@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -53,27 +52,32 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 			return
 		}
 
-		var chroot = path.Join(cfg.StateBaseDir, "vms", id)
+		var chroot = filepath.Join(cfg.StateBaseDir, "vms", id)
 
-		if err := os.MkdirAll(chroot, 0755); err != nil {
+		if err := os.MkdirAll(chroot, 0o755); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if err := os.Chown(chroot, firecracker.DefaultJailerUID, firecracker.DefaultJailerGID); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// Copy the kernel and init to the chroot
-		if err := linux.CopyFile(cfg.KernelPath, path.Join(chroot, "vmlinux"), 0644); err != nil {
+		if err := linux.CopyFile(cfg.KernelPath, filepath.Join(chroot, "vmlinux"), 0644); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// copy the firecracker binary to the chroot
-		if err := linux.CopyFile(cfg.FirecrackerBinPath, path.Join(chroot, "firecracker"), 0755); err != nil {
+		if err := linux.CopyFile(cfg.FirecrackerBinPath, filepath.Join(chroot, "firecracker"), 0755); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// copy kiln binary to the chroot
-		if err := linux.CopyFile(cfg.KilnBinPath, path.Join(chroot, "kiln"), 0755); err != nil {
+		if err := linux.CopyFile(cfg.KilnBinPath, filepath.Join(chroot, "kiln"), 0755); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -95,6 +99,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		files := make(map[string][]byte)
 
 		initBinaryPath := filepath.Join(chroot, "init") // Assuming init binary is copied to vmdir
+
 		initContent, err := os.ReadFile(initBinaryPath)
 		if err != nil {
 			log.Fatalf("Failed to read init binary: %v", err)
@@ -104,13 +109,13 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		files["inferno/init"] = initContent
 
 		// Convert run configuration to bytes (JSON)
-		runJSONContent, err := img.Marshal()
+		imageConfigJSON, err := img.Marshal()
 		if err != nil {
 			log.Fatalf("Failed to marshal run config: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		files["inferno/run.json"] = runJSONContent
+		files["inferno/run.json"] = imageConfigJSON
 
 		_, err = createInitrd(chroot, files)
 		if err != nil {
@@ -119,27 +124,27 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		// create the rootfs device
-		if err := images.CreateRootFS(ctx, req.Image, path.Join(chroot, "rootfs.ext4")); err != nil {
+		if err := images.CreateRootFS(ctx, req.Image, filepath.Join(chroot, "rootfs.ext4")); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// create the firecracker config
-		fcConfig, err := firecrackerConfig(id, chroot, path.Join(chroot, initDeviceName))
+		fcConfig, err := firecrackerConfig(id, chroot, filepath.Join(chroot, initDeviceName))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// write the firecracker config to a file
-		fcCfgPath := path.Join(chroot, "firecracker.json")
+		fcConfigPath := filepath.Join(chroot, "firecracker.json")
 
-		if err := firecracker.WriteConfig(fcCfgPath, fcConfig); err != nil {
+		if err := firecracker.WriteConfig(fcConfigPath, fcConfig); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		if err := os.Chown(fcCfgPath, firecracker.DefaultJailerUID, firecracker.DefaultJailerGID); err != nil {
+		if err := os.Chown(fcConfigPath, firecracker.DefaultJailerUID, firecracker.DefaultJailerGID); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -156,7 +161,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		// write the kiln config to a file
-		if err := kiln.WriteConfig(path.Join(chroot, "kiln.json"), kilnConfig); err != nil {
+		if err := kiln.WriteConfig(filepath.Join(chroot, "kiln.json"), kilnConfig); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -183,7 +188,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 }
 
 func createInitrd(chroot string, files map[string][]byte) (string, error) {
-	var path = path.Join(chroot, initDeviceName)
+	var path = filepath.Join(chroot, initDeviceName)
 
 	// create the initrd file with the right permissions
 	initrd, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -214,6 +219,12 @@ func createInitrd(chroot string, files map[string][]byte) (string, error) {
 		if err != nil {
 			return "", err
 		}
+	}
+	if err := archiver.Close(); err != nil {
+		return "", err
+	}
+	if err := compressor.Close(); err != nil {
+		return "", err
 	}
 	return path, nil
 }
