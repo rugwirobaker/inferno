@@ -1,8 +1,6 @@
 module github.com/rugwirobaker/inferno
 
-go 1.22.0
-
-toolchain go1.22.7
+go 1.23.2
 
 require (
 	github.com/AlecAivazis/survey/v2 v2.3.7
@@ -14,6 +12,8 @@ require (
 	github.com/mgutz/ansi v0.0.0-20170206155736-9520e82c474b
 	github.com/spf13/cobra v1.8.1
 	github.com/spf13/pflag v1.0.5
+	golang.org/x/sys v0.25.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -43,10 +43,8 @@ require (
 	go.opentelemetry.io/otel/metric v1.30.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.30.0 // indirect
 	go.opentelemetry.io/otel/trace v1.30.0 // indirect
-	golang.org/x/sys v0.25.0 // indirect
 	golang.org/x/term v0.24.0 // indirect
 	golang.org/x/text v0.18.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gotest.tools/v3 v3.5.1 // indirect
 )
