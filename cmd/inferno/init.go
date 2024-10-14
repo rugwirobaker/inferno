@@ -17,7 +17,7 @@ func NewInitCommand() *cobra.Command {
 		short = "Creates configuration file"
 	)
 
-	cmd := command.New("run", short, long, runInit)
+	cmd := command.New("init", short, long, runInit)
 
 	flag.Add(cmd,
 		flag.String{

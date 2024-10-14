@@ -66,6 +66,7 @@ func FromFile(path string) (*Config, error) {
 	var cfg = new(Config)
 
 	decoder := yaml.NewDecoder(file)
+	decoder.KnownFields(true)
 	if err := decoder.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("failed to decode config file: %w", err)
 	}

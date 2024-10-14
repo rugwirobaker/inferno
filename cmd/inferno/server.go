@@ -17,7 +17,7 @@ import (
 
 const defaultConfigFile = "/etc/inferno/inferno.conf"
 
-func NewDaemonCommand() *cobra.Command {
+func NewServerCommand() *cobra.Command {
 	const (
 		longDesc  = "Inferno is a microVM runtime"
 		shortDesc = "Starts the Inferno server"
@@ -116,8 +116,8 @@ func ensureDirectories(cfg *config.Config) error {
 
 func ensureFilesExist(cfg *config.Config) error {
 	files := []string{
-		cfg.SocketFilePath,
 		cfg.FirecrackerBinPath,
+		cfg.KilnBinPath,
 		cfg.InitPath,
 		cfg.KernelPath,
 	}

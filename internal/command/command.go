@@ -3,6 +3,7 @@ package command
 import (
 	"context"
 
+	"github.com/rugwirobaker/inferno/internal/flag"
 	"github.com/spf13/cobra"
 )
 
@@ -22,6 +23,20 @@ func newRunE(fn Runner) func(*cobra.Command, []string) error {
 		return nil
 	}
 	return func(cmd *cobra.Command, args []string) error {
-		return fn(cmd.Context())
+		ctx := cmd.Context()
+		ctx = NewContext(ctx, cmd)
+		ctx = flag.NewContext(ctx, cmd.Flags())
+
+		return fn(ctx)
 	}
+}
+
+type contextKey struct{}
+
+func NewContext(ctx context.Context, cmd *cobra.Command) context.Context {
+	return context.WithValue(ctx, contextKey{}, cmd)
+}
+
+func FromContext(ctx context.Context) *cobra.Command {
+	return ctx.Value(contextKey{}).(*cobra.Command)
 }
