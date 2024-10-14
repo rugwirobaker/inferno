@@ -79,6 +79,10 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		// ensure the image is cached locally at /var
+		if err := images.FetchImage(ctx, req.Image); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		// extract the image from manifest
 		img, err := images.CreateConfig(ctx, req.Image)
@@ -94,6 +98,8 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		initContent, err := os.ReadFile(initBinaryPath)
 		if err != nil {
 			log.Fatalf("Failed to read init binary: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		files["inferno/init"] = initContent
 
@@ -101,6 +107,8 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		runJSONContent, err := img.Marshal()
 		if err != nil {
 			log.Fatalf("Failed to marshal run config: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		files["inferno/run.json"] = runJSONContent
 
@@ -111,7 +119,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		// create the rootfs device
-		if err := images.ExtractRootFS(ctx, req.Image, path.Join(chroot, "rootfs.ext4")); err != nil {
+		if err := images.CreateRootFS(ctx, req.Image, path.Join(chroot, "rootfs.ext4")); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
