@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -38,16 +39,22 @@ type runRequest struct {
 
 func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var ctx = r.Context()
-
+		var (
+			logger = slog.With("system", "server")
+			ctx    = r.Context()
+		)
 		var req runRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			logger.Error("Failed to decode request", "error", err)
+
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		id, err := nanoid.Generate(HEX_ALPHABET, 8)
 		if err != nil {
+			logger.Error("Failed to generate VM ID", "error", err)
+
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -55,35 +62,43 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		var chroot = filepath.Join(cfg.StateBaseDir, "vms", id)
 
 		if err := os.MkdirAll(chroot, 0o755); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to create chroot", "error", err)
+
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		if err := os.Chown(chroot, firecracker.DefaultJailerUID, firecracker.DefaultJailerGID); err != nil {
+			slog.With(slog.String("vm-id", id)).Error("Failed to chown chroot", "error", err)
+
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// Copy the kernel and init to the chroot
 		if err := linux.CopyFile(cfg.KernelPath, filepath.Join(chroot, "vmlinux"), 0644); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to copy kernel", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// copy the firecracker binary to the chroot
 		if err := linux.CopyFile(cfg.FirecrackerBinPath, filepath.Join(chroot, "firecracker"), 0755); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to copy firecracker", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// copy kiln binary to the chroot
 		if err := linux.CopyFile(cfg.KilnBinPath, filepath.Join(chroot, "kiln"), 0755); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to copy kiln", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// ensure the image is cached locally at /var
 		if err := images.FetchImage(ctx, req.Image); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to fetch image", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -91,6 +106,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		// extract the image from manifest
 		img, err := images.CreateConfig(ctx, req.Image)
 		if err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to create image config", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -102,7 +118,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 
 		initContent, err := os.ReadFile(initBinaryPath)
 		if err != nil {
-			log.Fatalf("Failed to read init binary: %v", err)
+			logger.With(slog.String("vm-id", id)).Error("Failed to read init binary", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -119,12 +135,14 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 
 		_, err = createInitrd(chroot, files)
 		if err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to create initrd", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// create the rootfs device
 		if err := images.CreateRootFS(ctx, req.Image, filepath.Join(chroot, "rootfs.ext4")); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to create rootfs", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -132,6 +150,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		// create the firecracker config
 		fcConfig, err := firecrackerConfig(id, chroot, filepath.Join(chroot, initDeviceName))
 		if err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to create firecracker config", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -140,11 +159,13 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		fcConfigPath := filepath.Join(chroot, "firecracker.json")
 
 		if err := firecracker.WriteConfig(fcConfigPath, fcConfig); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to write firecracker config", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		if err := os.Chown(fcConfigPath, firecracker.DefaultJailerUID, firecracker.DefaultJailerGID); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to chown firecracker config", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -156,12 +177,14 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 			MemoryMB: req.MemoryMB,
 		})
 		if err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to create kiln config", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// write the kiln config to a file
 		if err := kiln.WriteConfig(filepath.Join(chroot, "kiln.json"), kilnConfig); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to write kiln config", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -173,6 +196,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		})
 
 		if err := vm.Start(ctx); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to start VM", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -180,10 +204,10 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		if err := json.NewEncoder(w).Encode(map[string]string{"id": id}); err != nil {
+			logger.With(slog.String("vm-id", id)).Error("Failed to encode response", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
 	}
 }
 
@@ -278,14 +302,15 @@ func firecrackerConfig(id, chroot, initrdPath string) (*firecracker.Config, erro
 
 func kilnConfig(id, chroot string, resources kiln.Resources) (*kiln.Config, error) {
 	return &kiln.Config{
-		JailID:                id,
-		ChrootPath:            chroot,
-		UID:                   firecracker.DefaultJailerUID,
-		GID:                   firecracker.DefaultJailerGID,
-		NetNS:                 true,
-		FirecrackerSocketPath: "/firecracker.sock",
-		FirecrackerConfigPath: "firecracker.json",
-		Resources:             resources,
+		JailID:                  id,
+		ChrootPath:              chroot,
+		UID:                     firecracker.DefaultJailerUID,
+		GID:                     firecracker.DefaultJailerGID,
+		NetNS:                   true,
+		FirecrackerSocketPath:   "/firecracker.sock",
+		FirecrackerConfigPath:   "firecracker.json",
+		FirecrackerVsockUDSPath: "control.sock",
+		Resources:               resources,
 	}, nil
 }
 

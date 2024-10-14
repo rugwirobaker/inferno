@@ -21,15 +21,20 @@ type Config struct {
 	JailID        string `json:"jail_id"`
 	ChrootPath    string `json:"chroot"`
 	ChrootBaseDir string `json:"chroot_base_dir"`
+	UID           int    `json:"uid"`
+	GID           int    `json:"gid"`
+	Log           Log    `json:"log"`
 
-	Log                     Log
-	UID                     int       `json:"uid"`
-	GID                     int       `json:"gid"`
-	NetNS                   bool      `json:"netns"`
-	FirecrackerSocketPath   string    `json:"firecracker_socket_path"`
-	FirecrackerConfigPath   string    `json:"firecracker_config_path"`
-	FirecrackerVsockUDSPath string    `json:"firecracker_vsock_uds_path"`
-	Resources               Resources `json:"resources"`
+	NetNS bool `json:"netns"`
+
+	FirecrackerSocketPath   string `json:"firecracker_socket_path"`
+	FirecrackerConfigPath   string `json:"firecracker_config_path"`
+	FirecrackerVsockUDSPath string `json:"firecracker_vsock_uds_path"`
+
+	VsockStdoutPort int `json:"vsock_stdout_port"` // receive stdout/stderr send over by the init
+	VsockExitPort   int `json:"vsock_exit_port"`   // receive exit code info from the init
+
+	Resources Resources `json:"resources"`
 }
 
 type Log struct {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 
@@ -62,9 +63,19 @@ func runDaemon(ctx context.Context) error {
 	// Override configuration with command-line flags
 	cfg.OverrideWithFlags(ctx)
 
+	if err := configureLogger(cfg); err != nil {
+		slog.Error("Failed to configure logger", "error", err)
+		return err
+	}
+
 	// Ensure necessary directories exist
 	if err := ensureDirectories(cfg); err != nil {
 		return fmt.Errorf("failed to ensure directories: %w", err)
+	}
+
+	// Ensure necessary files exist
+	if err := ensureFilesExist(cfg); err != nil {
+		return fmt.Errorf("failed to ensure files: %w", err)
 	}
 
 	// Remove existing socket file if it exists
@@ -85,6 +96,7 @@ func runDaemon(ctx context.Context) error {
 
 	// Pass the configuration to the server
 	srv := server.New(listener, cfg, images)
+
 	return srv.Run()
 }
 
@@ -118,4 +130,33 @@ func ensureFilesExist(cfg *config.Config) error {
 		}
 	}
 	return nil
+}
+
+func configureLogger(c *config.Config) error {
+	opts := slog.HandlerOptions{Level: &server.LogLevel}
+
+	if !c.Log.Timestamp {
+		opts.ReplaceAttr = removeTime
+	}
+
+	var handler slog.Handler
+	switch format := c.Log.Format; format {
+	case "text":
+		handler = slog.NewTextHandler(os.Stderr, &opts)
+	case "json":
+		handler = slog.NewJSONHandler(os.Stderr, &opts)
+	default:
+		return fmt.Errorf("invalid log format: %q", format)
+	}
+
+	slog.SetDefault(slog.New(handler))
+	return nil
+}
+
+// removeTime removes the "time" field from slog.
+func removeTime(groups []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.TimeKey {
+		return slog.Attr{}
+	}
+	return a
 }

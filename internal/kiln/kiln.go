@@ -93,6 +93,12 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	// Configure the logger
+	if err := configureLogger(config); err != nil {
+		slog.Error("Failed to configure logger", "error", err)
+		return err
+	}
+
 	var vmID = config.JailID
 
 	slog.Info("Running Firecracker", "vmID", vmID)
