@@ -2,8 +2,10 @@ package vm_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"sync"
 	"testing"
@@ -13,8 +15,12 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// MockWriter is a mock implementation of io.WriteCloser for testing purposes.
-// It records all writes and can be configured to fail certain write attempts.
+// set test environment to enable slog debug logs
+func init() {
+	slog.SetLogLoggerLevel(slog.LevelDebug)
+}
+
+// MockWriter simulates multiple writers with the ability to fail.
 type MockWriter struct {
 	mu             sync.Mutex
 	WrittenData    bytes.Buffer
@@ -22,12 +28,19 @@ type MockWriter struct {
 	WriteResponses []error // Errors to return for each failed write
 	writeIndex     int     // Current write attempt index
 	CloseCalled    bool    // Whether Close was called
+	WriteDone      chan struct{}
 }
 
 // Write simulates writing data, potentially failing based on configuration.
 func (m *MockWriter) Write(p []byte) (n int, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	defer func() {
+		if m.WriteDone != nil {
+			m.WriteDone <- struct{}{}
+		}
+	}()
 
 	if m.writeIndex < len(m.WriteFailures) && m.WriteFailures[m.writeIndex] {
 		err = m.WriteResponses[m.writeIndex]
@@ -58,12 +71,15 @@ func TestLoggerWriteToFile(t *testing.T) {
 	defer os.Remove(tmpFile.Name()) // Clean up
 
 	// Define a factory that returns the temp file
-	factory := func() (io.WriteCloser, error) {
+	factory := func(ctx context.Context) (io.WriteCloser, error) {
 		return tmpFile, nil
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Initialize the logger with functional options
-	logger, err := vm.NewLogger(factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 	defer logger.Close()
 
@@ -100,12 +116,15 @@ func TestLoggerWriteToMockWriter(t *testing.T) {
 	mock := &MockWriter{}
 
 	// Define a factory that returns the mock writer
-	factory := func() (io.WriteCloser, error) {
+	factory := func(ctx context.Context) (io.WriteCloser, error) {
 		return mock, nil
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Initialize the logger with functional options
-	logger, err := vm.NewLogger(factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 	defer logger.Close()
 
@@ -141,12 +160,14 @@ func TestConcurrentLogging(t *testing.T) {
 	mock := &MockWriter{}
 
 	// Define a factory that returns the mock writer
-	factory := func() (io.WriteCloser, error) {
+	factory := func(ctx context.Context) (io.WriteCloser, error) {
 		return mock, nil
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	// Initialize the logger with functional options
-	logger, err := vm.NewLogger(factory, vm.WithQueueSize(1000), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(1000), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 	defer logger.Close()
 
@@ -190,12 +211,15 @@ func TestLoggerCloseBehavior(t *testing.T) {
 	mock := &MockWriter{}
 
 	// Define a factory that returns the mock writer
-	factory := func() (io.WriteCloser, error) {
+	factory := func(ctx context.Context) (io.WriteCloser, error) {
 		return mock, nil
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Initialize the logger with functional options
-	logger, err := vm.NewLogger(factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 
 	// Log a message
@@ -216,103 +240,101 @@ func TestLoggerCloseBehavior(t *testing.T) {
 	assert.NotContains(mock.WrittenData.Bytes(), []byte("Post-close log entry."), "Post-close log entry was unexpectedly written")
 }
 
-// TestLoggerRetryLogic tests that Logger renews the writer upon write failure without retrying the write.
-// TestLoggerRetryLogic tests that Logger renews the writer upon write failure without retrying the write.
-// func TestLoggerRetryLogic(t *testing.T) {
-// 	tests := []struct {
-// 		name           string
-// 		writeFailures  []bool  // Defines which write attempts should fail
-// 		writeResponses []error // Errors to return for each failed write
-// 		logMessage     string  // The log message to be written
-// 		expectWritten  bool    // Whether the log message should be written successfully
-// 		expectedWrites []int   // Expected number of writes per writer
-// 	}{
-// 		{
-// 			name:           "Write succeeds on first attempt",
-// 			writeFailures:  []bool{false},
-// 			writeResponses: []error{nil},
-// 			logMessage:     "Successful write",
-// 			expectWritten:  true,
-// 			expectedWrites: []int{1},
-// 		},
-// 		{
-// 			name:           "Write fails and is not retried",
-// 			writeFailures:  []bool{true},
-// 			writeResponses: []error{errors.New("write failed")},
-// 			logMessage:     "Failed write",
-// 			expectWritten:  false,
-// 			expectedWrites: []int{1, 0}, // First writer failed once, second writer not used
-// 		},
-// 	}
+func TestLoggerContextCancellation(t *testing.T) {
+	assert := assert.New(t)
 
-// 	for _, tc := range tests {
-// 		t.Run(tc.name, func(t *testing.T) {
-// 			// Initialize mock writers based on test case
-// 			var mockWriters []*MockWriter
-// 			for i := 0; i < len(tc.writeFailures); i++ {
-// 				mock := &MockWriter{
-// 					WriteFailures:  []bool{tc.writeFailures[i]},
-// 					WriteResponses: []error{tc.writeResponses[i]},
-// 				}
-// 				mockWriters = append(mockWriters, mock)
-// 			}
+	// Initialize the mock writer
+	mock := &MockWriter{WriteFailures: []bool{false}}
 
-// 			// Define a factory that returns mock writers sequentially
-// 			factory := func() (io.WriteCloser, error) {
-// 				if len(mockWriters) == 0 {
-// 					return nil, errors.New("no more mock writers available")
-// 				}
-// 				writer := mockWriters[0]
-// 				mockWriters = mockWriters[1:]
-// 				return writer, nil
-// 			}
+	// Create a factory that returns the mock writer and accepts a context
+	factory := func(ctx context.Context) (io.WriteCloser, error) {
+		return mock, nil
+	}
 
-// 			// Initialize the logger
-// 			logLogger, err := vm.NewLogger(factory, 10, 2*time.Second)
-// 			if err != nil {
-// 				t.Fatalf("Failed to create logger: %v", err)
-// 			}
-// 			defer logLogger.Close()
+	// Initialize the logger with a context
+	ctx, cancel := context.WithCancel(context.Background())
 
-// 			// Log the message
-// 			err = logLogger.Log(tc.logMessage)
-// 			if err != nil && !errors.Is(err, io.EOF) {
-// 				t.Errorf("Unexpected error during Log: %v", err)
-// 			}
+	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
+	assert.NoError(err)
 
-// 			// Allow some time for the write and potential renewal
-// 			time.Sleep(500 * time.Millisecond)
+	// Log a message before context cancellation
+	err = logger.Log("Log entry before cancellation.")
+	assert.NoError(err, "Failed to log message before context cancellation")
 
-// 			// Close the logger to ensure all logs are flushed
-// 			logLogger.Close()
+	// Wait a short time to ensure the message is logged
+	time.Sleep(100 * time.Millisecond)
 
-// 			// Verify the number of write attempts per writer
-// 			for i, expected := range tc.expectedWrites {
-// 				if i >= len(mockWriters) {
-// 					t.Fatalf("Expected at least %d mock writers, but got %d", len(tc.expectedWrites), len(mockWriters))
-// 				}
-// 				actual := mockWriters[i].writeIndex
-// 				if actual != expected {
-// 					t.Errorf("Writer %d: expected %d write attempts, got %d", i+1, expected, actual)
-// 				}
-// 			}
+	// Cancel the context to simulate shutdown
+	cancel()
 
-// 			// Verify whether the log message was written
-// 			written := false
-// 			for _, mock := range mockWriters {
-// 				if bytes.Contains(mock.WrittenData.Bytes(), []byte(tc.logMessage)) {
-// 					written = true
-// 					break
-// 				}
-// 			}
+	// Attempt to log after context cancellation
+	err = logger.Log("Log entry after cancellation.")
+	assert.ErrorIs(err, io.EOF, "Expected io.EOF after context cancellation")
 
-// 			if tc.expectWritten && !written {
-// 				t.Errorf("Expected message '%s' to be written, but it was not", tc.logMessage)
-// 			}
+	// Verify that the post-cancel message was not written
+	writtenContent := mock.WrittenData.String()
+	assert.NotContains(writtenContent, "Log entry after cancellation.", "Log entry after cancellation was unexpectedly written")
 
-// 			if !tc.expectWritten && written {
-// 				t.Errorf("Did not expect message '%s' to be written, but it was", tc.logMessage)
-// 			}
-// 		})
-// 	}
-// }
+	// Close the logger explicitly (no-op since it's already closed)
+	logger.Close()
+}
+
+func TestLoggerWriterRenewal(t *testing.T) {
+	assert := assert.New(t)
+
+	// Create two mock writers to simulate renewal
+	mockWriter1 := &MockWriter{
+		WriteFailures:  []bool{true}, // The first writer fails on the first write
+		WriteResponses: []error{fmt.Errorf("mock failure")},
+		WriteDone:      make(chan struct{}, 1),
+	}
+	mockWriter2 := &MockWriter{
+		WriteDone: make(chan struct{}, 1),
+	}
+
+	// Create a factory that returns mockWriter1 first, then mockWriter2
+	factory := func(ctx context.Context) (io.WriteCloser, error) {
+		if !mockWriter1.CloseCalled {
+			return mockWriter1, nil
+		}
+		return mockWriter2, nil
+	}
+
+	// Initialize the logger
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
+	assert.NoError(err, "Failed to create logger")
+	defer logger.Close()
+
+	// Log an entry that should trigger the first writer's failure
+	err = logger.Log("first log entry")
+	assert.NoError(err, "Expected no error when logging the first entry despite failure")
+
+	// Wait for the first write attempt to complete
+	select {
+	case <-mockWriter1.WriteDone:
+		// Write attempted
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timed out waiting for first write attempt")
+	}
+
+	// Verify the first writer was closed after the failure
+	assert.True(mockWriter1.CloseCalled, "Expected first writer to be closed after failure")
+
+	// Log another entry which should use the second writer
+	err = logger.Log("second log entry")
+	assert.NoError(err, "Expected no error when logging the second entry after renewal")
+
+	// Wait for the second write attempt to complete
+	select {
+	case <-mockWriter2.WriteDone:
+		// Write attempted
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timed out waiting for second write attempt")
+	}
+
+	// Verify that the second writer received the second log entry
+	assert.Contains(mockWriter2.WrittenData.String(), "second log entry", "Expected second writer to contain 'second log entry'")
+}

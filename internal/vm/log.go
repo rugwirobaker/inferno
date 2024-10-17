@@ -1,8 +1,10 @@
 package vm
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -11,13 +13,15 @@ import (
 
 // Logger handles logging with queued entries and a retriable writer.
 type Logger struct {
-	writer       *retriableWriter
+	writer       io.WriteCloser
 	logChan      chan string
-	quitChan     chan struct{}
 	wg           sync.WaitGroup
 	flushTimeout time.Duration
+	closed       bool
 	mu           sync.RWMutex // Protects access to writer.closed
 	once         sync.Once    // Ensures Close is idempotent
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 type Options struct {
@@ -43,9 +47,11 @@ func WithFlushTimeout(timeout time.Duration) Option {
 // - factory: Function to create new WriterCloser instances.
 // - queueSize: Size of the log entry queue.
 // - flushTimeout: Maximum time to wait during flush.
-func NewLogger(factory writerFactory, opts ...Option) (*Logger, error) {
+func NewLogger(ctx context.Context, factory writerFactory, opts ...Option) (*Logger, error) {
+	ctx, cancel := context.WithCancel(ctx)
+
 	var options = Options{
-		QueueSize:    100,
+		QueueSize:    512,
 		FlushTimeout: 2 * time.Second,
 	}
 
@@ -53,16 +59,18 @@ func NewLogger(factory writerFactory, opts ...Option) (*Logger, error) {
 		opt(&options)
 	}
 
-	retriableWriter, err := newRetriableWriter(factory)
+	retriableWriter, err := newRetriableWriter(ctx, factory)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	logger := &Logger{
 		writer:       retriableWriter,
 		logChan:      make(chan string, options.QueueSize),
-		quitChan:     make(chan struct{}),
 		flushTimeout: options.FlushTimeout,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	logger.wg.Add(1)
@@ -82,9 +90,10 @@ func (l *Logger) processLogs() {
 				return
 			}
 			l.writeLog(logEntry)
-		case <-l.quitChan:
-			// Received quit signal, exit the goroutine
+		case <-l.ctx.Done():
+			l.Close()
 			return
+
 		}
 	}
 }
@@ -94,17 +103,21 @@ func (l *Logger) writeLog(logEntry string) {
 	// Use fmt.Fprintln to format the log entry with a newline
 	_, err := fmt.Fprintln(l.writer, logEntry)
 	if err != nil {
-		// Optionally handle the error, e.g., log to stderr
-		// For demonstration, we silently drop the log
+		slog.Debug("Failed to write log entry", "error", err)
 	}
 }
 
 // Log queues a log entry for processing.
 // Returns io.EOF if the logger has been closed.
 func (l *Logger) Log(entry string) error {
-	// Acquire read lock to check if logger is closed
+	select {
+	case <-l.ctx.Done():
+		return io.EOF
+	default:
+	}
+
 	l.mu.RLock()
-	closed := l.writer.closed
+	closed := l.closed
 	l.mu.RUnlock()
 
 	if closed {
@@ -113,30 +126,43 @@ func (l *Logger) Log(entry string) error {
 
 	select {
 	case l.logChan <- entry:
-		// Successfully queued
 		return nil
 	default:
-		// Queue is full, drop the log or handle accordingly
-		return nil
+		// Queue is full, drop the log (or handle it as needed)
+		return nil // For now, silently dropping logs if the queue is full
 	}
 }
 
 // Close is an alias for Flush.
 func (l *Logger) Close() {
 	l.once.Do(func() {
-		// Signal to quit processing
-		close(l.quitChan)
-		// Wait for the goroutine to finish
-		l.wg.Wait()
-		// Close the log channel to release any blocked goroutines
+		l.mu.Lock()
+		l.closed = true
+		l.mu.Unlock()
 		close(l.logChan)
-		// Close the retriable writer
+
+		// Wait for the processLogs goroutine to finish
+		done := make(chan struct{})
+		go func() {
+			l.wg.Wait()
+			close(done)
+		}()
+
+		// Wait for FlushTimeout duration to allow logs to be processed
+		flushTimeout := l.flushTimeout
+		select {
+		case <-done:
+			// Successfully flushed all logs
+		case <-time.After(flushTimeout):
+			slog.Debug("Logger flush timeout exceeded")
+		}
+		// Close the writer
 		l.writer.Close()
 	})
 }
 
 // writerFactory defines a function that returns a new io.WriteCloser.
-type writerFactory func() (io.WriteCloser, error)
+type writerFactory func(ctx context.Context) (io.WriteCloser, error)
 
 // retriableWriter wraps an io.WriteCloser and provides retry logic with backoff.
 type retriableWriter struct {
@@ -146,12 +172,14 @@ type retriableWriter struct {
 	mu     sync.RWMutex
 	writer io.WriteCloser
 	closed bool
+
+	ctx context.Context
 }
 
 // newRetriableWriter initializes a RetriableWriter with the initial WriterCloser.
 // It configures the backoff strategy for retries.
-func newRetriableWriter(factory writerFactory) (*retriableWriter, error) {
-	writer, err := factory()
+func newRetriableWriter(ctx context.Context, factory writerFactory) (*retriableWriter, error) {
+	writer, err := factory(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -168,6 +196,7 @@ func newRetriableWriter(factory writerFactory) (*retriableWriter, error) {
 		factory: factory,
 		backoff: b,
 		writer:  writer,
+		ctx:     ctx,
 	}, nil
 }
 
@@ -218,33 +247,36 @@ func (rw *retriableWriter) write(p []byte) (n int, err error) {
 
 // renew replaces the current WriterCloser with a new one from the factory.
 // It retries with exponential backoff until successful or until the writer is closed.
-// Assumes that the caller holds the write lock.
 func (rw *retriableWriter) renew() error {
 	if rw.closed {
 		return io.EOF
 	}
-	// Close the existing writer if it's not nil
+
+	// Ensure the existing writer is closed
 	if rw.writer != nil {
-		rw.writer.Close()
+		err := rw.writer.Close()
+		if err != nil {
+			slog.Debug("Error closing writer during renew:", "error", err)
+		}
 		rw.writer = nil
 	}
+
 	// Reset the backoff
 	rw.backoff.Reset()
 
+	// Retry to get a new writer with backoff
 	for {
 		if rw.closed {
 			return io.EOF
 		}
-		newWriter, err := rw.factory()
+		newWriter, err := rw.factory(rw.ctx)
 		if err != nil {
 			// Retry with backoff
 			wait := rw.backoff.Duration()
-			<-time.After(wait)
-
+			time.Sleep(wait)
 			continue
 		}
 		rw.writer = newWriter
-
 		return nil
 	}
 }
