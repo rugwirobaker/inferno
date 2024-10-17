@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"sync"
@@ -19,15 +18,41 @@ type Logger struct {
 	flushTimeout time.Duration
 	mu           sync.RWMutex // Protects access to writer.closed
 	once         sync.Once    // Ensures Close is idempotent
-	ctx          context.Context
-	cancel       context.CancelFunc
+}
+
+type Options struct {
+	QueueSize    int
+	FlushTimeout time.Duration
+}
+
+type Option func(*Options)
+
+func WithQueueSize(size int) Option {
+	return func(o *Options) {
+		o.QueueSize = size
+	}
+}
+
+func WithFlushTimeout(timeout time.Duration) Option {
+	return func(o *Options) {
+		o.FlushTimeout = timeout
+	}
 }
 
 // NewLogger initializes the Logger with a RetriableWriter.
 // - factory: Function to create new WriterCloser instances.
 // - queueSize: Size of the log entry queue.
 // - flushTimeout: Maximum time to wait during flush.
-func NewLogger(factory writerFactory, queueSize int, flushTimeout time.Duration) (*Logger, error) {
+func NewLogger(factory writerFactory, opts ...Option) (*Logger, error) {
+	var options = Options{
+		QueueSize:    100,
+		FlushTimeout: 2 * time.Second,
+	}
+
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	retriableWriter, err := newRetriableWriter(factory)
 	if err != nil {
 		return nil, err
@@ -35,9 +60,9 @@ func NewLogger(factory writerFactory, queueSize int, flushTimeout time.Duration)
 
 	logger := &Logger{
 		writer:       retriableWriter,
-		logChan:      make(chan string, queueSize),
+		logChan:      make(chan string, options.QueueSize),
 		quitChan:     make(chan struct{}),
-		flushTimeout: flushTimeout, // Currently unused
+		flushTimeout: options.FlushTimeout,
 	}
 
 	logger.wg.Add(1)

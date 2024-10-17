@@ -2,7 +2,6 @@ package vm_test
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/rugwirobaker/inferno/internal/vm"
+	"github.com/stretchr/testify/assert"
 )
 
 // MockWriter is a mock implementation of io.WriteCloser for testing purposes.
@@ -50,11 +50,11 @@ func (m *MockWriter) Close() error {
 
 // TestLoggerWriteToFile tests that Logger correctly writes log entries to a file.
 func TestLoggerWriteToFile(t *testing.T) {
+	assert := assert.New(t)
+
 	// Create a temporary file
 	tmpFile, err := os.CreateTemp("", "logger_test_*.log")
-	if err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
+	assert.NoError(err, "Failed to create temp file")
 	defer os.Remove(tmpFile.Name()) // Clean up
 
 	// Define a factory that returns the temp file
@@ -62,12 +62,10 @@ func TestLoggerWriteToFile(t *testing.T) {
 		return tmpFile, nil
 	}
 
-	// Initialize the logger
-	logLogger, err := vm.NewLogger(factory, 100, 2*time.Second)
-	if err != nil {
-		t.Fatalf("Failed to create logger: %v", err)
-	}
-	// Removed defer to call Close explicitly
+	// Initialize the logger with functional options
+	logLogger, err := vm.NewLogger(factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
+	assert.NoError(err, "Failed to create logger")
+	defer logLogger.Close()
 
 	// Log some messages
 	messages := []string{
@@ -77,9 +75,8 @@ func TestLoggerWriteToFile(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		if err := logLogger.Log(msg); err != nil {
-			t.Errorf("Failed to log message '%s': %v", msg, err)
-		}
+		err := logLogger.Log(msg)
+		assert.NoError(err, fmt.Sprintf("Failed to log message '%s'", msg))
 	}
 
 	// Allow some time for logs to be written
@@ -87,25 +84,18 @@ func TestLoggerWriteToFile(t *testing.T) {
 
 	// Verify the writes
 	content, err := os.ReadFile(tmpFile.Name())
-	if err != nil {
-		t.Fatalf("Failed to read log file: %v", err)
-	}
+	assert.NoError(err, "Failed to read log file")
 
+	contentStr := string(content)
 	for _, msg := range messages {
-		if !bytes.Contains(content, []byte(msg)) {
-			t.Errorf("Log file does not contain expected message: %s", msg)
-		}
+		assert.Contains(contentStr, msg, fmt.Sprintf("Log file does not contain expected message: %s", msg))
 	}
-
-	// Close the logger to ensure all logs are flushed
-	logLogger.Close()
-
-	// Attempting to close again should not panic (idempotent)
-	logLogger.Close()
 }
 
 // TestLoggerWriteToMockWriter tests that Logger correctly writes to a mock writer.
 func TestLoggerWriteToMockWriter(t *testing.T) {
+	assert := assert.New(t)
+
 	// Initialize the mock writer
 	mock := &MockWriter{}
 
@@ -114,12 +104,10 @@ func TestLoggerWriteToMockWriter(t *testing.T) {
 		return mock, nil
 	}
 
-	// Initialize the logger
-	logLogger, err := vm.NewLogger(factory, 100, 2*time.Second)
-	if err != nil {
-		t.Fatalf("Failed to create logger: %v", err)
-	}
-	// Removed defer to call Close explicitly
+	// Initialize the logger with functional options
+	logLogger, err := vm.NewLogger(factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
+	assert.NoError(err, "Failed to create logger")
+	defer logLogger.Close()
 
 	// Log some messages
 	messages := []string{
@@ -128,35 +116,27 @@ func TestLoggerWriteToMockWriter(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		if err := logLogger.Log(msg); err != nil {
-			t.Errorf("Failed to log message '%s': %v", msg, err)
-		}
+		err := logLogger.Log(msg)
+		assert.NoError(err, fmt.Sprintf("Failed to log message '%s'", msg))
 	}
 
 	// Allow some time for logs to be written
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify the writes
+	writtenContent := mock.WrittenData.String()
 	for _, msg := range messages {
-		if !bytes.Contains(mock.WrittenData.Bytes(), []byte(msg)) {
-			t.Errorf("MockWriter does not contain expected message: %s", msg)
-		}
+		assert.Contains(writtenContent, msg, fmt.Sprintf("MockWriter does not contain expected message: %s", msg))
 	}
-
-	// Close the logger to ensure all logs are flushed
-	logLogger.Close()
-
-	// Attempting to close again should not panic (idempotent)
-	logLogger.Close()
-
 	// Verify that Close was called
-	if !mock.CloseCalled {
-		t.Errorf("MockWriter.Close was not called")
-	}
+	logLogger.Close()
+	assert.True(mock.CloseCalled, "MockWriter.Close was not called")
 }
 
 // TestConcurrentLogging tests that Logger can handle concurrent logging.
 func TestConcurrentLogging(t *testing.T) {
+	assert := assert.New(t)
+
 	// Initialize the mock writer
 	mock := &MockWriter{}
 
@@ -165,11 +145,9 @@ func TestConcurrentLogging(t *testing.T) {
 		return mock, nil
 	}
 
-	// Initialize the logger
-	logLogger, err := vm.NewLogger(factory, 1000, 2*time.Second)
-	if err != nil {
-		t.Fatalf("Failed to create logger: %v", err)
-	}
+	// Initialize the logger with functional options
+	logLogger, err := vm.NewLogger(factory, vm.WithQueueSize(1000), vm.WithFlushTimeout(2*time.Second))
+	assert.NoError(err, "Failed to create logger")
 	defer logLogger.Close()
 
 	// Number of goroutines and messages
@@ -185,9 +163,8 @@ func TestConcurrentLogging(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numMessages; j++ {
 				msg := fmt.Sprintf("Goroutine %d - Message %d", id, j)
-				if err := logLogger.Log(msg); err != nil {
-					t.Errorf("Failed to log message '%s': %v", msg, err)
-				}
+				err := logLogger.Log(msg)
+				assert.NoError(err, fmt.Sprintf("Failed to log message '%s'", msg))
 			}
 		}(i)
 	}
@@ -198,23 +175,17 @@ func TestConcurrentLogging(t *testing.T) {
 	// Allow some time for logs to be written
 	time.Sleep(1 * time.Second)
 
-	// Close the logger to ensure all logs are flushed
-	logLogger.Close()
-
-	// Attempting to close again should not panic (idempotent)
-	logLogger.Close()
-
 	// Verify that all messages were written
 	expectedCount := numGoroutines * numMessages
 	actualCount := bytes.Count(mock.WrittenData.Bytes(), []byte("Goroutine"))
 
-	if actualCount != expectedCount {
-		t.Errorf("Expected %d log entries, but got %d", expectedCount, actualCount)
-	}
+	assert.Equal(expectedCount, actualCount, fmt.Sprintf("Expected %d log entries, but got %d", expectedCount, actualCount))
 }
 
 // TestLoggerCloseBehavior tests that Logger returns io.EOF after being closed.
 func TestLoggerCloseBehavior(t *testing.T) {
+	assert := assert.New(t)
+
 	// Initialize the mock writer
 	mock := &MockWriter{}
 
@@ -223,17 +194,13 @@ func TestLoggerCloseBehavior(t *testing.T) {
 		return mock, nil
 	}
 
-	// Initialize the logger
-	logLogger, err := vm.NewLogger(factory, 10, 2*time.Second)
-	if err != nil {
-		t.Fatalf("Failed to create logger: %v", err)
-	}
+	// Initialize the logger with functional options
+	logLogger, err := vm.NewLogger(factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
+	assert.NoError(err, "Failed to create logger")
 
 	// Log a message
 	err = logLogger.Log("Pre-close log entry.")
-	if err != nil {
-		t.Errorf("Failed to log message before close: %v", err)
-	}
+	assert.NoError(err, "Failed to log message before close")
 
 	// Close the logger
 	logLogger.Close()
@@ -243,14 +210,10 @@ func TestLoggerCloseBehavior(t *testing.T) {
 
 	// Attempt to log after closure
 	err = logLogger.Log("Post-close log entry.")
-	if !errors.Is(err, io.EOF) {
-		t.Errorf("Expected io.EOF after close, but got: %v", err)
-	}
+	assert.ErrorIs(err, io.EOF, "Expected io.EOF after close")
 
 	// Verify that the post-close message was not written
-	if bytes.Contains(mock.WrittenData.Bytes(), []byte("Post-close log entry.")) {
-		t.Errorf("Post-close log entry was unexpectedly written")
-	}
+	assert.NotContains(mock.WrittenData.Bytes(), []byte("Post-close log entry."), "Post-close log entry was unexpectedly written")
 }
 
 // TestLoggerRetryLogic tests that Logger renews the writer upon write failure without retrying the write.
