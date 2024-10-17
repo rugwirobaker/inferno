@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
+	"sync"
 
 	"syscall"
 
@@ -13,6 +15,11 @@ import (
 )
 
 const paths = "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+
+var LogLevel struct {
+	sync.Mutex
+	slog.LevelVar
+}
 
 // main starts an init process that can prepare an environment and start a shell
 // after the Kernel has started.

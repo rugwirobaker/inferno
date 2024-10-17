@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,7 +37,7 @@ type VM struct {
 	// Reference to the VM configuration
 	Config *Config
 	// vsockClient
-	vsockClient *http.Client
+	// vsockClient *http.Client
 
 	Mutex sync.Mutex
 

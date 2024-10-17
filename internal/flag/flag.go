@@ -55,7 +55,7 @@ func (b Bool) addTo(cmd *cobra.Command) {
 	for _, name := range b.Aliases {
 		makeAlias(b, name).addTo(cmd)
 	}
-	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", b.Aliases)
+	err := cmd.Flags().SetAnnotation(f.Name, "inferno_alias", b.Aliases)
 	if err != nil {
 		panic(err)
 	}
@@ -95,7 +95,7 @@ func (s String) addTo(cmd *cobra.Command) {
 	for _, name := range s.Aliases {
 		makeAlias(s, name).addTo(cmd)
 	}
-	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", s.Aliases)
+	err := cmd.Flags().SetAnnotation(f.Name, "inferno_alias", s.Aliases)
 	if err != nil {
 		panic(err)
 	}
@@ -132,7 +132,7 @@ func (i Int) addTo(cmd *cobra.Command) {
 	for _, name := range i.Aliases {
 		makeAlias(i, name).addTo(cmd)
 	}
-	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", i.Aliases)
+	err := cmd.Flags().SetAnnotation(f.Name, "inferno_alias", i.Aliases)
 	if err != nil {
 		panic(err)
 	}
@@ -164,7 +164,7 @@ func (i Float64) addTo(cmd *cobra.Command) {
 	for _, name := range i.Aliases {
 		makeAlias(i, name).addTo(cmd)
 	}
-	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", i.Aliases)
+	err := cmd.Flags().SetAnnotation(f.Name, "inferno_alias", i.Aliases)
 	if err != nil {
 		panic(err)
 	}
@@ -198,7 +198,7 @@ func (ss StringSlice) addTo(cmd *cobra.Command) {
 	for _, name := range ss.Aliases {
 		makeAlias(ss, name).addTo(cmd)
 	}
-	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", ss.Aliases)
+	err := cmd.Flags().SetAnnotation(f.Name, "inferno_alias", ss.Aliases)
 	if err != nil {
 		panic(err)
 	}
@@ -232,7 +232,7 @@ func (ss StringArray) addTo(cmd *cobra.Command) {
 	for _, name := range ss.Aliases {
 		makeAlias(ss, name).addTo(cmd)
 	}
-	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", ss.Aliases)
+	err := cmd.Flags().SetAnnotation(f.Name, "inferno_alias", ss.Aliases)
 	if err != nil {
 		panic(err)
 	}
@@ -266,7 +266,7 @@ func (d Duration) addTo(cmd *cobra.Command) {
 	for _, name := range d.Aliases {
 		makeAlias(d, name).addTo(cmd)
 	}
-	err := cmd.Flags().SetAnnotation(f.Name, "flyctl_alias", d.Aliases)
+	err := cmd.Flags().SetAnnotation(f.Name, "inferno_alias", d.Aliases)
 	if err != nil {
 		panic(err)
 	}

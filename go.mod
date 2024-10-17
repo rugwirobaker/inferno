@@ -7,6 +7,7 @@ require (
 	github.com/cavaliergopher/cpio v1.0.1
 	github.com/docker/docker v27.3.1+incompatible
 	github.com/google/go-cmp v0.6.0
+	github.com/jpillora/backoff v1.0.0
 	github.com/klauspost/compress v1.17.11
 	github.com/matoous/go-nanoid/v2 v2.1.0
 	github.com/mgutz/ansi v0.0.0-20170206155736-9520e82c474b

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -119,7 +120,7 @@ func run(ctx context.Context) error {
 	cmd.Stderr = os.Stderr
 
 	// Run the Firecracker process
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
 		slog.Error("Failed to run Firecracker", "error", err)
 		return err
 	}
@@ -155,4 +156,21 @@ func removeTime(groups []string, a slog.Attr) slog.Attr {
 		return slog.Attr{}
 	}
 	return a
+}
+
+func vsockListener(udsPath string, port int) (net.Listener, error) {
+	vsockPath := fmt.Sprintf("%s_%d", udsPath, port)
+
+	// Remove any old socket file before creating a new one
+	if err := os.RemoveAll(vsockPath); err != nil {
+		return nil, fmt.Errorf("failed to remove old vsock path: %w", err)
+	}
+
+	// Listen on the vsock path
+	listener, err := net.Listen("unix", vsockPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start vsock listener: %w", err)
+	}
+
+	return listener, nil
 }
