@@ -125,7 +125,34 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	// Wait for the Firecracker process to complete
+	ps := cmd.Process
+
+	waitErr := make(chan error)
+	waitState := make(chan *os.ProcessState)
+
+	go func() {
+		state, err := ps.Wait()
+		if err != nil {
+			waitErr <- err
+			return
+		}
+		waitState <- state
+	}()
+
+	select {
+	case err := <-waitErr:
+		slog.Error("Firecracker execution failed", "error", err)
+		return err
+	case state := <-waitState:
+		if !state.Success() {
+			slog.Error("Firecracker execution failed", "exitCode", state.ExitCode())
+			return fmt.Errorf("firecracker exited with code %d", state.ExitCode())
+		}
+	}
+
 	slog.Info("Firecracker execution complete", "vmID", vmID)
+
 	return nil
 }
 
