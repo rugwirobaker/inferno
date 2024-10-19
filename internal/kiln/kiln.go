@@ -1,14 +1,19 @@
 package kiln
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -16,8 +21,10 @@ import (
 	"github.com/rugwirobaker/inferno/internal/command"
 	"github.com/rugwirobaker/inferno/internal/flag"
 	"github.com/rugwirobaker/inferno/internal/pointer"
+	"github.com/rugwirobaker/inferno/internal/vm"
 	"github.com/rugwirobaker/inferno/internal/vsock"
 	"github.com/spf13/cobra"
+	"github.com/valyala/bytebufferpool"
 )
 
 // New sets up the kiln command structure
@@ -133,20 +140,17 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	vsockExitPath := fmt.Sprintf("%s_%d", config.FirecrackerVsockUDSPath, config.VsockExitPort)
+	// some clean tasks to run at the end
+	var finalizers []FinalizerFunc
 
-	listener, err := vsock.NewVsockUnixListener(vsockExitPath)
+	vsockExitPath := fmt.Sprintf("%s_%d", config.FirecrackerVsockUDSPath, config.VsockExitPort)
+	exitListener, err := vsock.NewVsockUnixListener(vsockExitPath)
 	if err != nil {
 		slog.Error("Failed to start vsock listener", "error", err)
 		return err
 	}
-	defer listener.Close()
+	defer exitListener.Close()
 
-	// some clean tasks to run at the end
-	var finalizers []FinalizerFunc
-
-	// Start the vsock server
-	// Create exit status channel
 	exitStatusChan := make(chan InitExitStatus)
 
 	// Start the server that handles exit status requests
@@ -163,13 +167,56 @@ func run(ctx context.Context) error {
 
 		finalizers = append(finalizers, func() error {
 			slog.Info("Stopping vsock server")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			return server.Shutdown(ctx)
 		})
 
-		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(exitListener); err != nil && err != http.ErrServerClosed {
 			slog.Error("Error serving exit status", "error", err)
+		}
+	}()
+
+	vsockLogPath := fmt.Sprintf("%s_%d", config.FirecrackerVsockUDSPath, config.VsockStdoutPort)
+	logListener, err := vsock.NewVsockUnixListener(vsockLogPath)
+	if err != nil {
+		slog.Error("Failed to start vsock listener", "error", err)
+		return err
+	}
+
+	// Start the server that handles logs
+	go func() {
+		slog.Info("Serving logs on vsock")
+
+		for {
+			conn, err := logListener.Accept()
+			slog.Debug("Accepted connection", "conn", conn)
+			if err != nil {
+				slog.Error("Failed to accept connection", "error", err)
+				continue
+			}
+
+			// handle the connection(for this use the same pattern as net/http uses behind the scenes)
+			go func() {
+				defer conn.Close()
+
+				ctx, cancel := context.WithCancel(ctx)
+				defer cancel()
+
+				factory := vm.SocketWriterFactory(ctx, *config.Log.Path)
+
+				logger, err := vm.NewLogger(ctx, factory)
+				if err != nil {
+					slog.Error("Failed to create logger", "error", err)
+					return
+				}
+				// add a finalizer to close the logger
+				finalizers = append(finalizers, func() error {
+					logger.Close()
+					return nil
+				})
+				handleVMLogs(conn, logger)
+			}()
 		}
 	}()
 
@@ -219,6 +266,50 @@ func run(ctx context.Context) error {
 			kilnExitStatus.VMExitCode = pointer.Int64(int64(state.ExitCode()))
 
 			return finalize(config, kilnExitStatus, finalizers...)
+		}
+	}
+}
+
+func handleVMLogs(src net.Conn, logger *vm.Logger) {
+	defer src.Close()
+
+	writeLine := func(line []byte) {
+		lineStr := strings.TrimRight(string(line), " \t\r\n")
+		if lineStr == "" {
+			return
+		}
+		logger.Log(lineStr)
+	}
+
+	reader := bufio.NewReader(src)
+	var buf *bytebufferpool.ByteBuffer
+	for {
+		line, isPrefix, err := reader.ReadLine()
+
+		switch {
+		case errors.Is(err, io.EOF):
+			slog.Debug("done reading lines into chan")
+			return
+		case err != nil:
+			slog.Warn("failed to read line", "error", err)
+			time.Sleep(100 * time.Millisecond)
+		case isPrefix:
+			if buf == nil {
+				buf = bytebufferpool.Get()
+			}
+			buf.B = append(buf.B, line...)
+		case line == nil:
+			// skip nil lines
+		case buf == nil:
+			// did not need to buffer, send as-is!
+			writeLine(line)
+		default:
+			// insert the remaining bits of the line
+			buf.B = append(buf.B, line...)
+			// had to buffer, send the buffer's content
+			writeLine(buf.B)
+			bytebufferpool.Put(buf)
+			buf.Reset()
 		}
 	}
 }

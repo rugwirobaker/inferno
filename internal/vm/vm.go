@@ -4,15 +4,12 @@ package vm
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
 
-	"github.com/rugwirobaker/inferno/internal/firecracker"
-	"github.com/rugwirobaker/inferno/internal/image"
-	"github.com/rugwirobaker/inferno/internal/kiln"
 	"golang.org/x/sys/unix"
 )
 
@@ -26,9 +23,8 @@ const (
 )
 
 type Config struct {
-	Image       *image.Config
-	Kiln        *kiln.Config
-	Firecracker *firecracker.Config
+	Chroot      string
+	LogPathSock string
 }
 
 type VM struct {
@@ -55,11 +51,11 @@ func (vm *VM) Start(ctx context.Context) error {
 	vm.Mutex.Lock()
 	defer vm.Mutex.Unlock()
 
-	if err := unix.Mkfifo(*vm.Config.Kiln.Log.Path, 0o666); err != nil && !os.IsExist(err) {
+	if err := unix.Mkfifo(vm.Config.LogPathSock, 0o666); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("could not create firefly fifo: %w", err)
 	}
 
-	kilnConfigPath := filepath.Join(vm.Config.Kiln.ChrootPath, "kiln.json")
+	kilnConfigPath := filepath.Join(vm.Config.Chroot, "kiln.json")
 
 	// create cmd
 	cmd := exec.Command("kiln", "--config", kilnConfigPath)
@@ -82,7 +78,7 @@ func (vm *VM) Start(ctx context.Context) error {
 	go func() {
 		// wait for the process to finish
 		if err := cmd.Wait(); err != nil {
-			log.Print("kiln process failed", "error", err)
+			slog.Error("kiln process failed", "error", err)
 		}
 	}()
 

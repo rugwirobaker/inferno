@@ -191,9 +191,8 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		vm := vm.New(id, &vm.Config{
-			Image:       img,
-			Kiln:        kilnConfig,
-			Firecracker: fcConfig,
+			Chroot:      kilnConfig.ChrootPath,
+			LogPathSock: filepath.Join(cfg.StateBaseDir, "app_logs.sock"),
 		})
 
 		if err := vm.Start(ctx); err != nil {

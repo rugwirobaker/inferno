@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -47,7 +48,7 @@ func WithFlushTimeout(timeout time.Duration) Option {
 // - factory: Function to create new WriterCloser instances.
 // - queueSize: Size of the log entry queue.
 // - flushTimeout: Maximum time to wait during flush.
-func NewLogger(ctx context.Context, factory writerFactory, opts ...Option) (*Logger, error) {
+func NewLogger(ctx context.Context, factory WriterFactory, opts ...Option) (*Logger, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	var options = Options{
@@ -161,12 +162,19 @@ func (l *Logger) Close() {
 	})
 }
 
-// writerFactory defines a function that returns a new io.WriteCloser.
-type writerFactory func(ctx context.Context) (io.WriteCloser, error)
+// WriterFactory defines a function that returns a new io.WriteCloser.
+type WriterFactory func(ctx context.Context) (io.WriteCloser, error)
+
+func SocketWriterFactory(ctx context.Context, addr string) WriterFactory {
+	return func(ctx context.Context) (io.WriteCloser, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", addr)
+	}
+}
 
 // retriableWriter wraps an io.WriteCloser and provides retry logic with backoff.
 type retriableWriter struct {
-	factory writerFactory
+	factory WriterFactory
 	backoff backoff.Backoff
 
 	mu     sync.RWMutex
@@ -178,7 +186,7 @@ type retriableWriter struct {
 
 // newRetriableWriter initializes a RetriableWriter with the initial WriterCloser.
 // It configures the backoff strategy for retries.
-func newRetriableWriter(ctx context.Context, factory writerFactory) (*retriableWriter, error) {
+func newRetriableWriter(ctx context.Context, factory WriterFactory) (*retriableWriter, error) {
 	writer, err := factory(ctx)
 	if err != nil {
 		return nil, err
