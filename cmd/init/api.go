@@ -33,7 +33,7 @@ func KillHandler(killChan chan syscall.Signal) http.Handler {
 		// validate the signal via syscall.Signal
 		sig := syscall.Signal(ks.Signal)
 		switch sig {
-		case syscall.SIGTERM, syscall.SIGKILL:
+		case syscall.SIGTERM, syscall.SIGINT:
 			break
 		default:
 			slog.Error("Invalid signal", "signal", ks.Signal)

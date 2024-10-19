@@ -12,6 +12,13 @@ type Config struct {
 	Process Process           `json:"process"`
 	Env     map[string]string `json:"env"`
 	Vsock   Vsock             `json:"vsock"`
+	Log     Log               `json:"log"`
+}
+
+type Log struct {
+	Format    string `yaml:"format"`    // "text", "json"
+	Timestamp bool   `yaml:"timestamp"` // show timestamp
+	Debug     bool   `yaml:"debug"`     // include debug logging
 }
 
 type Vsock struct {

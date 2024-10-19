@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
@@ -16,11 +15,15 @@ import (
 
 	"syscall"
 
+	"github.com/mdlayher/vsock"
 	"github.com/rugwirobaker/inferno/internal/image"
 	"github.com/rugwirobaker/inferno/internal/linux"
 )
 
-const paths = "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+const (
+	paths = "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+	port  = 10000
+)
 
 var LogLevel struct {
 	sync.Mutex
@@ -31,6 +34,8 @@ var LogLevel struct {
 // after the Kernel has started.
 func main() {
 	fmt.Printf("inferno init started\n")
+
+	ctx := context.Background()
 
 	if err := linux.Mount("none", "/proc", "proc", 0); err != nil {
 		log.Fatalf("error mounting /proc: %v", err)
@@ -56,12 +61,29 @@ func main() {
 		panic(fmt.Sprintf("could not read run.json, error: %s", err))
 	}
 
+	if err := configureLogger(config); err != nil {
+		panic(fmt.Sprintf("could not configure logger, error: %s", err))
+	}
+
 	if err := setHostname(config.ID); err != nil {
 		panic(err)
 	}
 
+	client, err := NewVsockClient(ctx, port)
+	if err != nil {
+		slog.Error("Failed to create vsock client", "error", err)
+		os.Exit(1)
+	}
+
 	// / Create the kill signal channel and pass it to the HTTP handler
 	killChan := make(chan syscall.Signal, 1)
+
+	listener, err := vsock.Listen(10000, nil)
+	if err != nil {
+		slog.Error("Failed to listen on vsock", "error", err)
+		os.Exit(1)
+	}
+	defer listener.Close()
 
 	// Start the main process in the VM
 	cmd := exec.Command(config.Process.Cmd, config.Process.Args...)
@@ -82,7 +104,6 @@ func main() {
 
 	// Setup HTTP server with timeouts and graceful shutdown
 	server := &http.Server{
-		Addr:         ":8080",
 		Handler:      KillHandler(killChan),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -91,9 +112,11 @@ func main() {
 
 	// Start HTTP server in a goroutine and wait for shutdown signal
 	go func() {
-		log.Println("Starting HTTP server on :8080")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server failed: %v", err)
+		slog.Debug("Serving Init API on vsock", "port", port)
+
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			slog.Error("HTTP server failed", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -108,16 +131,17 @@ func main() {
 	}()
 
 	// Initialize exit status
-	var exitStatus ExitStatus
+	var exit ExitStatus
 
 	// Wait for kill signals or child process exit in a loop
 	select {
 	case signal := <-killChan:
-		log.Printf("Received kill signal: %d, sending to child process (PID: %d)", signal, cmd.Process.Pid)
-		syscall.Kill(cmd.Process.Pid, syscall.Signal(signal))
-		err := cmd.Wait() // Wait for child to exit after receiving the signal
-		if err != nil {
-			exitStatus = ExitStatus{
+		slog.Debug("Received kill signal", "signal", signal, "pid", cmd.Process.Pid)
+		_ = syscall.Kill(cmd.Process.Pid, syscall.Signal(signal))
+
+		// Wait for child to exit after receiving the signal
+		if err := cmd.Wait(); err != nil {
+			exit = ExitStatus{
 				ExitCode:  -1,
 				OOMKilled: false,
 				Message:   fmt.Sprintf("Process terminated with signal %d", signal),
@@ -127,13 +151,13 @@ func main() {
 	case err := <-childExited:
 		switch {
 		case err != nil:
-			exitStatus = ExitStatus{
+			exit = ExitStatus{
 				ExitCode:  -1,
 				OOMKilled: false,
 				Message:   fmt.Sprintf("Main process exited with error: %v", err),
 			}
 		default:
-			exitStatus = ExitStatus{
+			exit = ExitStatus{
 				ExitCode:  0,
 				OOMKilled: false,
 				Message:   "Main process exited normally",
@@ -144,20 +168,22 @@ func main() {
 
 	// OOM killer detection
 	if checkOOMKill(cmd.Process.Pid) {
-		exitStatus.OOMKilled = true
-		exitStatus.Message = "Process was killed by OOM killer"
+		exit.OOMKilled = true
+		exit.Message = "Process was killed by OOM killer"
+	}
+
+	if err := sendExitStatus(ctx, client, exit); err != nil {
+		slog.Debug("Failed to send exit status", "error", err)
 	}
 
 	// Gracefully shut down the HTTP server
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("HTTP server Shutdown failed: %v", err)
+		slog.Error("HTTP server Shutdown failed", "error", err)
+		os.Exit(1)
 	}
-	log.Println("HTTP server gracefully stopped")
-
-	// Write exit status to file(TODO: send via vsock)
-	writeExitStatus(exitStatus)
+	slog.Info("HTTP server gracefully stopped")
 }
 
 func setHostname(hostname string) error {
@@ -179,7 +205,7 @@ type ExitStatus struct {
 func handleSystemSignals(killChan chan syscall.Signal) {
 	sigChan := make(chan os.Signal, 1)
 
-	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGKILL)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 
 	go func() {
 		for sig := range sigChan {
@@ -187,21 +213,6 @@ func handleSystemSignals(killChan chan syscall.Signal) {
 			killChan <- syscall.Signal(sig.(syscall.Signal))
 		}
 	}()
-}
-
-// Function to write the exit status
-func writeExitStatus(exitStatus ExitStatus) {
-	file, err := os.Create("/inferno/exit_status.json") // You can modify the path as needed
-	if err != nil {
-		log.Printf("Error creating exit status file: %v", err)
-		return
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(exitStatus); err != nil {
-		log.Printf("Error writing exit status: %v", err)
-	}
 }
 
 // Function to check if the process was killed by the OOM killer
@@ -225,4 +236,33 @@ func checkOOMKill(pid int) bool {
 	}
 
 	return false
+}
+
+func configureLogger(c *image.Config) error {
+	opts := slog.HandlerOptions{Level: &LogLevel}
+
+	if !c.Log.Timestamp {
+		opts.ReplaceAttr = removeTime
+	}
+
+	var handler slog.Handler
+	switch format := c.Log.Format; format {
+	case "text":
+		handler = slog.NewTextHandler(os.Stderr, &opts)
+	case "json":
+		handler = slog.NewJSONHandler(os.Stderr, &opts)
+	default:
+		return fmt.Errorf("invalid log format: %q", format)
+	}
+
+	slog.SetDefault(slog.New(handler))
+	return nil
+}
+
+// removeTime removes the "time" field from slog.
+func removeTime(groups []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.TimeKey {
+		return slog.Attr{}
+	}
+	return a
 }
