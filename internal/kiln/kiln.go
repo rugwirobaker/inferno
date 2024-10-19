@@ -142,6 +142,9 @@ func run(ctx context.Context) error {
 	}
 	defer listener.Close()
 
+	// some clean tasks to run at the end
+	var finalizers []FinalizerFunc
+
 	// Start the vsock server
 	// Create exit status channel
 	exitStatusChan := make(chan InitExitStatus)
@@ -157,6 +160,14 @@ func run(ctx context.Context) error {
 			WriteTimeout: 10 * time.Second,
 			IdleTimeout:  120 * time.Second,
 		}
+
+		finalizers = append(finalizers, func() error {
+			slog.Info("Stopping vsock server")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			return server.Shutdown(ctx)
+		})
+
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			slog.Error("Error serving exit status", "error", err)
 		}
@@ -164,10 +175,8 @@ func run(ctx context.Context) error {
 
 	// Wait for the Firecracker process to complete
 	ps := cmd.Process
-
 	waitErr := make(chan error)
 	waitState := make(chan *os.ProcessState)
-
 	go func() {
 		state, err := ps.Wait()
 		if err != nil {
@@ -204,12 +213,12 @@ func run(ctx context.Context) error {
 			if !state.Success() {
 				slog.Error("Firecracker execution failed", "exitCode", state.ExitCode())
 				kilnExitStatus.VMExitCode = pointer.Int64(int64(state.ExitCode()))
-				return finalize(config, kilnExitStatus)
+				return finalize(config, kilnExitStatus, finalizers...)
 			}
 			slog.Info("Firecracker execution completed", "exitCode", state.ExitCode())
 			kilnExitStatus.VMExitCode = pointer.Int64(int64(state.ExitCode()))
 
-			return finalize(config, kilnExitStatus)
+			return finalize(config, kilnExitStatus, finalizers...)
 		}
 	}
 }

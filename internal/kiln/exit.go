@@ -23,9 +23,15 @@ type KilnExitStatus struct {
 	OOMKilled *bool   `json:"oom_killed,omitempty"`
 }
 
+type FinalizerFunc func() error
+
 // finalize cleans up the kiln process and writes the exit status to exit_status.json
-func finalize(config *Config, exitStatus KilnExitStatus) (err error) {
-	// Write the exit status to exit_status.json
+func finalize(config *Config, exitStatus KilnExitStatus, finalizers ...FinalizerFunc) (err error) {
+	for _, f := range finalizers {
+		if err := f(); err != nil {
+			slog.Error("Failed to run finalizer", "error", err)
+		}
+	}
 	if err := writeExitStatus(config.ExitStatusPath, exitStatus); err != nil {
 		slog.Error("Failed to write exit status", "error", err)
 		return err
