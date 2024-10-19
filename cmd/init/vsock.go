@@ -5,29 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
-
-	"github.com/mdlayher/vsock"
 )
-
-func NewVsockClient(ctx context.Context, port uint32) (*http.Client, error) {
-	// Dial to the host server over vsock
-	conn, err := vsock.Dial(2, port, nil) // Connect to host CID (2) and the specified port
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to host via vsock: %v", err)
-	}
-
-	// Create an HTTP client that uses the VSOCK connection
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return conn, nil
-			},
-		},
-	}
-	return client, nil
-}
 
 func sendExitStatus(ctx context.Context, client *http.Client, exitStatus ExitStatus) error {
 	// Encode the exit status as JSON

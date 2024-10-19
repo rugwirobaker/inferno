@@ -15,9 +15,10 @@ import (
 
 	"syscall"
 
-	"github.com/mdlayher/vsock"
 	"github.com/rugwirobaker/inferno/internal/image"
 	"github.com/rugwirobaker/inferno/internal/linux"
+	"github.com/rugwirobaker/inferno/internal/pointer"
+	"github.com/rugwirobaker/inferno/internal/vsock"
 )
 
 const (
@@ -69,21 +70,20 @@ func main() {
 		panic(err)
 	}
 
-	client, err := NewVsockClient(ctx, port)
+	client, err := vsock.NewClient(ctx, uint32(config.VsockExitPort))
 	if err != nil {
 		slog.Error("Failed to create vsock client", "error", err)
 		os.Exit(1)
 	}
 
-	// / Create the kill signal channel and pass it to the HTTP handler
-	killChan := make(chan syscall.Signal, 1)
-
-	listener, err := vsock.Listen(10000, nil)
+	listener, err := vsock.NewVsockListener(uint32(config.VsockSignalPort))
 	if err != nil {
-		slog.Error("Failed to listen on vsock", "error", err)
+		slog.Error("Failed to create vsock listener", "error", err)
 		os.Exit(1)
 	}
-	defer listener.Close()
+
+	// / Create the kill signal channel and pass it to the HTTP handler
+	killChan := make(chan syscall.Signal, 1)
 
 	// Start the main process in the VM
 	cmd := exec.Command(config.Process.Cmd, config.Process.Args...)
@@ -144,6 +144,7 @@ func main() {
 			exit = ExitStatus{
 				ExitCode:  -1,
 				OOMKilled: false,
+				Signal:    pointer.Int(int(signal)),
 				Message:   fmt.Sprintf("Process terminated with signal %d", signal),
 			}
 		}
@@ -199,6 +200,7 @@ type ExitStatus struct {
 	ExitCode  int    `json:"exit_code"`
 	OOMKilled bool   `json:"oom_killed"`
 	Message   string `json:"message"`
+	Signal    *int   `json:"signal,omitempty"`
 }
 
 // signal handling function to gracefully handle OS/system kill signals

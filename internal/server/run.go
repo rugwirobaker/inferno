@@ -22,6 +22,7 @@ import (
 	"github.com/rugwirobaker/inferno/internal/linux"
 	"github.com/rugwirobaker/inferno/internal/pointer"
 	"github.com/rugwirobaker/inferno/internal/vm"
+	"github.com/rugwirobaker/inferno/internal/vsock"
 )
 
 const (
@@ -291,7 +292,7 @@ func firecrackerConfig(id, chroot, initrdPath string) (*firecracker.Config, erro
 		},
 		VsockDevices: []firecracker.VsockDevice{
 			{
-				GuestCID: 3,
+				GuestCID: 3, // guest CID is always 3
 				VsockID:  "control",
 				UDSPath:  "control.sock",
 			},
@@ -310,7 +311,11 @@ func kilnConfig(id, chroot string, resources kiln.Resources) (*kiln.Config, erro
 		FirecrackerSocketPath:   "/firecracker.sock",
 		FirecrackerConfigPath:   "firecracker.json",
 		FirecrackerVsockUDSPath: "control.sock",
-		Resources:               resources,
+
+		VsockStdoutPort:  vsock.VsockStdoutPort,
+		VsockExitPort:    vsock.VsockExitPort,
+		VsockMetricsPort: vsock.VsockMetricsPort,
+		Resources:        resources,
 	}, nil
 }
 

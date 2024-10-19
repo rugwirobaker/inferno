@@ -11,20 +11,19 @@ type Config struct {
 	ID      string            `json:"id"`
 	Process Process           `json:"process"`
 	Env     map[string]string `json:"env"`
-	Vsock   Vsock             `json:"vsock"`
 	Log     Log               `json:"log"`
+
+	VsockStdoutPort  int `json:"vsock_stdout_port"`  // send stdout/stderr to the host
+	VsockExitPort    int `json:"vsock_exit_port"`    // send exit code to the host
+	VsockMetricsPort int `json:"vsock_metrics_port"` // send metrics to the host
+	VsockSignalPort  int `json:"vsock_signal_port"`  // receive kill signal from the host
+
 }
 
 type Log struct {
 	Format    string `yaml:"format"`    // "text", "json"
 	Timestamp bool   `yaml:"timestamp"` // show timestamp
 	Debug     bool   `yaml:"debug"`     // include debug logging
-}
-
-type Vsock struct {
-	CID  uint32
-	Path string
-	Port uint32
 }
 
 type Process struct {

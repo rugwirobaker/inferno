@@ -4,14 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/rugwirobaker/inferno/internal/command"
 	"github.com/rugwirobaker/inferno/internal/flag"
+	"github.com/rugwirobaker/inferno/internal/pointer"
+	"github.com/rugwirobaker/inferno/internal/vsock"
 	"github.com/spf13/cobra"
 )
 
@@ -79,6 +84,9 @@ var LogLevel struct {
 func run(ctx context.Context) error {
 	var chroot = "/" // we're in jail already
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
 	config, err := configFromFile(filepath.Join(chroot, "kiln.json"))
 	if err != nil {
 		slog.Error("Failed to load kiln config", "error", err)
@@ -125,6 +133,35 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	vsockExitPath := fmt.Sprintf("%s_%d", config.FirecrackerVsockUDSPath, config.VsockExitPort)
+
+	listener, err := vsock.NewVsockUnixListener(vsockExitPath)
+	if err != nil {
+		slog.Error("Failed to start vsock listener", "error", err)
+		return err
+	}
+	defer listener.Close()
+
+	// Start the vsock server
+	// Create exit status channel
+	exitStatusChan := make(chan InitExitStatus)
+
+	// Start the server that handles exit status requests
+	go func() {
+		slog.Info("Serving exit status on vsock")
+		mux := http.NewServeMux()
+		mux.HandleFunc("/exit", ExitStatusHandler(exitStatusChan))
+		server := &http.Server{
+			Handler:      mux,
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 10 * time.Second,
+			IdleTimeout:  120 * time.Second,
+		}
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			slog.Error("Error serving exit status", "error", err)
+		}
+	}()
+
 	// Wait for the Firecracker process to complete
 	ps := cmd.Process
 
@@ -140,20 +177,41 @@ func run(ctx context.Context) error {
 		waitState <- state
 	}()
 
-	select {
-	case err := <-waitErr:
-		slog.Error("Firecracker execution failed", "error", err)
-		return err
-	case state := <-waitState:
-		if !state.Success() {
-			slog.Error("Firecracker execution failed", "exitCode", state.ExitCode())
-			return fmt.Errorf("firecracker exited with code %d", state.ExitCode())
+	kilnExitStatus := KilnExitStatus{}
+
+	for {
+
+		select {
+		case sig := <-sigChan: // we received a signal
+			slog.Info("Relaying signal to Firecracker", "signal", sig)
+			if err := ps.Signal(sig); err != nil {
+				slog.Error("Failed to stop Firecracker", "error", err)
+			}
+		case exitStatus := <-exitStatusChan: // the main process has exited
+			slog.Info("Received exit status", "exitCode", exitStatus.ExitCode, "oomKilled", exitStatus.OOMKilled, "message", exitStatus.Message)
+
+			kilnExitStatus.ExitCode = pointer.Int64(exitStatus.ExitCode)
+			kilnExitStatus.OOMKilled = pointer.Bool(exitStatus.OOMKilled)
+			kilnExitStatus.Error = pointer.String(exitStatus.Message)
+			kilnExitStatus.Signal = pointer.Int64(int64(exitStatus.Signal))
+
+		case err := <-waitErr: // firecracker process failed
+			slog.Error("Firecracker execution failed", "error", err)
+			kilnExitStatus.VMError = pointer.String(err.Error())
+			return finalize(config, kilnExitStatus)
+
+		case state := <-waitState: // firecracker process completed
+			if !state.Success() {
+				slog.Error("Firecracker execution failed", "exitCode", state.ExitCode())
+				kilnExitStatus.VMExitCode = pointer.Int64(int64(state.ExitCode()))
+				return finalize(config, kilnExitStatus)
+			}
+			slog.Info("Firecracker execution completed", "exitCode", state.ExitCode())
+			kilnExitStatus.VMExitCode = pointer.Int64(int64(state.ExitCode()))
+
+			return finalize(config, kilnExitStatus)
 		}
 	}
-
-	slog.Info("Firecracker execution complete", "vmID", vmID)
-
-	return nil
 }
 
 func configureLogger(c *Config) error {
@@ -183,21 +241,4 @@ func removeTime(groups []string, a slog.Attr) slog.Attr {
 		return slog.Attr{}
 	}
 	return a
-}
-
-func vsockListener(udsPath string, port int) (net.Listener, error) {
-	vsockPath := fmt.Sprintf("%s_%d", udsPath, port)
-
-	// Remove any old socket file before creating a new one
-	if err := os.RemoveAll(vsockPath); err != nil {
-		return nil, fmt.Errorf("failed to remove old vsock path: %w", err)
-	}
-
-	// Listen on the vsock path
-	listener, err := net.Listen("unix", vsockPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start vsock listener: %w", err)
-	}
-
-	return listener, nil
 }

@@ -31,8 +31,11 @@ type Config struct {
 	FirecrackerConfigPath   string `json:"firecracker_config_path"`
 	FirecrackerVsockUDSPath string `json:"firecracker_vsock_uds_path"`
 
-	VsockStdoutPort int `json:"vsock_stdout_port"` // receive stdout/stderr send over by the init
-	VsockExitPort   int `json:"vsock_exit_port"`   // receive exit code info from the init
+	VsockStdoutPort  int `json:"vsock_stdout_port"`  // receive stdout/stderr send over by the init
+	VsockExitPort    int `json:"vsock_exit_port"`    // receive exit code info from the init
+	VsockMetricsPort int `json:"vsock_metrics_port"` // request metrics from the init
+
+	ExitStatusPath string `json:"exit_status_path"`
 
 	Resources Resources `json:"resources"`
 }

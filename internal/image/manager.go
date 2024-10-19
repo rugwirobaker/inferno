@@ -9,6 +9,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/rugwirobaker/inferno/internal/vsock"
 )
 
 type Manager struct {
@@ -50,6 +51,10 @@ func (m *Manager) CreateConfig(ctx context.Context, imageName string) (*Config, 
 			Cmd:  cmd,
 			Args: args,
 		},
+		VsockStdoutPort:  vsock.VsockStdoutPort,
+		VsockExitPort:    vsock.VsockExitPort,
+		VsockMetricsPort: vsock.VsockMetricsPort,
+		VsockSignalPort:  vsock.VsockSignalPort,
 	}, nil
 }
 
