@@ -203,7 +203,7 @@ func run(ctx context.Context) error {
 				ctx, cancel := context.WithCancel(ctx)
 				defer cancel()
 
-				factory := vm.SocketWriterFactory(ctx, *config.Log.Path)
+				factory := vm.SocketWriterFactory(ctx, config.VMLogsSocketPath)
 
 				logger, err := vm.NewLogger(ctx, factory)
 				if err != nil {

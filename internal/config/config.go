@@ -12,32 +12,34 @@ import (
 )
 
 type Config struct {
-	StateBaseDir       string `yaml:"state_base_dir"`       // /var/lib/inferno
-	ImageBaseDir       string `yaml:"image_base_dir"`       // /var/lib/inferno/images
-	KernelPath         string `yaml:"kernel_path"`          // /var/lib/inferno/kernel
-	FirecrackerBinPath string `yaml:"firecracker_bin_path"` // /usr/local/bin/firecracker
-	KilnBinPath        string `yaml:"kiln_bin_path"`        // /usr/local/bin/kiln
-	InitPath           string `yaml:"init_path"`            // /var/lib/inferno/initrd.img
-	SocketFilePath     string `yaml:"socket_file"`          // /var/run/inferno.sock
-	Log                Log    `yaml:"log"`
+	StateBaseDir         string `yaml:"state_base_dir"`       // /var/lib/inferno
+	ImageBaseDir         string `yaml:"image_base_dir"`       // /var/lib/inferno/images
+	KernelPath           string `yaml:"kernel_path"`          // /var/lib/inferno/kernel
+	FirecrackerBinPath   string `yaml:"firecracker_bin_path"` // /usr/local/bin/firecracker
+	KilnBinPath          string `yaml:"kiln_bin_path"`        // /usr/local/bin/kiln
+	InitPath             string `yaml:"init_path"`            // /var/lib/inferno/initrd.img
+	VMLogsSocketPath     string `yaml:"vm_logs_socket_path"`  // /var/run/inferno_vm_logs.sock
+	ServerSocketFilePath string `yaml:"server_socket_path"`   // /var/run/inferno.sock
+	Log                  Log    `yaml:"log"`
 }
 
 type Log struct {
-	Format    string  `yaml:"format"`    // "text", "json"
-	Timestamp bool    `yaml:"timestamp"` // show timestamp
-	Debug     bool    `yaml:"debug"`     // include debug logging
-	Path      *string `yaml:"path"`      // /var/log/inferno.log
+	Format    string  `yaml:"format"`         // "text", "json"
+	Timestamp bool    `yaml:"timestamp"`      // show timestamp
+	Debug     bool    `yaml:"debug"`          // include debug logging
+	Path      *string `yaml:"path,omitempty"` // /var/log/inferno.log
 }
 
 func Default() *Config {
 	return &Config{
-		StateBaseDir:       "/var/lib/inferno",
-		ImageBaseDir:       "/var/lib/inferno/images",
-		KernelPath:         "/var/lib/inferno/kernel",
-		FirecrackerBinPath: "/usr/local/bin/firecracker",
-		KilnBinPath:        "/usr/local/bin/kiln",
-		InitPath:           "/var/lib/inferno/initrd.img",
-		SocketFilePath:     "/var/run/inferno.sock",
+		StateBaseDir:         "/var/lib/inferno",
+		ImageBaseDir:         "/var/lib/inferno/images",
+		KernelPath:           "/var/lib/inferno/kernel",
+		FirecrackerBinPath:   "/usr/local/bin/firecracker",
+		KilnBinPath:          "/usr/local/bin/kiln",
+		InitPath:             "/var/lib/inferno/initrd.img",
+		ServerSocketFilePath: "/var/run/inferno.sock",
+		VMLogsSocketPath:     "/var/run/inferno_vm_logs.sock",
 		Log: Log{
 			Format:    "text",
 			Timestamp: true,
@@ -75,7 +77,7 @@ func FromFile(path string) (*Config, error) {
 
 func (cfg *Config) OverrideWithFlags(ctx context.Context) {
 	if socketFile := flag.GetString(ctx, "socket-file"); socketFile != "" {
-		cfg.SocketFilePath = socketFile
+		cfg.ServerSocketFilePath = socketFile
 	}
 	if vmBaseDir := flag.GetString(ctx, "vm-base-dir"); vmBaseDir != "" {
 		cfg.StateBaseDir = vmBaseDir

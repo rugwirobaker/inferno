@@ -13,9 +13,10 @@ import (
 	"github.com/rugwirobaker/inferno/internal/image"
 	"github.com/rugwirobaker/inferno/internal/server"
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 )
 
-const defaultConfigFile = "/etc/inferno/inferno.conf"
+const defaultConfigFile = "/etc/inferno/inferno.yaml"
 
 func NewServerCommand() *cobra.Command {
 	const (
@@ -73,18 +74,23 @@ func runDaemon(ctx context.Context) error {
 		return fmt.Errorf("failed to ensure directories: %w", err)
 	}
 
+	// create the vm logs socket
+	if err := unix.Mkfifo(cfg.VMLogsSocketPath, 0o666); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("could not create vm logs fifo: %w", err)
+	}
+
 	// Ensure necessary files exist
 	if err := ensureFilesExist(cfg); err != nil {
 		return fmt.Errorf("failed to ensure files: %w", err)
 	}
 
 	// Remove existing socket file if it exists
-	if _, err := os.Stat(cfg.SocketFilePath); err == nil {
-		os.Remove(cfg.SocketFilePath)
+	if _, err := os.Stat(cfg.ServerSocketFilePath); err == nil {
+		os.Remove(cfg.ServerSocketFilePath)
 	}
 
 	// Start the Unix socket listener
-	listener, err := net.Listen("unix", cfg.SocketFilePath)
+	listener, err := net.Listen("unix", cfg.ServerSocketFilePath)
 	if err != nil {
 		return fmt.Errorf("failed to listen on socket: %w", err)
 	}

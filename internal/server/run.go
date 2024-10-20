@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -128,7 +127,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		// Convert run configuration to bytes (JSON)
 		imageConfigJSON, err := img.Marshal()
 		if err != nil {
-			log.Fatalf("Failed to marshal run config: %v", err)
+			logger.With(slog.String("vm-id", id)).Error("Failed to marshal image config", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -172,7 +171,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		// create kiln config
-		kilnConfig, err := kilnConfig(id, chroot, kiln.Resources{
+		kilnConfig, err := kilnConfig(id, cfg.VMLogsSocketPath, kiln.Resources{
 			CPUKind:  req.CPUKind,
 			CPUCount: req.CPUCount,
 			MemoryMB: req.MemoryMB,
@@ -191,8 +190,8 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		vm := vm.New(id, &vm.Config{
-			Chroot:      kilnConfig.ChrootPath,
-			LogPathSock: filepath.Join(cfg.StateBaseDir, "app_logs.sock"),
+			Chroot:      chroot,
+			LogPathSock: cfg.VMLogsSocketPath,
 		})
 
 		if err := vm.Start(ctx); err != nil {
@@ -300,13 +299,11 @@ func firecrackerConfig(id, chroot, initrdPath string) (*firecracker.Config, erro
 	return fcConfig, nil
 }
 
-func kilnConfig(id, chroot string, resources kiln.Resources) (*kiln.Config, error) {
+func kilnConfig(id, logSocket string, resources kiln.Resources) (*kiln.Config, error) {
 	return &kiln.Config{
 		JailID:                  id,
-		ChrootPath:              chroot,
 		UID:                     firecracker.DefaultJailerUID,
 		GID:                     firecracker.DefaultJailerGID,
-		NetNS:                   true,
 		FirecrackerSocketPath:   "/firecracker.sock",
 		FirecrackerConfigPath:   "firecracker.json",
 		FirecrackerVsockUDSPath: "control.sock",
@@ -314,6 +311,9 @@ func kilnConfig(id, chroot string, resources kiln.Resources) (*kiln.Config, erro
 		VsockStdoutPort:  vsock.VsockStdoutPort,
 		VsockExitPort:    vsock.VsockExitPort,
 		VsockMetricsPort: vsock.VsockMetricsPort,
+
+		VMLogsSocketPath: logSocket,
+		ExitStatusPath:   "exit-status.json",
 		Resources:        resources,
 	}, nil
 }

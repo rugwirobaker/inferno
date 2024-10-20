@@ -18,14 +18,11 @@ type Resources struct {
 
 // KilnConfig defines the full configuration for the Kiln jailer.
 type Config struct {
-	JailID        string `json:"jail_id"`
-	ChrootPath    string `json:"chroot"`
-	ChrootBaseDir string `json:"chroot_base_dir"`
-	UID           int    `json:"uid"`
-	GID           int    `json:"gid"`
-	Log           Log    `json:"log"`
+	JailID string `json:"jail_id"`
 
-	NetNS bool `json:"netns"`
+	UID int `json:"uid"`
+	GID int `json:"gid"`
+	Log Log `json:"log"`
 
 	FirecrackerSocketPath   string `json:"firecracker_socket_path"`
 	FirecrackerConfigPath   string `json:"firecracker_config_path"`
@@ -35,7 +32,8 @@ type Config struct {
 	VsockExitPort    int `json:"vsock_exit_port"`    // receive exit code info from the init
 	VsockMetricsPort int `json:"vsock_metrics_port"` // request metrics from the init
 
-	ExitStatusPath string `json:"exit_status_path"`
+	VMLogsSocketPath string `json:"vm_logs_socket_path"`
+	ExitStatusPath   string `json:"exit_status_path"`
 
 	Resources Resources `json:"resources"`
 }
@@ -80,20 +78,11 @@ func configWithFlags(ctx context.Context, cfg *Config) *Config {
 	if flagID := flag.GetString(ctx, "id"); flagID != "" {
 		cfg.JailID = flagID
 	}
-	if chroot := flag.GetString(ctx, "chroot"); chroot != "" {
-		cfg.ChrootPath = chroot
-	}
-	if chrootBaseDir := flag.GetString(ctx, "chroot-base-dir"); chrootBaseDir != "" {
-		cfg.ChrootBaseDir = chrootBaseDir
-	}
 	if uid := flag.GetInt(ctx, "uid"); uid != 0 {
 		cfg.UID = uid
 	}
 	if gid := flag.GetInt(ctx, "gid"); gid != 0 {
 		cfg.GID = gid
-	}
-	if netns := flag.GetBool(ctx, "netns"); netns {
-		cfg.NetNS = netns
 	}
 	if cpu := flag.GetInt(ctx, "cpu"); cpu != 0 {
 		cfg.Resources.CPUCount = cpu
