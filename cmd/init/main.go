@@ -116,15 +116,18 @@ func main() {
 	}
 
 	var wg sync.WaitGroup // Create a WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		streamLogs(stdout, stdoutConn)
+	}()
 
-	wg.Add(1) // Increment for stdout
-	go streamLogs(stdout, stdoutConn, &wg)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		streamLogs(stderr, stdoutConn)
+	}()
 
-	wg.Add(1) // Increment for stderr
-	go streamLogs(stderr, stdoutConn, &wg)
-
-	// Wait for all log streams to complete before exiting main
-	wg.Wait()
 	err = cmd.Start()
 	if err != nil {
 		panic(fmt.Sprintf("could not start %s, error: %s", config.Process.Cmd, err))
@@ -218,8 +221,7 @@ func main() {
 	slog.Info("HTTP server gracefully stopped")
 }
 
-func streamLogs(src io.ReadCloser, dst io.WriteCloser, wg *sync.WaitGroup) {
-	defer wg.Done()
+func streamLogs(src io.ReadCloser, dst io.WriteCloser) {
 	defer src.Close()
 	defer dst.Close()
 
