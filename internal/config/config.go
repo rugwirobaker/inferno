@@ -18,7 +18,7 @@ type Config struct {
 	FirecrackerBinPath   string `yaml:"firecracker_bin_path"` // /usr/local/bin/firecracker
 	KilnBinPath          string `yaml:"kiln_bin_path"`        // /usr/local/bin/kiln
 	InitPath             string `yaml:"init_path"`            // /var/lib/inferno/initrd.img
-	VMLogsSocketPath     string `yaml:"vm_logs_socket_path"`  // /var/run/inferno_vm_logs.sock
+	VMLogsSocketPath     string `yaml:"vm_logs_socket_path"`  // /opt/vector/vm_logs.sock
 	ServerSocketFilePath string `yaml:"server_socket_path"`   // /var/run/inferno.sock
 	Log                  Log    `yaml:"log"`
 }
@@ -39,7 +39,7 @@ func Default() *Config {
 		KilnBinPath:          "/usr/local/bin/kiln",
 		InitPath:             "/var/lib/inferno/initrd.img",
 		ServerSocketFilePath: "/var/run/inferno.sock",
-		VMLogsSocketPath:     "/var/run/inferno_vm_logs.sock",
+		VMLogsSocketPath:     "/opt/vector/vm_logs.sock",
 		Log: Log{
 			Format:    "text",
 			Timestamp: true,

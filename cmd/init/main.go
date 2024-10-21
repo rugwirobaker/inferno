@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -70,11 +71,19 @@ func main() {
 		panic(err)
 	}
 
-	client, err := vsock.NewClient(ctx, uint32(config.VsockExitPort))
+	client, err := vsock.NewHostClient(ctx, uint32(config.VsockExitPort))
 	if err != nil {
 		slog.Error("Failed to create vsock client", "error", err)
 		os.Exit(1)
 	}
+
+	// Open VSOCK connection for logging
+	stdoutConn, err := vsock.NewVsockConn(uint32(config.VsockStdoutPort))
+	if err != nil {
+		slog.Error("Failed to create vsock log connection", "error", err)
+		os.Exit(1)
+	}
+	defer stdoutConn.Close()
 
 	listener, err := vsock.NewVsockListener(uint32(config.VsockSignalPort))
 	if err != nil {
@@ -93,18 +102,30 @@ func main() {
 	for k, v := range config.Env {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slog.Error("Failed to capture stderr", "error", err)
+		os.Exit(1)
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		slog.Error("Failed to capture stderr", "error", err)
+		os.Exit(1)
+	}
+
+	go streamLogs(stdout, stdoutConn)
+	go streamLogs(stderr, stdoutConn)
 
 	err = cmd.Start()
 	if err != nil {
 		panic(fmt.Sprintf("could not start %s, error: %s", config.Process.Cmd, err))
 	}
 
-	// Setup HTTP server with timeouts and graceful shutdown
+	api := NewAPI(killChan)
 	server := &http.Server{
-		Handler:      KillHandler(killChan),
+		Handler:      api.Handler(),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -185,6 +206,17 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("HTTP server gracefully stopped")
+}
+
+func streamLogs(src io.ReadCloser, dst io.WriteCloser) {
+	defer src.Close()
+	defer dst.Close()
+
+	// Directly copy from pipe (stdout/stderr) to the VSOCK connection
+	_, err := io.Copy(dst, src)
+	if err != nil && err != io.EOF {
+		slog.Error("Failed to copy logs to vsock", "error", err)
+	}
 }
 
 func setHostname(hostname string) error {

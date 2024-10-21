@@ -171,7 +171,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		// create kiln config
-		kilnConfig, err := kilnConfig(id, cfg.VMLogsSocketPath, kiln.Resources{
+		kilnConfig, err := kilnConfig(id, filepath.Base(cfg.VMLogsSocketPath), kiln.Resources{
 			CPUKind:  req.CPUKind,
 			CPUCount: req.CPUCount,
 			MemoryMB: req.MemoryMB,

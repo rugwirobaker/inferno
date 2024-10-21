@@ -25,13 +25,22 @@ const (
 	VsockSignalPort
 )
 
-func NewClient(ctx context.Context, port uint32) (*http.Client, error) {
-	// Dial to the host server over vsock
-	conn, err := vsock.Dial(2, port, nil) // Connect to host CID (2) and the specified port
+// NewVsockConn creates a new vsock connection to the host via the specified port
+func NewVsockConn(port uint32) (net.Conn, error) {
+	conn, err := vsock.Dial(2, port, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to host via vsock: %v", err)
 	}
+	return conn, nil
+}
 
+// NewHostClient creates a new http client that connects to the host via /dev/vsock
+func NewHostClient(ctx context.Context, port uint32) (*http.Client, error) {
+	// Dial to the host server over vsock
+	conn, err := NewVsockConn(port)
+	if err != nil {
+		return nil, err
+	}
 	// Create an HTTP client that uses the VSOCK connection
 	client := &http.Client{
 		Transport: &http.Transport{

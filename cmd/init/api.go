@@ -7,6 +7,22 @@ import (
 	"syscall"
 )
 
+type API struct {
+	signalChan chan syscall.Signal
+}
+
+func NewAPI(signalChan chan syscall.Signal) *API {
+	return &API{signalChan: signalChan}
+}
+
+func (a *API) Handler() http.Handler {
+	v1 := http.NewServeMux()
+	v1.HandleFunc("/status", statusHandler)
+	v1.Handle("/signal", signalHandler(a.signalChan))
+	v1.Handle("/v1/", http.StripPrefix("/v1", v1))
+	return v1
+}
+
 type KillSignal struct {
 	Signal uint32 `json:"signal"`
 }
@@ -15,7 +31,13 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
-func KillHandler(killChan chan syscall.Signal) http.Handler {
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status": "ok"}`))
+}
+
+func signalHandler(killChan chan syscall.Signal) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		var ks KillSignal
 		if err := json.NewDecoder(r.Body).Decode(&ks); err != nil {
