@@ -1,0 +1,11 @@
+[sources.kiln_logs]
+  type = "socket"
+  mode = "unix_stream"
+  path = "./vm_logs.sock" 
+  socket_file_mode = 438 # 438 is the octal representation of 666
+
+[sinks.stdout]
+  type = "console"
+  inputs = ["kiln_logs"]
+  target = "stdout"
+  encoding.codec = "text" # You can also use "text" if you prefer plain output
