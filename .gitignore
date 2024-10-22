@@ -1,3 +1,14 @@
 bin
 inferno.y*ml
 dist/
+kiln.json
+firecracker
+firecracker.json
+firecracker.sock
+vmlinux
+initrd.*
+initramfs
+run.json
+exit_status.json
+kernel-build
+rootfs*

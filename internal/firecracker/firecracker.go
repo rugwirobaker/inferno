@@ -138,7 +138,11 @@ func ReadConfig(path string) (*Config, error) {
 }
 
 func DefaultBootArgs() []string {
-	return []string{"console=ttyS0", "reboot=k", "panic=1", "pci=off"}
+	return []string{
+		"console=ttyS0",
+		"reboot=k",
+		"panic=1",
+		"pci=off"}
 }
 
 // func DefaultBootArgs() []string {

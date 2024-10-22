@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,7 +19,9 @@ import (
 
 	"github.com/rugwirobaker/inferno/internal/command"
 	"github.com/rugwirobaker/inferno/internal/flag"
+	"github.com/rugwirobaker/inferno/internal/iostreams"
 	"github.com/rugwirobaker/inferno/internal/pointer"
+	"github.com/rugwirobaker/inferno/internal/render"
 	"github.com/rugwirobaker/inferno/internal/vm"
 	"github.com/rugwirobaker/inferno/internal/vsock"
 	"github.com/spf13/cobra"
@@ -77,6 +78,11 @@ func New() *cobra.Command {
 			Name:        "chroot-base-dir",
 			Description: " represents the base folder where chroot jails are built.",
 		},
+
+		flag.String{
+			Name:        "init",
+			Description: "Hijacks the command flow to generate a kiln.json file for testing",
+		},
 	)
 
 	return cmd
@@ -89,12 +95,15 @@ var LogLevel struct {
 
 // run handles the main logic for the jailer command
 func run(ctx context.Context) error {
-	var chroot = "/" // we're in jail already
+	if configPath := flag.GetString(ctx, "init"); configPath != "" {
+		return initConfig(ctx, configPath)
+	}
+	// var chroot = "/" // we're in jail already
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 
-	config, err := configFromFile(filepath.Join(chroot, "kiln.json"))
+	config, err := configFromFile("./kiln.json")
 	if err != nil {
 		slog.Error("Failed to load kiln config", "error", err)
 		return err
@@ -104,7 +113,7 @@ func run(ctx context.Context) error {
 	config = configWithFlags(ctx, config)
 
 	// Write the updated config back to kiln.json for debugging/tracing
-	if err := WriteConfig(filepath.Join(chroot, "kiln.json"), config); err != nil {
+	if err := WriteConfig("kiln.json", config); err != nil {
 		slog.Error("Failed to write updated kiln config", "error", err)
 		return err
 	}
@@ -122,13 +131,13 @@ func run(ctx context.Context) error {
 	// Prepare arguments for Firecracker execution
 	args := []string{
 		"--id", vmID,
-		"--api-sock", filepath.Join(chroot, config.FirecrackerSocketPath),
-		"--config-file", filepath.Join(chroot, config.FirecrackerConfigPath),
+		"--api-sock", config.FirecrackerSocketPath,
+		"--config-file", config.FirecrackerConfigPath,
 	}
 
 	// Start Firecracker using exec.Command
-	cmd := exec.Command("/firecracker", args...)
-	cmd.Dir = chroot // Ensure we run Firecracker within the chroot directory
+	cmd := exec.Command("./firecracker", args...)
+	// cmd.Dir = chroot // Ensure we run Firecracker within the chroot directory
 
 	// Set output to stdout/stderr for logging
 	cmd.Stdout = os.Stdout
@@ -258,7 +267,7 @@ func run(ctx context.Context) error {
 
 		case state := <-waitState: // firecracker process completed
 			if !state.Success() {
-				slog.Error("Firecracker execution failed", "exitCode", state.ExitCode())
+				slog.Error("Firecracker execution failed", "pid", state.Pid(), "exitCode", state.ExitCode())
 				kilnExitStatus.VMExitCode = pointer.Int64(int64(state.ExitCode()))
 				return finalize(config, kilnExitStatus, finalizers...)
 			}
@@ -341,4 +350,17 @@ func removeTime(groups []string, a slog.Attr) slog.Attr {
 		return slog.Attr{}
 	}
 	return a
+}
+
+func initConfig(ctx context.Context, configPath string) (err error) {
+	var io = iostreams.FromContext(ctx)
+	config := Default()
+
+	if err = WriteConfig(configPath, config); err != nil {
+		return
+	}
+
+	_ = render.JSON(io.Out, config)
+
+	return
 }

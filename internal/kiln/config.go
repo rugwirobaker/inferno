@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/rugwirobaker/inferno/internal/firecracker"
 	"github.com/rugwirobaker/inferno/internal/flag"
+	"github.com/rugwirobaker/inferno/internal/vsock"
 )
 
 // Resources defines the CPU and Memory limits for the VM.
@@ -43,6 +45,35 @@ type Log struct {
 	Timestamp bool    `yaml:"timestamp"` // show timestamp
 	Debug     bool    `yaml:"debug"`     // include debug logging
 	Path      *string `yaml:"path"`      // log file path
+}
+
+func Default() *Config {
+	return &Config{
+		JailID: "kiln",
+		UID:    firecracker.DefaultJailerGID,
+		GID:    firecracker.DefaultJailerGID,
+		Resources: Resources{
+			CPUCount: 1,
+			MemoryMB: 128,
+			CPUKind:  "C3",
+		},
+		FirecrackerSocketPath:   "firecracker.sock",
+		FirecrackerConfigPath:   "firecracker.json",
+		FirecrackerVsockUDSPath: "firecracker.sock",
+
+		VsockStdoutPort:  vsock.VsockStdoutPort,
+		VsockExitPort:    vsock.VsockExitPort,
+		VsockMetricsPort: vsock.VsockMetricsPort,
+
+		VMLogsSocketPath: "vm_logs.sock",
+		ExitStatusPath:   "exit_status.json",
+
+		Log: Log{
+			Format:    "text",
+			Timestamp: true,
+			Debug:     false,
+		},
+	}
 }
 
 func configFromFile(path string) (*Config, error) {

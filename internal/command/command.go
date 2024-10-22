@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/rugwirobaker/inferno/internal/flag"
+	"github.com/rugwirobaker/inferno/internal/iostreams"
 	"github.com/spf13/cobra"
 )
 
@@ -26,6 +27,9 @@ func newRunE(fn Runner) func(*cobra.Command, []string) error {
 		ctx := cmd.Context()
 		ctx = NewContext(ctx, cmd)
 		ctx = flag.NewContext(ctx, cmd.Flags())
+
+		io := iostreams.System()
+		ctx = iostreams.NewContext(ctx, io)
 
 		return fn(ctx)
 	}

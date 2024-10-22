@@ -22,10 +22,7 @@ import (
 	"github.com/rugwirobaker/inferno/internal/vsock"
 )
 
-const (
-	paths = "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
-	port  = 10000
-)
+const paths = "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 var LogLevel struct {
 	sync.Mutex
@@ -39,6 +36,9 @@ func main() {
 
 	ctx := context.Background()
 
+	if err := linux.Mount("none", "/dev", "devtmpfs", 0); err != nil {
+		log.Fatalf("error mounting /dev: %v", err)
+	}
 	if err := linux.Mount("none", "/proc", "proc", 0); err != nil {
 		log.Fatalf("error mounting /proc: %v", err)
 	}
@@ -58,6 +58,22 @@ func main() {
 		log.Fatalf("error mounting /sys/fs/cgroup: %v", err)
 	}
 
+	if err := os.MkdirAll("/newroot", 0755); err != nil {
+		log.Fatalf("error creating /newroot: %v", err)
+	}
+	if err := linux.Mount("/rootfs", "/newroot", "ext4", 0); err != nil {
+		log.Fatalf("error mounting /rootfs: %v", err)
+	}
+	if err := linux.PivotRoot("/newroot", "/newroot/oldroot"); err != nil {
+		log.Fatalf("error switching root: %v", err)
+	}
+	// Unmount the old root (now at /old_root) and remove it
+	if err := syscall.Unmount("/oldroot", syscall.MNT_DETACH); err != nil {
+		log.Fatalf("error unmounting old root: %v", err)
+	}
+	if err := os.Remove("/oldroot"); err != nil {
+		log.Fatalf("error removing old_root: %v", err)
+	}
 	config, err := image.FromFile("/inferno/run.json")
 	if err != nil {
 		panic(fmt.Sprintf("could not read run.json, error: %s", err))
@@ -73,7 +89,7 @@ func main() {
 
 	client, err := vsock.NewHostClient(ctx, uint32(config.VsockExitPort))
 	if err != nil {
-		slog.Error("Failed to create vsock client", "error", err)
+		slog.Error("Failed to create exit code vsock client", "error", err)
 		os.Exit(1)
 	}
 
@@ -130,7 +146,7 @@ func main() {
 
 	err = cmd.Start()
 	if err != nil {
-		panic(fmt.Sprintf("could not start %s, error: %s", config.Process.Cmd, err))
+		panic(fmt.Sprintf("could not start main process: %s", err))
 	}
 
 	api := NewAPI(killChan)
@@ -143,7 +159,7 @@ func main() {
 
 	// Start HTTP server in a goroutine and wait for shutdown signal
 	go func() {
-		slog.Debug("Serving Init API on vsock", "port", port)
+		slog.Debug("Serving Init API on vsock", "port", config.VsockSignalPort)
 
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server failed", "error", err)

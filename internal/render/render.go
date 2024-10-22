@@ -15,7 +15,7 @@ import (
 	"github.com/rugwirobaker/inferno/internal/iostreams"
 )
 
-func WriteJSON(w io.Writer, v interface{}) error {
+func JSON(w io.Writer, v interface{}) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
