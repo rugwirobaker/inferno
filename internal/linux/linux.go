@@ -1,25 +1,12 @@
 package linux
 
 import (
-	"fmt"
 	"io"
 	"os"
-	"syscall"
 )
 
 func Mount(source, target, filesystemtype string, flags uintptr) error {
-	if _, err := os.Stat(target); os.IsNotExist(err) {
-		err := os.MkdirAll(target, 0755)
-		if err != nil {
-			return fmt.Errorf("error creating target folder: %s %s", target, err)
-		}
-	}
-
-	err := syscall.Mount(source, target, filesystemtype, flags, "")
-	if err != nil {
-		return fmt.Errorf("error mounting %s to %s, error: %s", source, target, err)
-	}
-	return nil
+	return mount(source, target, filesystemtype, flags)
 }
 
 func CopyFile(src, dst string, perm os.FileMode) error {
