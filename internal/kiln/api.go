@@ -2,6 +2,7 @@ package kiln
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 )
 
@@ -23,6 +24,8 @@ func ExitStatusHandler(exitStatusChan chan InitExitStatus) http.HandlerFunc {
 			return
 		}
 		exitStatusChan <- exitStatus
+
+		slog.Info("Received exit status", "exitCode", exitStatus.ExitCode, "oomKilled", exitStatus.OOMKilled, "message", exitStatus.Message)
 
 		w.WriteHeader(http.StatusOK)
 	}

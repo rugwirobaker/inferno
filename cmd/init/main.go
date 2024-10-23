@@ -17,7 +17,6 @@ import (
 	"syscall"
 
 	"github.com/rugwirobaker/inferno/internal/image"
-	"github.com/rugwirobaker/inferno/internal/linux"
 	"github.com/rugwirobaker/inferno/internal/pointer"
 	"github.com/rugwirobaker/inferno/internal/vsock"
 )
@@ -36,47 +35,46 @@ func main() {
 
 	ctx := context.Background()
 
-	if err := linux.Mount("none", "/dev", "devtmpfs", 0); err != nil {
-		log.Fatalf("error mounting /dev: %v", err)
-	}
-	if err := linux.Mount("none", "/proc", "proc", 0); err != nil {
-		log.Fatalf("error mounting /proc: %v", err)
-	}
-	if err := linux.Mount("none", "/dev/pts", "devpts", 0); err != nil {
-		log.Fatalf("error mounting /dev/pts: %v", err)
-	}
-	if err := linux.Mount("none", "/dev/mqueue", "mqueue", 0); err != nil {
-		log.Fatalf("error mounting /dev/mqueue: %v", err)
-	}
-	if err := linux.Mount("none", "/dev/shm", "tmpfs", 0); err != nil {
-		log.Fatalf("error mounting /dev/shm: %v", err)
-	}
-	if err := linux.Mount("none", "/sys", "sysfs", 0); err != nil {
-		log.Fatalf("error mounting /sys: %v", err)
-	}
-	if err := linux.Mount("none", "/sys/fs/cgroup", "cgroup", 0); err != nil {
-		log.Fatalf("error mounting /sys/fs/cgroup: %v", err)
-	}
-
-	if err := os.MkdirAll("/newroot", 0755); err != nil {
-		log.Fatalf("error creating /newroot: %v", err)
-	}
-	if err := linux.Mount("/rootfs", "/newroot", "ext4", 0); err != nil {
-		log.Fatalf("error mounting /rootfs: %v", err)
-	}
-	if err := linux.PivotRoot("/newroot", "/newroot/oldroot"); err != nil {
-		log.Fatalf("error switching root: %v", err)
-	}
-	// Unmount the old root (now at /old_root) and remove it
-	if err := syscall.Unmount("/oldroot", syscall.MNT_DETACH); err != nil {
-		log.Fatalf("error unmounting old root: %v", err)
-	}
-	if err := os.Remove("/oldroot"); err != nil {
-		log.Fatalf("error removing old_root: %v", err)
-	}
 	config, err := image.FromFile("/inferno/run.json")
 	if err != nil {
 		panic(fmt.Sprintf("could not read run.json, error: %s", err))
+	}
+
+	if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", syscall.MS_NOSUID, "mode=0755"); err != nil {
+		log.Fatalf("Failed to mount devtmpfs to /dev: %v", err)
+	}
+	// mount root device at /rootfs
+	if err := os.MkdirAll("/rootfs", 0755); err != nil {
+		log.Fatal(err)
+	}
+	if err := syscall.Mount("/dev/vda", "/rootfs", "ext4", syscall.MS_RELATIME, ""); err != nil {
+		log.Fatalf("Failed to mount /dev/vdb to /rootfs: %v", err)
+	}
+
+	if err := os.MkdirAll("/rootfs/dev", 0755); err != nil {
+		log.Fatalf("failed to create /rootfs/dev: %v", err)
+	}
+	if err := syscall.Mount("/dev", "/rootfs/dev", "", syscall.MS_MOVE, ""); err != nil {
+		log.Fatalf("error mounting /dev to /rootfs/dev: %v", err)
+	}
+
+	// change root to /rootfs
+	if err := os.Chdir("/rootfs"); err != nil {
+		log.Fatalf("Failed to change directory to /newroot: %v", err)
+	}
+	if err := syscall.Mount(".", "/", "", syscall.MS_MOVE, ""); err != nil {
+		log.Fatalf("Failed to mount new root over /: %v", err)
+	}
+	if err := syscall.Chroot("."); err != nil {
+		log.Fatalf("Failed to chroot to the new root: %v", err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		log.Fatalf("Failed to change directory to new /: %v", err)
+	}
+
+	// finally mount other filesystems
+	if err := mountFS(); err != nil {
+		log.Fatalf("Failed to mount filesystems: %v", err)
 	}
 
 	if err := configureLogger(config); err != nil {
@@ -302,6 +300,10 @@ func checkOOMKill(pid int) bool {
 }
 
 func configureLogger(c *image.Config) error {
+	if c.Log.Debug {
+		LogLevel.Set(slog.LevelDebug)
+	}
+
 	opts := slog.HandlerOptions{Level: &LogLevel}
 
 	if !c.Log.Timestamp {
