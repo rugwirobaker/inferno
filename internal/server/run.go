@@ -18,8 +18,8 @@ import (
 	"github.com/rugwirobaker/inferno/internal/firecracker"
 	"github.com/rugwirobaker/inferno/internal/image"
 	"github.com/rugwirobaker/inferno/internal/kiln"
-	"github.com/rugwirobaker/inferno/internal/linux"
 	"github.com/rugwirobaker/inferno/internal/pointer"
+	"github.com/rugwirobaker/inferno/internal/sys"
 	"github.com/rugwirobaker/inferno/internal/vm"
 	"github.com/rugwirobaker/inferno/internal/vsock"
 )
@@ -76,21 +76,21 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		// Copy the kernel and init to the chroot
-		if err := linux.CopyFile(cfg.KernelPath, filepath.Join(chroot, "vmlinux"), 0644); err != nil {
+		if err := sys.CopyFile(cfg.KernelPath, filepath.Join(chroot, "vmlinux"), 0644); err != nil {
 			logger.With(slog.String("vm-id", id)).Error("Failed to copy kernel", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// copy the firecracker binary to the chroot
-		if err := linux.CopyFile(cfg.FirecrackerBinPath, filepath.Join(chroot, "firecracker"), 0755); err != nil {
+		if err := sys.CopyFile(cfg.FirecrackerBinPath, filepath.Join(chroot, "firecracker"), 0755); err != nil {
 			logger.With(slog.String("vm-id", id)).Error("Failed to copy firecracker", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		// copy kiln binary to the chroot
-		if err := linux.CopyFile(cfg.KilnBinPath, filepath.Join(chroot, "kiln"), 0755); err != nil {
+		if err := sys.CopyFile(cfg.KilnBinPath, filepath.Join(chroot, "kiln"), 0755); err != nil {
 			logger.With(slog.String("vm-id", id)).Error("Failed to copy kiln", "error", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

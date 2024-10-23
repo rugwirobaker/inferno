@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,8 +30,6 @@ var LogLevel struct {
 // main starts an init process that can prepare an environment and start a shell
 // after the Kernel has started.
 func main() {
-	fmt.Printf("inferno init started\n")
-
 	ctx := context.Background()
 
 	config, err := image.FromFile("/inferno/run.json")
@@ -40,49 +37,62 @@ func main() {
 		panic(fmt.Sprintf("could not read run.json, error: %s", err))
 	}
 
-	if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", syscall.MS_NOSUID, "mode=0755"); err != nil {
-		log.Fatalf("Failed to mount devtmpfs to /dev: %v", err)
-	}
-	// mount root device at /rootfs
-	if err := os.MkdirAll("/rootfs", 0755); err != nil {
-		log.Fatal(err)
-	}
-	if err := syscall.Mount("/dev/vda", "/rootfs", "ext4", syscall.MS_RELATIME, ""); err != nil {
-		log.Fatalf("Failed to mount /dev/vdb to /rootfs: %v", err)
-	}
-
-	if err := os.MkdirAll("/rootfs/dev", 0755); err != nil {
-		log.Fatalf("failed to create /rootfs/dev: %v", err)
-	}
-	if err := syscall.Mount("/dev", "/rootfs/dev", "", syscall.MS_MOVE, ""); err != nil {
-		log.Fatalf("error mounting /dev to /rootfs/dev: %v", err)
-	}
-
-	// change root to /rootfs
-	if err := os.Chdir("/rootfs"); err != nil {
-		log.Fatalf("Failed to change directory to /newroot: %v", err)
-	}
-	if err := syscall.Mount(".", "/", "", syscall.MS_MOVE, ""); err != nil {
-		log.Fatalf("Failed to mount new root over /: %v", err)
-	}
-	if err := syscall.Chroot("."); err != nil {
-		log.Fatalf("Failed to chroot to the new root: %v", err)
-	}
-	if err := os.Chdir("/"); err != nil {
-		log.Fatalf("Failed to change directory to new /: %v", err)
-	}
-
-	// finally mount other filesystems
-	if err := mountFS(); err != nil {
-		log.Fatalf("Failed to mount filesystems: %v", err)
-	}
-
 	if err := configureLogger(config); err != nil {
 		panic(fmt.Sprintf("could not configure logger, error: %s", err))
 	}
 
+	slog.Info("inferno init started")
+
+	slog.With("config", config).Debug("loaded config")
+
+	if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", syscall.MS_NOSUID, "mode=0755"); err != nil {
+		slog.Error("Failed to mount devtmpfs to /dev", "error", err)
+		os.Exit(1)
+	}
+	// mount root device at /rootfs
+	if err := os.MkdirAll("/rootfs", 0755); err != nil {
+		slog.Error("Failed to create /rootfs", "error", err)
+		os.Exit(1)
+	}
+	if err := syscall.Mount("/dev/vda", "/rootfs", "ext4", syscall.MS_RELATIME, ""); err != nil {
+		slog.Error("Failed to mount /dev/vda to /rootfs", "error", err)
+		os.Exit(1)
+	}
+
+	if err := os.MkdirAll("/rootfs/dev", 0755); err != nil {
+		slog.Error("Failed to create /rootfs/dev", "error", err)
+		os.Exit(1)
+	}
+	if err := syscall.Mount("/dev", "/rootfs/dev", "", syscall.MS_MOVE, ""); err != nil {
+		slog.Error("Failed to mount /dev to /rootfs/dev", "error", err)
+		os.Exit(1)
+	}
+
+	// change root to /rootfs
+	if err := os.Chdir("/rootfs"); err != nil {
+		slog.Error("Failed to change directory to /rootfs", "error", err)
+		os.Exit(1)
+	}
+	if err := syscall.Mount(".", "/", "", syscall.MS_MOVE, ""); err != nil {
+		slog.Error("Failed to mount new root over /", "error", err)
+		os.Exit(1)
+	}
+	if err := syscall.Chroot("."); err != nil {
+		slog.Error("Failed to chroot to the new root", "error", err)
+		os.Exit(1)
+	}
+	if err := os.Chdir("/"); err != nil {
+		slog.Error("Failed to change directory to new /", "error", err)
+		os.Exit(1)
+	}
+
+	// finally mount other filesystems
+	if err := mountFS(); err != nil {
+		slog.Error("Failed to mount filesystems", "error", err)
+	}
+
 	if err := setHostname(config.ID); err != nil {
-		panic(err)
+		slog.Error("Failed to set hostname", "error", err)
 	}
 
 	client, err := vsock.NewHostClient(ctx, uint32(config.VsockExitPort))
@@ -132,12 +142,16 @@ func main() {
 	var wg sync.WaitGroup // Create a WaitGroup
 	wg.Add(1)
 	go func() {
+		slog.Debug("streaming stdout")
+
 		defer wg.Done()
 		streamLogs(stdout, stdoutConn)
 	}()
 
 	wg.Add(1)
 	go func() {
+		slog.Debug("streaming stderr")
+
 		defer wg.Done()
 		streamLogs(stderr, stdoutConn)
 	}()
@@ -178,7 +192,8 @@ func main() {
 	// Initialize exit status
 	var exit ExitStatus
 
-	// Wait for kill signals or child process exit in a loop
+	slog.Debug("Waiting for kill signal or child process exit")
+
 	select {
 	case signal := <-killChan:
 		slog.Debug("Received kill signal", "signal", signal, "pid", cmd.Process.Pid)
@@ -213,9 +228,14 @@ func main() {
 	}
 
 	// OOM killer detection
-	if checkOOMKill(cmd.Process.Pid) {
+	oom, err := checkOOMKill(cmd.Process.Pid)
+	if err != nil {
+		slog.Error("Failed to check OOM kill", "error", err)
+	}
+
+	if oom {
 		exit.OOMKilled = true
-		exit.Message = "Process was killed by OOM killer"
+		exit.Message = "Main process was killed by the OOM killer"
 	}
 
 	if err := sendExitStatus(ctx, client, exit); err != nil {
@@ -232,7 +252,7 @@ func main() {
 
 	wg.Wait()
 
-	slog.Info("HTTP server gracefully stopped")
+	slog.Info("init exiting")
 }
 
 func streamLogs(src io.ReadCloser, dst io.WriteCloser) {
@@ -270,18 +290,18 @@ func handleSystemSignals(killChan chan syscall.Signal) {
 
 	go func() {
 		for sig := range sigChan {
-			log.Printf("Received system signal: %v\n", sig)
+			slog.Debug("Received system signal", "signal", sig)
+
 			killChan <- syscall.Signal(sig.(syscall.Signal))
 		}
 	}()
 }
 
 // Function to check if the process was killed by the OOM killer
-func checkOOMKill(pid int) bool {
+func checkOOMKill(pid int) (bool, error) {
 	file, err := os.Open("/dev/kmsg")
 	if err != nil {
-		log.Printf("error opening /dev/kmsg: %s", err)
-		return false
+		return false, fmt.Errorf("failed to open /dev/kmsg: %w", err)
 	}
 	defer file.Close()
 
@@ -291,12 +311,11 @@ func checkOOMKill(pid int) bool {
 	for scanner.Scan() {
 		if text := scanner.Text(); text != "" && time.Now().Before(time.Now().Add(1*time.Second)) {
 			if contains := text; contains == matcher {
-				return true
+				return true, nil
 			}
 		}
 	}
-
-	return false
+	return false, nil
 }
 
 func configureLogger(c *image.Config) error {
@@ -312,6 +331,8 @@ func configureLogger(c *image.Config) error {
 
 	var handler slog.Handler
 	switch format := c.Log.Format; format {
+	case "kernel":
+		handler = NewKernelStyleHandler(os.Stderr, "init", opts)
 	case "text":
 		handler = slog.NewTextHandler(os.Stderr, &opts)
 	case "json":

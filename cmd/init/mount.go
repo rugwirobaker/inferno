@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"syscall"
 )
@@ -45,7 +46,7 @@ func mountDev() error {
 		if err := syscall.Mount(m.source, m.target, m.fstype, m.flags, m.options); err != nil {
 			return fmt.Errorf("error mounting %s to %s: %v", m.source, m.target, err)
 		}
-		log.Printf("Mounted %s to %s", m.source, m.target)
+		slog.Debug("Mounted %s to %s", m.source, m.target)
 	}
 	return nil
 }
