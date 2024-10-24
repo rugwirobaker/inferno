@@ -243,7 +243,7 @@ func main() {
 	}
 
 	// Gracefully shut down the HTTP server
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		slog.Error("HTTP server Shutdown failed", "error", err)

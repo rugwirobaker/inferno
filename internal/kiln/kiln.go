@@ -295,6 +295,8 @@ func handleVMLogs(src net.Conn, logger *vm.Logger) {
 	for {
 		line, isPrefix, err := reader.ReadLine()
 
+		slog.Debug("read a line")
+
 		switch {
 		case errors.Is(err, io.EOF):
 			slog.Debug("done reading lines into chan")

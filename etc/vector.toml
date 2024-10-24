@@ -1,6 +1,6 @@
 [sources.kiln_logs]
   type = "socket"
-  mode = "unix_stream"
+  mode = "unix"
   path = "./vm_logs.sock" 
   socket_file_mode = 438 # 438 is the octal representation of 666
 
