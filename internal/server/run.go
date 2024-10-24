@@ -308,9 +308,8 @@ func kilnConfig(id, logSocket string, resources kiln.Resources) (*kiln.Config, e
 		FirecrackerConfigPath:   "firecracker.json",
 		FirecrackerVsockUDSPath: "control.sock",
 
-		VsockStdoutPort:  vsock.VsockStdoutPort,
-		VsockExitPort:    vsock.VsockExitPort,
-		VsockMetricsPort: vsock.VsockMetricsPort,
+		VsockStdoutPort: vsock.VsockStdoutPort,
+		VsockExitPort:   vsock.VsockExitPort,
 
 		VMLogsSocketPath: logSocket,
 		ExitStatusPath:   "exit-status.json",

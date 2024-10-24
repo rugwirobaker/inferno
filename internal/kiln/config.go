@@ -18,7 +18,7 @@ type Resources struct {
 	CPUKind  string `json:"cpu_kind"`
 }
 
-// KilnConfig defines the full configuration for the Kiln jailer.
+// Config defines the full configuration for the Kiln jailer.
 type Config struct {
 	JailID string `json:"jail_id"`
 
@@ -30,9 +30,8 @@ type Config struct {
 	FirecrackerConfigPath   string `json:"firecracker_config_path"`
 	FirecrackerVsockUDSPath string `json:"firecracker_vsock_uds_path"`
 
-	VsockStdoutPort  int `json:"vsock_stdout_port"`  // receive stdout/stderr send over by the init
-	VsockExitPort    int `json:"vsock_exit_port"`    // receive exit code info from the init
-	VsockMetricsPort int `json:"vsock_metrics_port"` // request metrics from the init
+	VsockStdoutPort int `json:"vsock_stdout_port"` // receive stdout/stderr send over by the init
+	VsockExitPort   int `json:"vsock_exit_port"`   // receive exit code info from the init
 
 	VMLogsSocketPath string `json:"vm_logs_socket_path"`
 	ExitStatusPath   string `json:"exit_status_path"`
@@ -41,10 +40,10 @@ type Config struct {
 }
 
 type Log struct {
-	Format    string  `yaml:"format"`    // "text", "json"
-	Timestamp bool    `yaml:"timestamp"` // show timestamp
-	Debug     bool    `yaml:"debug"`     // include debug logging
-	Path      *string `yaml:"path"`      // log file path
+	Format    string  `json:"format"`         // "text", "json"
+	Timestamp bool    `json:"timestamp"`      // show timestamp
+	Debug     bool    `json:"debug"`          // include debug logging
+	Path      *string `json:"path,omitempty"` // log file path
 }
 
 func Default() *Config {
@@ -61,9 +60,8 @@ func Default() *Config {
 		FirecrackerConfigPath:   "firecracker.json",
 		FirecrackerVsockUDSPath: "firecracker.sock",
 
-		VsockStdoutPort:  vsock.VsockStdoutPort,
-		VsockExitPort:    vsock.VsockExitPort,
-		VsockMetricsPort: vsock.VsockMetricsPort,
+		VsockStdoutPort: vsock.VsockStdoutPort,
+		VsockExitPort:   vsock.VsockExitPort,
 
 		VMLogsSocketPath: "vm_logs.sock",
 		ExitStatusPath:   "exit_status.json",
@@ -91,7 +89,7 @@ func configFromFile(path string) (*Config, error) {
 }
 
 func WriteConfig(path string, cfg *Config) error {
-	file, err := os.Create(path)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create kiln config: %w", err)
 	}

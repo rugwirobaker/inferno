@@ -51,10 +51,9 @@ func (m *Manager) CreateConfig(ctx context.Context, imageName string) (*Config, 
 			Cmd:  cmd,
 			Args: args,
 		},
-		VsockStdoutPort:  vsock.VsockStdoutPort,
-		VsockExitPort:    vsock.VsockExitPort,
-		VsockMetricsPort: vsock.VsockMetricsPort,
-		VsockSignalPort:  vsock.VsockSignalPort,
+		VsockStdoutPort: vsock.VsockStdoutPort,
+		VsockExitPort:   vsock.VsockExitPort,
+		VsockAPIPort:    vsock.VsockAPIPort,
 	}, nil
 }
 

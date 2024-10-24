@@ -8,20 +8,27 @@ import (
 	"log/slog"
 	"net/http"
 	"syscall"
+
+	"github.com/rugwirobaker/inferno/internal/vsock"
 )
 
 type API struct {
+	vsockPort  uint32
 	signalChan chan syscall.Signal
 }
 
-func NewAPI(signalChan chan syscall.Signal) *API {
-	return &API{signalChan: signalChan}
+func NewAPI(vsockPort uint32, signalChan chan syscall.Signal) *API {
+	return &API{
+		vsockPort:  vsockPort,
+		signalChan: signalChan,
+	}
 }
 
 func (a *API) Handler() http.Handler {
 	v1 := http.NewServeMux()
 	v1.HandleFunc("/status", statusHandler)
 	v1.Handle("/signal", signalHandler(a.signalChan))
+	v1.Handle("/ping", pingVsockHandler(a.vsockPort))
 	v1.Handle("/v1/", http.StripPrefix("/v1", v1))
 	return v1
 }
@@ -75,6 +82,34 @@ func signalHandler(killChan chan syscall.Signal) http.Handler {
 
 		w.Write([]byte(`{"status": "ok"}`))
 	}
+	return http.HandlerFunc(fn)
+}
+
+func pingVsockHandler(logVsockPort uint32) http.Handler {
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		// Try to connect to the logging vsock port
+		conn, err := vsock.NewVsockConn(logVsockPort)
+		if err != nil {
+			slog.Error("Failed to ping vsock", "error", err)
+			http.Error(w, "Failed to connect to vsock", http.StatusInternalServerError)
+			return
+		}
+		defer conn.Close()
+
+		// write PING\n to the vsock connection
+		if _, err := conn.Write([]byte("PING\n")); err != nil {
+			slog.Error("Failed to write to vsock", "error", err)
+			http.Error(w, "Failed to write to vsock", http.StatusInternalServerError)
+			return
+		}
+		slog.Info("Sent PING to vsock")
+
+		// respond with json OK
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status": "ok"}`))
+	}
+
 	return http.HandlerFunc(fn)
 }
 

@@ -19,10 +19,8 @@ const (
 	VsockStdoutPort int = iota + 10000
 	// VsockExitPort is port used by the guest to send exit code(status) of the main process to the host
 	VsockExitPort
-	// VsockMetricsPort is port used by the host to request metrics from the guest
-	VsockMetricsPort
-	// VsockSignalPort is port used by the host to send a kill signal to the guest
-	VsockSignalPort
+	// VsockAPIPort is port used by the host to send a kill signal to the guest
+	VsockAPIPort
 )
 
 // NewVsockConn creates a new vsock connection to the host via the specified port

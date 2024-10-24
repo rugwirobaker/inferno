@@ -109,7 +109,7 @@ func main() {
 	}
 	defer stdoutConn.Close()
 
-	listener, err := vsock.NewVsockListener(uint32(config.VsockSignalPort))
+	apiListener, err := vsock.NewVsockListener(uint32(config.VsockAPIPort))
 	if err != nil {
 		slog.Error("Failed to create vsock listener", "error", err)
 		os.Exit(1)
@@ -117,6 +117,25 @@ func main() {
 
 	// / Create the kill signal channel and pass it to the HTTP handler
 	killChan := make(chan syscall.Signal, 1)
+
+	api := NewAPI(uint32(config.VsockStdoutPort), killChan)
+	server := &http.Server{
+		Handler:      api.Handler(),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	// Start HTTP server in a goroutine and wait for shutdown signal
+	go func() {
+		slog.Debug("Serving Init API on vsock", "port", config.VsockAPIPort)
+
+		if err := server.Serve(apiListener); err != nil && err != http.ErrServerClosed {
+			slog.Error("HTTP server failed", "error", err)
+			os.Exit(1)
+		}
+
+	}()
 
 	// Start the main process in the VM
 	cmd := exec.Command(config.Process.Cmd, config.Process.Args...)
@@ -160,24 +179,6 @@ func main() {
 	if err != nil {
 		panic(fmt.Sprintf("could not start main process: %s", err))
 	}
-
-	api := NewAPI(killChan)
-	server := &http.Server{
-		Handler:      api.Handler(),
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	// Start HTTP server in a goroutine and wait for shutdown signal
-	go func() {
-		slog.Debug("Serving Init API on vsock", "port", config.VsockSignalPort)
-
-		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-			slog.Error("HTTP server failed", "error", err)
-			os.Exit(1)
-		}
-	}()
 
 	// Handle OS/system signals
 	handleSystemSignals(killChan)

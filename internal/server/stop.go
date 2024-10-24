@@ -30,7 +30,7 @@ func Stop(cfg *config.Config) http.HandlerFunc {
 
 		var chroot = filepath.Join(cfg.StateBaseDir, "vms", req.ID)
 
-		client := vsock.NewGuestClient(chroot, vsock.VsockSignalPort)
+		client := vsock.NewGuestClient(chroot, vsock.VsockAPIPort)
 
 		signal := signalVm{
 			Signal: req.Signal,

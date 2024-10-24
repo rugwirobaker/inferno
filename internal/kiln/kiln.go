@@ -140,14 +140,19 @@ func run(ctx context.Context) error {
 	// cmd.Dir = chroot // Ensure we run Firecracker within the chroot directory
 
 	// Set output to stdout/stderr for logging
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	stdoutReader, stdoutWriter := io.Pipe()
+	stderrReader, stderrWriter := io.Pipe()
 
-	// Run the Firecracker process
-	if err := cmd.Start(); err != nil {
-		slog.Error("Failed to run Firecracker", "error", err)
-		return err
-	}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
+
+	// Create a multiplexer to log the output while also passing it to the appropriate destination
+	go func() {
+		io.Copy(os.Stdout, stdoutReader) // Log to kiln's stdout
+	}()
+	go func() {
+		io.Copy(os.Stderr, stderrReader) // Log to kiln's stderr
+	}()
 
 	// some clean tasks to run at the end
 	var finalizers []FinalizerFunc
@@ -195,39 +200,44 @@ func run(ctx context.Context) error {
 
 	// Start the server that handles logs
 	go func() {
-		slog.Info("Serving logs on vsock")
+		slog.Debug("Serving logs on vsock")
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		factory := vm.SocketWriterFactory(ctx, config.VMLogsSocketPath)
+		logger, err := vm.NewLogger(ctx, factory)
+		if err != nil {
+			slog.Error("Failed to create logger", "error", err)
+			return
+		}
+		// add a finalizer to close the logger
+		finalizers = append(finalizers, func() error {
+			logger.Close()
+			return nil
+		})
 
 		for {
 			conn, err := logListener.Accept()
-			slog.Debug("Accepted connection", "conn", conn)
 			if err != nil {
 				slog.Error("Failed to accept connection", "error", err)
 				continue
 			}
+			slog.Info("Accepted connection", "conn", conn)
 
 			// handle the connection(for this use the same pattern as net/http uses behind the scenes)
 			go func() {
 				defer conn.Close()
 
-				ctx, cancel := context.WithCancel(ctx)
-				defer cancel()
-
-				factory := vm.SocketWriterFactory(ctx, config.VMLogsSocketPath)
-
-				logger, err := vm.NewLogger(ctx, factory)
-				if err != nil {
-					slog.Error("Failed to create logger", "error", err)
-					return
-				}
-				// add a finalizer to close the logger
-				finalizers = append(finalizers, func() error {
-					logger.Close()
-					return nil
-				})
 				handleVMLogs(conn, logger)
 			}()
 		}
 	}()
+
+	// Run the Firecracker process
+	if err := cmd.Start(); err != nil {
+		slog.Error("Failed to run Firecracker", "error", err)
+		return err
+	}
 
 	// Wait for the Firecracker process to complete
 	ps := cmd.Process
@@ -293,9 +303,8 @@ func handleVMLogs(src net.Conn, logger *vm.Logger) {
 	reader := bufio.NewReader(src)
 	var buf *bytebufferpool.ByteBuffer
 	for {
-		line, isPrefix, err := reader.ReadLine()
-
-		slog.Debug("read a line")
+		line, isPrefix, err := reader.ReadLine()                                    // Or use ReadString('\n') for simplicity
+		slog.Debug("Attempting to read a line", "line", line, "isPrefix", isPrefix) // Log the raw line for verification
 
 		switch {
 		case errors.Is(err, io.EOF):
