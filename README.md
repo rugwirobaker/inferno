@@ -34,7 +34,7 @@ This guide will walk you through setting up and running Kiln with its init progr
 ### Steps
 1. Make sure kvm is enabled and we have a copy of the firecracjer binary and the vmlinux kernel in the current directory. There is a script that:
     ```sh
-    ./scripts/setuo.sh
+    ./scripts/setup.sh
     ```
     This will firsr make sure kvm is enabled and then download the firecracker binary and the vmlinux kernel.
 
