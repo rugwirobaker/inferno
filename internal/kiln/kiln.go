@@ -170,6 +170,7 @@ func run(ctx context.Context) error {
 	// Start the server that handles exit status requests
 	go func() {
 		slog.Info("Serving exit status on vsock")
+
 		mux := http.NewServeMux()
 		mux.HandleFunc("/exit", ExitStatusHandler(exitStatusChan))
 		server := &http.Server{
@@ -200,7 +201,7 @@ func run(ctx context.Context) error {
 
 	// Start the server that handles logs
 	go func() {
-		slog.Debug("Serving logs on vsock")
+		slog.Info("Serving logs on vsock")
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -335,6 +336,10 @@ func handleVMLogs(src net.Conn, logger *vm.Logger) {
 }
 
 func configureLogger(c *Config) error {
+	if c.Log.Debug {
+		LogLevel.Set(slog.LevelDebug)
+	}
+
 	opts := slog.HandlerOptions{Level: &LogLevel}
 
 	if !c.Log.Timestamp {
