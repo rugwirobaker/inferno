@@ -27,6 +27,11 @@ type FinalizerFunc func() error
 
 // finalize cleans up the kiln process and writes the exit status to exit_status.json
 func finalize(config *Config, exitStatus KilnExitStatus, finalizers ...FinalizerFunc) (err error) {
+	slog.Info("Finalizing kiln process")
+
+	// log the number of finalizers
+	slog.Debug("Number of finalizers", "count", len(finalizers))
+
 	for _, f := range finalizers {
 		if err := f(); err != nil {
 			slog.Error("Failed to run finalizer", "error", err)

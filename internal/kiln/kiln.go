@@ -223,12 +223,9 @@ func run(ctx context.Context) error {
 				slog.Error("Failed to accept connection", "error", err)
 				continue
 			}
-			slog.Info("Accepted connection", "conn", conn)
+			slog.Debug("Accepted connection", "conn", conn)
 
-			// handle the connection(for this use the same pattern as net/http uses behind the scenes)
 			go func() {
-				defer conn.Close()
-
 				handleVMLogs(conn, logger)
 			}()
 		}
