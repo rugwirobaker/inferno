@@ -260,10 +260,16 @@ func streamLogs(src io.ReadCloser, dst io.WriteCloser) {
 	defer src.Close()
 	defer dst.Close()
 
-	// Directly copy from pipe (stdout/stderr) to the VSOCK connection
-	_, err := io.Copy(dst, src)
-	if err != nil && err != io.EOF {
-		slog.Error("Failed to copy logs to vsock", "error", err)
+	scanner := bufio.NewScanner(src)
+	for scanner.Scan() {
+		_, err := fmt.Fprintln(dst, scanner.Text())
+		if err != nil {
+			slog.Error("Failed to write log line to vsock", "error", err)
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		slog.Error("Error reading logs", "error", err)
 	}
 }
 
