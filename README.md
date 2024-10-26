@@ -36,7 +36,7 @@ This guide will walk you through setting up and running Kiln with its init progr
     ```sh
     ./scripts/setup.sh
     ```
-    This will firsr make sure kvm is enabled and then download the firecracker binary and the vmlinux kernel.
+    This will first make sure kvm is enabled and then download the firecracker binary and the vmlinux kernel.
 
 2. You'll need a rootfs for firecracker to boo with and lucky for you ./scripts/create_rootfs.sh has  you covered. It will create a rootfs for you from a docker image. You can run it like this:
     ```sh
@@ -140,7 +140,7 @@ This will start a firecracker microVM with the rootfs we created earlier and the
 
 8. When you run a vm you might see a few errors about being unable to open a connection to vm_logs_socket. That's because the logs are to be sent to vector.dev via a socket. You can either ignore this or run the following command to create a socket:
 ```sh
-sudo socat UNIX-LISTEN:/tmp/vm_logs_socket,fork,mode=777 -
+sudo socat -d -d UNIX-LISTEN:./vm_logs.sock,reuseaddr,fork STDOUT
 ```
 Or you can simply install vector.dev and run it with the following command:
 ```sh
@@ -151,3 +151,10 @@ Then you can run the following command to start vector.dev:
 # there a vector config file at etc/vector.toml
 vector --config etc/vector.toml
 ```
+
+9. Cleaning up after each run should make your next run smoother since some of the files are created dynamically. You can do this by running the following command:
+```sh
+sudo make clean
+```
+
+10. Note that if you modify the init program you'll need to rebuild the initrd.cpio file.
