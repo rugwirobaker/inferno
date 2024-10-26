@@ -55,7 +55,6 @@ func signalHandler(killChan chan syscall.Signal) http.Handler {
 
 			// respond with json error
 			w.Header().Set("Content-Type", "application/json")
-
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to decode kill signal"})
 			return
@@ -91,7 +90,9 @@ func pingVsockHandler(logVsockPort uint32) http.Handler {
 		conn, err := vsock.NewVsockConn(logVsockPort)
 		if err != nil {
 			slog.Error("Failed to ping vsock", "error", err)
-			http.Error(w, "Failed to connect to vsock", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to connect to vsock"})
 			return
 		}
 		defer conn.Close()
@@ -99,7 +100,10 @@ func pingVsockHandler(logVsockPort uint32) http.Handler {
 		// write PING\n to the vsock connection
 		if _, err := conn.Write([]byte("PING\n")); err != nil {
 			slog.Error("Failed to write to vsock", "error", err)
-			http.Error(w, "Failed to write to vsock", http.StatusInternalServerError)
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to write to vsock"})
 			return
 		}
 		slog.Info("Sent PING to vsock")
