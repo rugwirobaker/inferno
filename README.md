@@ -96,6 +96,31 @@ This guide will walk you through setting up and running Kiln with its init progr
 ```sh
 ./bin/kiln --init kiln.json
 ```
+You might need to make some modifications so it looks more like this:
+```
+{
+  "jail_id": "kiln",
+  "uid": 100,
+  "gid": 100,
+  "log": {
+    "format": "text",
+    "timestamp": true,
+    "debug": true
+  },
+  "firecracker_socket_path": "firecracker.sock",
+  "firecracker_config_path": "firecracker.json",
+  "firecracker_vsock_uds_path": "control.sock",
+  "vsock_stdout_port": 10000,
+  "vsock_exit_port": 10001,
+  "vm_logs_socket_path": "vm_logs.sock",
+  "exit_status_path": "exit_status.json",
+  "resources": {
+    "cpu_count": 1,
+    "memory_mb": 128,
+    "cpu_kind": "C3"
+  }
+}
+```
 
 6. Generate firecracker configuration
 ```sh
