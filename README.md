@@ -102,31 +102,28 @@ This guide will walk you through setting up and running Kiln with its init progr
 cat > firecracker.json <<EOF
 {
     "boot-source": {
-        "kernel_image_path": "./vmlinux",
-        initrd_path": "./initrd.cpio"
-        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+        "kernel_image_path": "vmlinux",
+        "initrd_path": "initrd.cpio",
+        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off rdinit=/inferno/init"
     },
     "drives": [
         {
             "drive_id": "rootfs",
-            "path_on_host": "./rootfs.ext4",
-            "is_root_device": true,
+            "path_on_host": "rootfs.img",
+            "is_root_device": false,
             "is_read_only": false
         }
-        ],
-        "machine-config": {
-            "vcpu_count": 1,
-            "mem_size_mib": 512
-        },
-        "logger": {
-            "log_fifo": "log.fifo",
-            "metrics_fifo": "metrics.fifo",
-            "level": "Debug"
-        },
-        "vsock": {
-            "vsock_device": "/tmp/vsock.sock"
-        }
+    ],
+    "machine-config": {
+        "vcpu_count": 1,
+        "mem_size_mib": 128
+    },
+    "vsock": {
+        "vsock_id": "control",
+        "guest_cid": 3,
+        "uds_path": "control.sock"
     }
+}
 EOF
 ```
 
