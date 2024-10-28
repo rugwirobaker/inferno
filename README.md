@@ -75,8 +75,7 @@ This guide will walk you through setting up and running Kiln with its init progr
         },
         "vsock_stdout_port": 10000,
         "vsock_exit_port": 10001,
-        "vsock_metrics_port": 10002,
-        "vsock_signal_port": 10003
+        "vsock_api_port": 10002
     }
     EOF
 ```
