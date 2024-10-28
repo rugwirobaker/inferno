@@ -56,7 +56,7 @@ This guide will walk you through setting up and running Kiln with its init progr
 ```sh
     # generate example run.json
     cat > init/run.json <<EOF
-    {
+{
         "id": "test-vm",
         "process": {
             "cmd": "/bin/sh",
@@ -77,7 +77,7 @@ This guide will walk you through setting up and running Kiln with its init progr
         "vsock_exit_port": 10001,
         "vsock_metrics_port": 10002,
         "vsock_signal_port": 10003
-    }
+}
     EOF
 ```
 
@@ -102,9 +102,9 @@ This guide will walk you through setting up and running Kiln with its init progr
 cat > firecracker.json <<EOF
 {
     "boot-source": {
-        "kernel_image_path": "vmlinux",
-        "initrd_path": "initrd.cpio",
-        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off rdinit=/inferno/init"
+        "kernel_image_path": "./vmlinux",
+        "initrd_path": "./initrd.cpio",
+        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
     },
     "drives": [
         {
@@ -116,12 +116,18 @@ cat > firecracker.json <<EOF
     ],
     "machine-config": {
         "vcpu_count": 1,
-        "mem_size_mib": 128
+        "mem_size_mib": 512
+    },
+    "logger": {
+        "log_path": "log.fifo",
+        "level": "Debug"
+    },
+    "metrics": {
+        "metrics_path": "metrics.fifo"
     },
     "vsock": {
-        "vsock_id": "control",
         "guest_cid": 3,
-        "uds_path": "control.sock"
+        "uds_path": "/tmp/vsock.sock"
     }
 }
 EOF
