@@ -1,5 +1,5 @@
 # inferno
-inferno is like docke but images run as firecracker microVMs
+inferno is like docker but images run as firecracker microVMs
 ## Features
 Currently we are targetting a very limited feature set:
 1. **inferno run**: given an docker/oci image it should create a VM running with that image as the root filesystem.
@@ -16,10 +16,10 @@ This project is composed of individual binaries that can each be independenty de
 Inferno currently has a few commands that mostly should be easy to understand
 
 1. `inferno init`: generates a configuration file with some default values so we can run the server with `--config`
-2. `inferno server`: runs the inferno server, it accepts a bunch of flags but it's better to configure by passsing the `--config` flag that accepts a file. Note that it requires root privileges to perfomr certain operations.
-3. `inferno run`: already explaines in in the features section.
-4. `inferno stop`: already explaines in in the features section.
-5. `inferno logs`: already explaines in in the features section. Note that this is the most important command given the project's objectives though I haven't had the chance to work on it.
+2. `inferno server`: runs the inferno server, it accepts a bunch of flags but it's better to configure by passsing the `--config` flag that accepts a file. Note that it requires root privileges to perform certain operations.
+3. `inferno run`: already explained in the features section.
+4. `inferno stop`: already explained in the features section.
+5. `inferno logs`: already explained in the features section. Note that this is the most important command given the project's objectives though I haven't had the chance to work on it.
 
 ## Running kiln + firecracker + init
 
@@ -32,13 +32,13 @@ This guide will walk you through setting up and running Kiln with its init progr
 * GNU Make installed
 
 ### Steps
-1. Make sure kvm is enabled and we have a copy of the firecracjer binary and the vmlinux kernel in the current directory. There is a script that:
+1. Make sure kvm is enabled and we have a copy of the firecracker binary and the vmlinux kernel in the current directory.
     ```sh
     ./scripts/setup.sh
     ```
     This will first make sure kvm is enabled and then download the firecracker binary and the vmlinux kernel.
 
-2. You'll need a rootfs for firecracker to boo with and lucky for you ./scripts/create_rootfs.sh has  you covered. It will create a rootfs for you from a docker image. You can run it like this:
+2. You'll need a rootfs for firecracker to boot with and lucky for you ./scripts/create_rootfs.sh has  you covered. It will create a rootfs for you from a docker image. You can run it like this:
     ```sh
     ./scripts/create_rootfs.sh <docker_image> <rootfs_dir>
     ```
@@ -83,7 +83,7 @@ This guide will walk you through setting up and running Kiln with its init progr
 
 ```sh
     # create initramfs directory 
-    mkdir -p initramfs
+    mkdir -p initramfs/inferno
     cp ./bin/init initramfs/inferno/init
     cp run.json initramfs/inferno/run.json
     cd initramfs
@@ -102,9 +102,9 @@ This guide will walk you through setting up and running Kiln with its init progr
 cat > firecracker.json <<EOF
 {
     "boot-source": {
-        "kernel_image_path": "./vmlinux",
-        "initrd_path": "./initrd.cpio",
-        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+        "kernel_image_path": "vmlinux",
+        "initrd_path": "initrd.cpio",
+        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off rdinit=/inferno/init"
     },
     "drives": [
         {
@@ -116,18 +116,12 @@ cat > firecracker.json <<EOF
     ],
     "machine-config": {
         "vcpu_count": 1,
-        "mem_size_mib": 512
-    },
-    "logger": {
-        "log_path": "log.fifo",
-        "level": "Debug"
-    },
-    "metrics": {
-        "metrics_path": "metrics.fifo"
+        "mem_size_mib": 128
     },
     "vsock": {
+        "vsock_id": "control",
         "guest_cid": 3,
-        "uds_path": "/tmp/vsock.sock"
+        "uds_path": "control.sock"
     }
 }
 EOF
