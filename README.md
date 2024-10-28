@@ -62,7 +62,7 @@ This guide will walk you through setting up and running Kiln with its init progr
             "cmd": "/bin/sh",
             "args": [
                 "-c",
-                "yes \"log message\" > /dev/stderr"
+                "while true; do echo 'Test log message from BusyBox'; sleep 2; done"
             ]
         },
         "env": {
