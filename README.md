@@ -1,5 +1,5 @@
 # inferno
-inferno is like docke but images run as firecracker microVMs
+inferno is like docker but images run as firecracker microVMs
 ## Features
 Currently we are targetting a very limited feature set:
 1. **inferno run**: given an docker/oci image it should create a VM running with that image as the root filesystem.
