@@ -21,33 +21,40 @@ check_dependencies() {
     command -v jq >/dev/null 2>&1 || handle_error "jq is required but not installed."
 }
 
-# Generate a random IP in the 172.16.0.0/16 subnet
-generate_ip() {
-    local SUBNET="172.16"
-    local OCTET3=$((RANDOM % 256))
-    local OCTET4=$((RANDOM % 256))
-    echo "$SUBNET.$OCTET3.$OCTET4"
+# Generate a random gateway IP in the 172.16.0.0/16 subnet
+generate_gateway_ip() {
+    local subnet="172.16"
+    local octet3=$((RANDOM % 256))
+    echo "$subnet.$octet3.1"
+}
+
+# Generate a random guest IP in the 172.16.0.0/16 subnet
+generate_guest_ip() {
+    local subnet="172.16"
+    local octet3=$((RANDOM % 256))
+    echo "$subnet.$octet3.2"
 }
 
 # Generate a random tap device name
 generate_tap_name() {
-    local TAP_NAME=$(nanoid --alphabet "1234567890abcdef" --size 8)
-    echo "tap${TAP_NAME}"
+    local tap_name=$(nanoid --alphabet "1234567890abcdef" --size 8)
+    echo "tap${tap_name}"
 }
 
 # Generate a MAC address
 generate_mac() {
-    printf 'AB:CD:%02x:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
+    printf 'AA:BB:%02x:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
 }
 
-# Create a tap device with a specified name and IP address
+# Create a tap device with a specified name and gateway IP address
 create_tap_device() {
-    local TAP_NAME="$1"
-    local IP="$2"
-    log "Creating tap device $TAP_NAME with IP $IP"
-    sudo ip tuntap add dev "$TAP_NAME" mode tap || handle_error "Failed to add tap device $TAP_NAME"
-    sudo ip addr add "$IP/16" dev "$TAP_NAME" || handle_error "Failed to assign IP $IP to $TAP_NAME"
-    sudo ip link set "$TAP_NAME" up || handle_error "Failed to bring up $TAP_NAME"
+    local tap_name="$1"
+    local gateway_ip="$2"
+
+    log "Creating tap device $tap_name with gateway IP $gateway_ip"
+    sudo ip tuntap add dev "$tap_name" mode tap || handle_error "Failed to add tap device $tap_name"
+    sudo ip addr add "$gateway_ip/16" dev "$tap_name" || handle_error "Failed to assign IP $gateway_ip to $tap_name"
+    sudo ip link set "$tap_name" up || handle_error "Failed to bring up $tap_name"
 }
 
 # Enable IP forwarding on the host
@@ -58,10 +65,9 @@ enable_ip_forwarding() {
 
 # Add a rule to accept packets from a specific tap device
 accept_packets() {
-    local TAP_NAME="$1"
-    local HOST_INTERFACE="$2"
-    log "Accepting packets from $TAP_NAME to $HOST_INTERFACE"
-    sudo iptables -t filter -A FORWARD -i "$TAP_NAME" -j ACCEPT -o "$HOST_INTERFACE" -m comment --comment "inferno" || handle_error "Failed to accept packets"
+    local tap_name="$1"
+    log "Accepting packets from $tap_name"
+    sudo iptables -t filter -A FORWARD -i "$tap_name" -j ACCEPT -o eth0 -m comment --comment "inferno" || handle_error "Failed to accept packets"
 }
 
 # Accept packets on connection state established or related
@@ -72,9 +78,9 @@ accept_established_packets() {
 
 # Masquerade packets from a specific tap device
 masquerade_packets() {
-    local HOST_INTERFACE="$1"
-    log "Masquerading packets to $HOST_INTERFACE"
-    sudo iptables -t nat -A POSTROUTING -o "$HOST_INTERFACE" -j MASQUERADE -m comment --comment "inferno" || handle_error "Failed to masquerade packets"
+    local tap_name="$1"
+    log "Masquerading packets from $tap_name"
+    sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE -m comment --comment "inferno" || handle_error "Failed to masquerade packets"
 }
 
 # Remove rules tagged with "inferno"
@@ -94,77 +100,76 @@ remove_inferno_rules() {
 
 # Delete the specified tap device
 delete_tap_device() {
-    local TAP_NAME="$1"
-    log "Deleting tap device $TAP_NAME"
-    sudo ip link del "$TAP_NAME" || handle_error "Failed to delete tap device $TAP_NAME"
+    local tap_name="$1"
+    log "Deleting tap device $tap_name"
+    sudo ip link del "$tap_name" || handle_error "Failed to delete tap device $tap_name"
 }
 
 # Teardown function to remove rules and clean up
 teardown() {
-    local TAP_NAME="$1"
+    local tap_name="$1"
     log "Starting teardown"
-    delete_tap_device "$TAP_NAME"
+    delete_tap_device "$tap_name"
     remove_inferno_rules
     log "Teardown complete"
 }
 
 # Update JSON configuration files
 update_config_files() {
-    local TAP_NAME="$1"
-    local IP="$2"
-    local MAC_ADDR="$3"
-    local FIRECRACKER_JSON="firecracker.json"
-    local RUN_JSON="run.json"
+    local tap_name="$1"
+    local guest_ip="$2"
+    local gateway_ip="$3"
+    local mac_addr="$4"
+    local firecracker_json="firecracker.json"
+    local run_json="run.json"
 
-    FILE_OWNER=$(stat -c '%U' firecracker.json)
-    FILE_GROUP=$(stat -c '%G' firecracker.json) 
+    FILE_OWNER=$(stat -c '%U' "$firecracker_json")
+    FILE_GROUP=$(stat -c '%G' "$firecracker_json")
 
-    log "Updating $FIRECRACKER_JSON with network interface details"
+    log "Overwriting $firecracker_json with new network interface details"
     jq --arg iface_id "eth0" \
-       --arg host_dev_name "$TAP_NAME" \
-       --arg guest_mac "$MAC_ADDR" \
-       '.network_interfaces += [{"iface_id": $iface_id, "host_dev_name": $host_dev_name, "guest_mac": $guest_mac}]' \
-       "$FIRECRACKER_JSON" > temp.json && mv temp.json "$FIRECRACKER_JSON"
+       --arg host_dev_name "$tap_name" \
+       --arg guest_mac "$mac_addr" \
+       '.["network-interfaces"] = [{"iface_id": $iface_id, "host_dev_name": $host_dev_name, "guest_mac": $guest_mac}]' \
+       "$firecracker_json" > temp.json && mv temp.json "$firecracker_json"
 
-    log "Updating $RUN_JSON with IP configuration details"
-    jq --arg ip "$IP" \
-       --arg gateway "172.16.0.1" \
+    log "Overwriting $run_json with new IP configuration details"
+    jq --arg ip "$guest_ip" \
+       --arg gateway "$gateway_ip" \
        --argjson mask 16 \
-       '.ips += [{"ip": $ip, "gateway": $gateway, "mask": $mask}]' \
-       "$RUN_JSON" > temp.json && mv temp.json "$RUN_JSON"
+       '.ips = [{"ip": $ip, "gateway": $gateway, "mask": $mask}]' \
+       "$run_json" > temp.json && mv temp.json "$run_json"
 
     # Restore file owner and group
-    chown $FILE_OWNER:$FILE_GROUP $FIRECRACKER_JSON $RUN_JSON
+    chown $FILE_OWNER:$FILE_GROUP "$firecracker_json" "$run_json"
 }
 
 # Main function to create the tap device, generate config, and update files
 setup() {
-    if [ -z "$1" ]; then
-        handle_error "Host network interface is required for setup."
-    fi
+    check_dependencies
 
-    local HOST_INTERFACE="$1"
-    local IP=$(generate_ip)
-    local TAP_NAME=$(generate_tap_name)
-    local MAC_ADDR=$(generate_mac)
+    local gateway_ip=$(generate_gateway_ip)
+    local guest_ip=$(generate_guest_ip)
+    local tap_name=$(generate_tap_name)
+    local mac_addr=$(generate_mac)
 
     enable_ip_forwarding
-    create_tap_device "$TAP_NAME" "$IP"
-    accept_packets "$TAP_NAME" "$HOST_INTERFACE"
+    create_tap_device "$tap_name" "$gateway_ip"
+    accept_packets "$tap_name"
     accept_established_packets
-    masquerade_packets "$HOST_INTERFACE"
-    update_config_files "$TAP_NAME" "$IP" "$MAC_ADDR"
+    masquerade_packets "$tap_name"
+    update_config_files "$tap_name" "$guest_ip" "$gateway_ip" "$mac_addr"
 
     # Output JSON configuration for verification
     log "Configuration generated successfully"
-    echo "{ \"tap_name\": \"$TAP_NAME\", \"ip\": \"$IP/16\", \"mac\": \"$MAC_ADDR\" }"
+    echo "{ \"tap_name\": \"$tap_name\", \"gateway_ip\": \"$gateway_ip\", \"guest_ip\": \"$guest_ip\", \"mac\": \"$mac_addr\" }"
 }
 
 # Switch between setup and teardown
 main() {
     case "$1" in
         setup)
-            setup "$2"
+            setup
             ;;
         teardown)
             if [ -z "$2" ]; then
@@ -173,7 +178,7 @@ main() {
             teardown "$2"
             ;;
         *)
-            echo "Usage: $0 {setup <host_interface>|teardown <tap_name>}"
+            echo "Usage: $0 {setup|teardown <tap_name>}"
             exit 1
             ;;
     esac

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 )
 
@@ -11,7 +12,11 @@ type Config struct {
 	ID      string            `json:"id"`
 	Process Process           `json:"process"`
 	Env     map[string]string `json:"env"`
+	IPs     []IPConfig        `json:"ips"`
 	Log     Log               `json:"log"`
+
+	EtcResolv EtcResolv `json:"etc_resolv"`
+	EtcHost   []EtcHost `json:"etc_hosts,omitempty"`
 
 	VsockStdoutPort int `json:"vsock_stdout_port"` // send stdout/stderr to the host
 	VsockExitPort   int `json:"vsock_exit_port"`   // send exit code to the host
@@ -19,10 +24,26 @@ type Config struct {
 
 }
 
+type IPConfig struct {
+	IP      net.IP `json:"ip"`
+	Gateway net.IP `json:"gateway"`
+	Mask    int    `json:"mask"`
+}
+
+type EtcResolv struct {
+	Nameservers []string `json:"nameservers"`
+}
+
+type EtcHost struct {
+	Host string
+	IP   string
+	Desc string
+}
+
 type Log struct {
-	Format    string `yaml:"format"`    // "text", "json"
-	Timestamp bool   `yaml:"timestamp"` // show timestamp
-	Debug     bool   `yaml:"debug"`     // include debug logging
+	Format    string `json:"format"`    // "text", "json"
+	Timestamp bool   `json:"timestamp"` // show timestamp
+	Debug     bool   `json:"debug"`     // include debug logging
 }
 
 type Process struct {

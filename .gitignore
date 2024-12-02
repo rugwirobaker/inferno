@@ -12,3 +12,4 @@ run.json
 exit_status.json
 kernel-build
 rootfs*
+*.img

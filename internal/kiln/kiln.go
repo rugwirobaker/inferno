@@ -133,6 +133,7 @@ func run(ctx context.Context) error {
 		"--id", vmID,
 		"--api-sock", config.FirecrackerSocketPath,
 		"--config-file", config.FirecrackerConfigPath,
+		"--level", "Debug",
 	}
 
 	// Start Firecracker using exec.Command

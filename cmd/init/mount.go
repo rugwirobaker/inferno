@@ -2,10 +2,11 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -59,7 +60,7 @@ func mountCgroups() error {
 	if err := syscall.Mount("tmpfs", "/sys/fs/cgroup", "tmpfs", syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, cgroupMode); err != nil {
 		return fmt.Errorf("error mounting cgroup: %v", err)
 	}
-	log.Println("Mounted cgroup")
+	slog.Debug("Mounted cgroup")
 	return nil
 }
 
@@ -68,18 +69,40 @@ func mountCommon() error {
 	commonMounts := []struct {
 		source, target, fstype string
 		flags                  uintptr
+		options                string
 	}{
-		{"proc", "/proc", "proc", 0},
-		{"sysfs", "/sys", "sysfs", 0},
+		{"proc", "/proc", "proc", syscall.MS_RDONLY, ""},
+		{"sysfs", "/sys", "sysfs", syscall.MS_NOSUID | syscall.MS_NOEXEC | syscall.MS_NODEV, ""},
 	}
+
 	for _, m := range commonMounts {
 		if err := os.MkdirAll(m.target, chmod0755); err != nil {
-			return fmt.Errorf("error creating dir %s: %v", m.target, err)
+			return fmt.Errorf("error creating directory %s: %w", m.target, err)
 		}
-		if err := syscall.Mount(m.source, m.target, m.fstype, m.flags, ""); err != nil {
-			return fmt.Errorf("error mounting %s to %s: %v", m.source, m.target, err)
+		if err := syscall.Mount(m.source, m.target, m.fstype, m.flags, m.options); err != nil {
+			return fmt.Errorf("error mounting %s (%s) to %s: %w", m.source, m.fstype, m.target, err)
 		}
-		log.Printf("Mounted %s to %s", m.source, m.target)
+		slog.Debug("Mounted filesystem", "source", m.source, "target", m.target)
+	}
+
+	return nil
+}
+
+func createProcSymlinks() error {
+	if err := unix.Symlinkat("/proc/self/fd", 0, "/dev/fd"); err != nil {
+		return fmt.Errorf("error creating /dev/fd symlink: %v", err)
+	}
+
+	if err := unix.Symlinkat("/proc/self/fd/0", 0, "/dev/stdin"); err != nil {
+		return fmt.Errorf("error creating /dev/stdin symlink: %v", err)
+	}
+
+	if err := unix.Symlinkat("/proc/self/fd/1", 0, "/dev/stdout"); err != nil {
+		return fmt.Errorf("error creating /dev/stdout symlink: %v", err)
+	}
+
+	if err := unix.Symlinkat("/proc/self/fd/2", 0, "/dev/stderr"); err != nil {
+		return fmt.Errorf("error creating /dev/stderr symlink: %v", err)
 	}
 	return nil
 }

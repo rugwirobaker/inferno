@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,9 +16,12 @@ import (
 
 	"syscall"
 
+	"github.com/opencontainers/runc/libcontainer/system"
+	"github.com/opencontainers/runc/libcontainer/user"
 	"github.com/rugwirobaker/inferno/internal/image"
 	"github.com/rugwirobaker/inferno/internal/pointer"
 	"github.com/rugwirobaker/inferno/internal/vsock"
+	"golang.org/x/sys/unix"
 )
 
 const paths = "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
@@ -68,7 +72,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// change root to /rootfs
+	slog.Debug("Switching to new root")
+
 	if err := os.Chdir("/rootfs"); err != nil {
 		slog.Error("Failed to change directory to /rootfs", "error", err)
 		os.Exit(1)
@@ -91,9 +96,124 @@ func main() {
 		slog.Error("Failed to mount filesystems", "error", err)
 	}
 
+	if err := os.MkdirAll("/run/lock", fs.FileMode(^uint32(0))); err != nil {
+		slog.Error("Failed to create /run/lock", "error", err)
+		os.Exit(1)
+	}
+
+	if err := createProcSymlinks(); err != nil {
+		slog.Error("Failed to create proc symlinks", "error", err)
+		os.Exit(1)
+	}
+
+	if err := os.MkdirAll("/root", unix.S_IRWXU); err != nil {
+		slog.Error("Failed to create /root", "error", err)
+		os.Exit(1)
+	}
+
+	if err := unix.Setrlimit(0, &unix.Rlimit{Cur: 10240, Max: 10240}); err != nil {
+		slog.Error("Failed to set rlimit", "error", err)
+		os.Exit(1)
+	}
+
+	var username = "root"
+
+	if _, err := user.LookupGroup(username); err != nil {
+		slog.Error("Failed to lookup group", "error", err)
+		os.Exit(1)
+	}
+
+	nixUser, err := user.LookupUser(username)
+	if err != nil {
+		slog.Error("Failed to lookup user", "error", err)
+		os.Exit(1)
+	}
+
+	if err := system.Setgid(nixUser.Gid); err != nil {
+		slog.Error("Failed to set group id", "error", err)
+		os.Exit(1)
+	}
+
+	if err := system.Setuid(nixUser.Uid); err != nil {
+		slog.Error("Failed to set user id", "error", err)
+		os.Exit(1)
+	}
+
+	if envHome := os.Getenv("HOME"); envHome == "" {
+		if err := os.Setenv("HOME", nixUser.Home); err != nil {
+			slog.Error("Failed to set HOME env", "error", err)
+		}
+	}
+
+	// set paths
+	if err := os.Setenv("PATH", paths); err != nil {
+		slog.Error("Failed to set PATH env", "error", err)
+	}
+
 	if err := setHostname(config.ID); err != nil {
 		slog.Error("Failed to set hostname", "error", err)
 	}
+
+	// mkdir /etc with 0755
+	if err := os.MkdirAll("/etc", 0755); err != nil {
+		slog.Error("Failed to create /etc", "error", err)
+		os.Exit(1)
+	}
+
+	// write hostname to /etc/hostname
+	if err := os.WriteFile("/etc/hostname", []byte(config.ID), 0644); err != nil {
+		slog.Error("Failed to write hostname to /etc/hostname", "error", err)
+		os.Exit(1)
+	}
+
+	// write resolv.conf
+	if err := writeResolvConf(config.EtcResolv); err != nil {
+		slog.Error("Failed to write resolv.conf", "error", err)
+		os.Exit(1)
+	}
+
+	// populate /etc/hosts
+	if err := writeEtcHost(config.EtcHost); err != nil {
+		slog.Error("Failed to write /etc/hosts", "error", err)
+		os.Exit(1)
+	}
+
+	if err := setupNetworking(*config); err != nil {
+		slog.Error("Failed to setup networking", "error", err)
+		os.Exit(1)
+	}
+
+	pingPath, err := exec.LookPath("ping")
+	if err != nil {
+		slog.Error("Failed to find ping", "error", err)
+		os.Exit(1)
+	}
+
+	// ping google.com
+	ping := exec.Command(pingPath, "-c", "1", "google.com")
+	ping.Stdout = os.Stdout
+	ping.Stderr = os.Stderr
+	if err := ping.Run(); err != nil {
+		slog.Error("Failed to ping google.com", "error", err)
+		os.Exit(1)
+	}
+
+	// catPath, err := exec.LookPath("cat")
+	// if err != nil {
+	// 	slog.Error("Failed to find ping", "error", err)
+	// 	os.Exit(1)
+	// }
+
+	// // cat google.com
+	// cat := exec.Command(catPath, "-A", "/etc/resolv.conf")
+	// cat.Stdout = os.Stdout
+	// cat.Stderr = os.Stderr
+	// if err := cat.Run(); err != nil {
+	// 	slog.Error("Failed to cat /etc/resolv.conf", "error", err)
+	// 	os.Exit(1)
+	// }
+
+	// Create VSOCK client to send exit status
 
 	client, err := vsock.NewHostClient(ctx, uint32(config.VsockExitPort))
 	if err != nil {
