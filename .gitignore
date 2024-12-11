@@ -13,3 +13,5 @@ exit_status.json
 kernel-build
 rootfs*
 *.img
+manifest.json
+data
