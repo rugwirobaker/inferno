@@ -8,18 +8,45 @@ source "${SCRIPT_DIR}/config.sh"
 # Enable strict error handling
 set_error_handlers
 
-# Generate a gateway IP in the 172.16.0.0/16 subnet
-generate_gateway_ip() {
-    local subnet="172.16"
-    local octet3=$((RANDOM % 256))
-    echo "$subnet.$octet3.1"
+# Find next available subnet in 172.16.x.y/30 range
+get_next_subnet() {
+    local db_path="$DB_PATH"
+    local subnet
+    
+    # Get the highest third octet used so far using string operations
+    subnet=$(sqlite3 "$db_path" "
+        SELECT COALESCE(
+            MAX(CAST(
+                substr(substr(gateway_ip, 8), 1, instr(substr(gateway_ip, 8), '.') - 1)
+                AS INTEGER
+            )), 
+            0
+        ) 
+        FROM vms;")
+    
+    # Increment for next subnet
+    subnet=$((subnet + 1))
+    
+    # Ensure we don't exceed valid range
+    if [ "$subnet" -gt 255 ]; then
+        error "No more subnets available in 172.16.0.0/16"
+        return 1
+    fi
+    
+    echo "$subnet"
 }
 
-# Generate a random guest IP in the 172.16.0.0/16 subnet
-generate_guest_ip() {
-    local subnet="172.16"
-    local octet3=$((RANDOM % 256))
-    echo "$subnet.$octet3.2"
+# Generate gateway and guest IPs for a /30 subnet
+generate_network_pair() {
+    local subnet="$1"
+    # For a /30 network:
+    # x.x.x.0/30 -> Network address
+    # x.x.x.1/30 -> Gateway
+    # x.x.x.2/30 -> Guest
+    # x.x.x.3/30 -> Broadcast
+    
+    local prefix="172.16.$subnet"
+    echo "${prefix}.1" "${prefix}.2"
 }
 
 # Generate a random tap device name
@@ -52,7 +79,7 @@ is_ip_forwarding_enabled() {
 }
 
 enable_ip_forwarding() {
-    require_root
+    require_root || return 1
     if ! is_ip_forwarding_enabled; then
         echo 1 > /proc/sys/net/ipv4/ip_forward || {
             error "Failed to enable IP forwarding"
@@ -68,7 +95,7 @@ tap_device_exists() {
 }
 
 create_tap_device() {
-    require_root
+    require_root || return 1
     local tap_name="$1"
     local gateway_ip="$2"
 
@@ -80,7 +107,7 @@ create_tap_device() {
     # Create operations in a subshell to ensure atomic execution
     (
         ip tuntap add dev "$tap_name" mode tap && \
-        ip addr add "$gateway_ip/16" dev "$tap_name" && \
+        ip addr add "$gateway_ip/30" dev "$tap_name" && \
         ip link set "$tap_name" up
     ) || {
         error "Failed to create and configure tap device $tap_name"
@@ -90,7 +117,7 @@ create_tap_device() {
 }
 
 delete_tap_device() {
-    require_root
+    require_root || return 1
     local tap_name="$1"
 
     if ! tap_device_exists "$tap_name"; then
@@ -164,9 +191,9 @@ configure_basic_nftables() {
             debug "Added established/related state rule"
         fi
 
-        if ! nft_rule_exists "inferno" "postrouting" "ip saddr $guest_ip"; then
-            nft add rule ip inferno postrouting oif "$OUTBOUND_INTERFACE" ip saddr "$guest_ip" masquerade
-            debug "Added masquerade rule for $guest_ip"
+        if ! nft_rule_exists "inferno" "postrouting" "ip saddr ${guest_ip}/30"; then
+            nft add rule ip inferno postrouting oif "$OUTBOUND_INTERFACE" ip saddr "${guest_ip}/30" masquerade
+            debug "Added masquerade rule for ${guest_ip}/30"
         fi
         
         return 0
@@ -257,8 +284,24 @@ create_vm_network() {
 
     # Generate network details
     local tap_name=$(generate_tap_name)
-    local gateway_ip=$(generate_gateway_ip)
-    local generated_guest_ip="${guest_ip:-$(generate_guest_ip)}"
+    local subnet gateway_ip generated_guest_ip
+    
+    if [ -z "$guest_ip" ]; then
+        subnet=$(get_next_subnet) || return 1
+        read -r gateway_ip generated_guest_ip < <(generate_network_pair "$subnet")
+        guest_ip="$generated_guest_ip"
+        debug "Generated network: subnet=$subnet, gateway=$gateway_ip, guest=$guest_ip"
+    else
+        # Extract subnet from provided guest IP and validate
+        if [[ ! "$guest_ip" =~ ^172\.16\.([0-9]+)\.2$ ]]; then
+            error "Invalid guest IP format. Must be 172.16.x.2"
+            return 1
+        fi
+        subnet="${BASH_REMATCH[1]}"
+        gateway_ip="172.16.${subnet}.1"
+        debug "Using provided guest IP: gateway=$gateway_ip, guest=$guest_ip"
+    fi
+    
     local mac_addr=$(generate_mac)
 
     # Create network configuration
@@ -269,7 +312,7 @@ create_vm_network() {
     create_tap_device "$tap_name" "$gateway_ip" || return 1
     
     log "Configuring basic nftables rules..."
-    configure_basic_nftables "$tap_name" "$gateway_ip" "$generated_guest_ip" || {
+    configure_basic_nftables "$tap_name" "$gateway_ip" "$guest_ip" || {
         delete_tap_device "$tap_name"
         return 1
     }
@@ -281,7 +324,7 @@ create_vm_network() {
     # Store in database
     local vm_data
     log "Storing configuration in database..."
-    vm_data=$(create_vm_with_state "$name" "$tap_name" "$gateway_ip" "$generated_guest_ip" "$mac_addr" "$nft_rules_hash") || {
+    vm_data=$(create_vm_with_state "$name" "$tap_name" "$gateway_ip" "$guest_ip" "$mac_addr" "$nft_rules_hash") || {
         delete_tap_device "$tap_name"
         error "Failed to create VM in database"
         return 1
