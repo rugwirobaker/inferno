@@ -4,22 +4,19 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"sync"
 	"time"
 
 	"syscall"
 
-	"github.com/opencontainers/runc/libcontainer/system"
-	"github.com/opencontainers/runc/libcontainer/user"
 	"github.com/rugwirobaker/inferno/internal/image"
-	"github.com/rugwirobaker/inferno/internal/pointer"
+	"github.com/rugwirobaker/inferno/internal/process"
+	"github.com/rugwirobaker/inferno/internal/process/primary"
+	"github.com/rugwirobaker/inferno/internal/process/ssh"
 	"github.com/rugwirobaker/inferno/internal/vsock"
 	"golang.org/x/sys/unix"
 )
@@ -36,6 +33,7 @@ var LogLevel struct {
 func main() {
 	ctx := context.Background()
 
+	// Load and validate configuration
 	config, err := image.FromFile("/inferno/run.json")
 	if err != nil {
 		panic(fmt.Sprintf("could not read run.json, error: %s", err))
@@ -46,68 +44,70 @@ func main() {
 	}
 
 	slog.Info("inferno init started")
-
 	slog.With("config", config).Debug("loaded config")
 
-	if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", syscall.MS_NOSUID, "mode=0755"); err != nil {
-		slog.Error("Failed to mount devtmpfs to /dev", "error", err)
-		os.Exit(1)
-	}
-	// mount root device at /rootfs
-	if err := os.MkdirAll("/rootfs", 0755); err != nil {
-		slog.Error("Failed to create /rootfs", "error", err)
-		os.Exit(1)
-	}
-	if err := syscall.Mount("/dev/vda", "/rootfs", "ext4", syscall.MS_RELATIME, ""); err != nil {
-		slog.Error("Failed to mount /dev/vda to /rootfs", "error", err)
+	// Initial system setup
+	if err := MountInitialDevFS(); err != nil {
+		slog.Error("Failed to mount initial devfs", "error", err)
 		os.Exit(1)
 	}
 
-	if err := os.MkdirAll("/rootfs/dev", 0755); err != nil {
-		slog.Error("Failed to create /rootfs/dev", "error", err)
-		os.Exit(1)
-	}
-	if err := syscall.Mount("/dev", "/rootfs/dev", "", syscall.MS_MOVE, ""); err != nil {
-		slog.Error("Failed to mount /dev to /rootfs/dev", "error", err)
+	// Mount root filesystem
+	if err := MountRootFS(config.Mounts.Root.Device, config.Mounts.Root.FSType, config.Mounts.Root.Options); err != nil {
+		slog.Error("Failed to mount root filesystem", "error", err)
 		os.Exit(1)
 	}
 
-	slog.Debug("Switching to new root")
-
-	if err := os.Chdir("/rootfs"); err != nil {
-		slog.Error("Failed to change directory to /rootfs", "error", err)
-		os.Exit(1)
-	}
-	if err := syscall.Mount(".", "/", "", syscall.MS_MOVE, ""); err != nil {
-		slog.Error("Failed to mount new root over /", "error", err)
-		os.Exit(1)
-	}
-	if err := syscall.Chroot("."); err != nil {
-		slog.Error("Failed to chroot to the new root", "error", err)
-		os.Exit(1)
-	}
-	if err := os.Chdir("/"); err != nil {
-		slog.Error("Failed to change directory to new /", "error", err)
+	// Switch to new root
+	if err := switchRoot(); err != nil {
+		slog.Error("Failed to switch root", "error", err)
 		os.Exit(1)
 	}
 
-	// finally mount other filesystems
-	if err := mountFS(); err != nil {
+	// Mount essential filesystems
+	if err := MountFS(); err != nil {
 		slog.Error("Failed to mount filesystems", "error", err)
+		os.Exit(1)
 	}
 
-	if err := os.MkdirAll("/run/lock", fs.FileMode(^uint32(0))); err != nil {
+	// Mount additional volumes
+	for _, vol := range config.Mounts.Volumes {
+		flags := MountFlags{}
+		for _, opt := range vol.Options {
+			switch opt {
+			case "ro":
+				flags.ReadOnly = true
+			case "noexec":
+				flags.NoExec = true
+			case "nosuid":
+				flags.NoSuid = true
+			case "nodev":
+				flags.NoDev = true
+			case "relatime":
+				flags.RelaTime = true
+			}
+		}
+
+		if err := Mount(vol.Device, vol.MountPoint, vol.FSType, flags, ""); err != nil {
+			slog.Error("Failed to mount volume",
+				"device", vol.Device,
+				"mountPoint", vol.MountPoint,
+				"error", err,
+			)
+			os.Exit(1)
+		}
+	}
+
+	// Create necessary directories
+	if err := os.MkdirAll("/run/lock", 0755); err != nil {
 		slog.Error("Failed to create /run/lock", "error", err)
 		os.Exit(1)
 	}
 
-	if err := createProcSymlinks(); err != nil {
-		slog.Error("Failed to create proc symlinks", "error", err)
-		os.Exit(1)
-	}
-
-	if err := os.MkdirAll("/root", unix.S_IRWXU); err != nil {
-		slog.Error("Failed to create /root", "error", err)
+	// Setup the user environment
+	userManager := NewUserManager(config.User)
+	if err := userManager.Setup(); err != nil {
+		slog.Error("Failed to setup user", "error", err)
 		os.Exit(1)
 	}
 
@@ -116,36 +116,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	var username = "root"
-
-	if _, err := user.LookupGroup(username); err != nil {
-		slog.Error("Failed to lookup group", "error", err)
-		os.Exit(1)
-	}
-
-	nixUser, err := user.LookupUser(username)
-	if err != nil {
-		slog.Error("Failed to lookup user", "error", err)
-		os.Exit(1)
-	}
-
-	if err := system.Setgid(nixUser.Gid); err != nil {
-		slog.Error("Failed to set group id", "error", err)
-		os.Exit(1)
-	}
-
-	if err := system.Setuid(nixUser.Uid); err != nil {
-		slog.Error("Failed to set user id", "error", err)
-		os.Exit(1)
-	}
-
-	if envHome := os.Getenv("HOME"); envHome == "" {
-		if err := os.Setenv("HOME", nixUser.Home); err != nil {
-			slog.Error("Failed to set HOME env", "error", err)
-		}
-	}
-
-	// set paths
 	if err := os.Setenv("PATH", paths); err != nil {
 		slog.Error("Failed to set PATH env", "error", err)
 	}
@@ -182,40 +152,9 @@ func main() {
 		slog.Error("Failed to setup networking", "error", err)
 		os.Exit(1)
 	}
-
-	pingPath, err := exec.LookPath("ping")
-	if err != nil {
-		slog.Error("Failed to find ping", "error", err)
-		os.Exit(1)
-	}
-
-	// ping google.com
-	ping := exec.Command(pingPath, "-c", "1", "google.com")
-	ping.Stdout = os.Stdout
-	ping.Stderr = os.Stderr
-	if err := ping.Run(); err != nil {
-		slog.Error("Failed to ping google.com", "error", err)
-		os.Exit(1)
-	}
-
-	// catPath, err := exec.LookPath("cat")
-	// if err != nil {
-	// 	slog.Error("Failed to find ping", "error", err)
-	// 	os.Exit(1)
-	// }
-
-	// // cat google.com
-	// cat := exec.Command(catPath, "-A", "/etc/resolv.conf")
-	// cat.Stdout = os.Stdout
-	// cat.Stderr = os.Stderr
-	// if err := cat.Run(); err != nil {
-	// 	slog.Error("Failed to cat /etc/resolv.conf", "error", err)
-	// 	os.Exit(1)
-	// }
-
 	// Create VSOCK client to send exit status
 
-	client, err := vsock.NewHostClient(ctx, uint32(config.VsockExitPort))
+	exitClient, err := vsock.NewHostClient(ctx, uint32(config.VsockExitPort))
 	if err != nil {
 		slog.Error("Failed to create exit code vsock client", "error", err)
 		os.Exit(1)
@@ -238,6 +177,8 @@ func main() {
 	// / Create the kill signal channel and pass it to the HTTP handler
 	killChan := make(chan syscall.Signal, 1)
 
+	handleSystemSignals(killChan)
+
 	api := NewAPI(uint32(config.VsockStdoutPort), killChan)
 	server := &http.Server{
 		Handler:      api.Handler(),
@@ -256,141 +197,37 @@ func main() {
 		}
 
 	}()
+	// Create and set up supervisor
+	supervisor := process.NewSupervisor(exitClient)
 
-	// Start the main process in the VM
-	cmd := exec.Command(config.Process.Cmd, config.Process.Args...)
-	cmd.Env = append(cmd.Env, paths)
+	// Create and add primary process
+	primary := primary.New(config.Process, config.Env)
+	supervisor.Add(primary, stdoutConn)
+	supervisor.SetPrimary(primary)
 
-	// Add environment variables
-	for k, v := range config.Env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
-
-	stdout, err := cmd.StdoutPipe()
+	// Create and add SSH server
+	sshServer, err := ssh.NewServer(config)
 	if err != nil {
-		slog.Error("Failed to capture stderr", "error", err)
+		slog.Error("Failed to create SSH server", "error", err)
+		os.Exit(1)
+	}
+	supervisor.Add(sshServer, stdoutConn)
+
+	// Run supervisor
+	if err := supervisor.Run(ctx, killChan); err != nil {
+		slog.Error("Supervisor error", "error", err)
 		os.Exit(1)
 	}
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		slog.Error("Failed to capture stderr", "error", err)
-		os.Exit(1)
-	}
-
-	var wg sync.WaitGroup // Create a WaitGroup
-	wg.Add(1)
-	go func() {
-		slog.Debug("streaming stdout")
-
-		defer wg.Done()
-		streamLogs(stdout, stdoutConn)
-	}()
-
-	wg.Add(1)
-	go func() {
-		slog.Debug("streaming stderr")
-
-		defer wg.Done()
-		streamLogs(stderr, stdoutConn)
-	}()
-
-	err = cmd.Start()
-	if err != nil {
-		panic(fmt.Sprintf("could not start main process: %s", err))
-	}
-
-	// Handle OS/system signals
-	handleSystemSignals(killChan)
-
-	// Monitor child process for exit or errors in a separate goroutine
-	childExited := make(chan error)
-	go func() {
-		err := cmd.Wait()
-		childExited <- err
-	}()
-
-	// Initialize exit status
-	var exit ExitStatus
-
-	slog.Debug("Waiting for kill signal or child process exit")
-
-	select {
-	case signal := <-killChan:
-		slog.Debug("Received kill signal", "signal", signal, "pid", cmd.Process.Pid)
-		_ = syscall.Kill(cmd.Process.Pid, syscall.Signal(signal))
-
-		// Wait for child to exit after receiving the signal
-		if err := cmd.Wait(); err != nil {
-			exit = ExitStatus{
-				ExitCode:  -1,
-				OOMKilled: false,
-				Signal:    pointer.Int(int(signal)),
-				Message:   fmt.Sprintf("Process terminated with signal %d", signal),
-			}
-		}
-
-	case err := <-childExited:
-		switch {
-		case err != nil:
-			exit = ExitStatus{
-				ExitCode:  -1,
-				OOMKilled: false,
-				Message:   fmt.Sprintf("Main process exited with error: %v", err),
-			}
-		default:
-			exit = ExitStatus{
-				ExitCode:  0,
-				OOMKilled: false,
-				Message:   "Main process exited normally",
-			}
-
-		}
-	}
-
-	// OOM killer detection
-	oom, err := checkOOMKill(cmd.Process.Pid)
-	if err != nil {
-		slog.Error("Failed to check OOM kill", "error", err)
-	}
-
-	if oom {
-		exit.OOMKilled = true
-		exit.Message = "Main process was killed by the OOM killer"
-	}
-
-	if err := sendExitStatus(ctx, client, exit); err != nil {
-		slog.Debug("Failed to send exit status", "error", err)
-	}
-
-	// Gracefully shut down the HTTP server
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Shutdown API server
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		slog.Error("HTTP server Shutdown failed", "error", err)
-		os.Exit(1)
-	}
 
-	wg.Wait()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Error shutting down API server", "error", err)
+	}
 
 	slog.Info("init exiting")
-}
-
-func streamLogs(src io.ReadCloser, dst io.WriteCloser) {
-	defer src.Close()
-	defer dst.Close()
-
-	scanner := bufio.NewScanner(src)
-	for scanner.Scan() {
-		_, err := fmt.Fprintln(dst, scanner.Text())
-		if err != nil {
-			slog.Error("Failed to write log line to vsock", "error", err)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		slog.Error("Error reading logs", "error", err)
-	}
 }
 
 func setHostname(hostname string) error {
@@ -478,4 +315,20 @@ func removeTime(groups []string, a slog.Attr) slog.Attr {
 		return slog.Attr{}
 	}
 	return a
+}
+
+func switchRoot() error {
+	if err := os.Chdir("/rootfs"); err != nil {
+		return fmt.Errorf("failed to change directory to /rootfs: %w", err)
+	}
+	if err := syscall.Mount(".", "/", "", syscall.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("failed to mount new root: %w", err)
+	}
+	if err := syscall.Chroot("."); err != nil {
+		return fmt.Errorf("failed to chroot: %w", err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		return fmt.Errorf("failed to change directory to new root: %w", err)
+	}
+	return nil
 }
