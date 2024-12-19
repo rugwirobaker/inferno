@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"syscall"
 
+	"github.com/rugwirobaker/inferno/internal/image"
 	"golang.org/x/sys/unix"
 )
 
@@ -135,6 +138,26 @@ func MountFS() error {
 	return nil
 }
 
+func CreateUserFiles(files []image.File) error {
+	for _, f := range files {
+		// Make sure the parent directories exist before creating the file
+		if err := os.MkdirAll(filepath.Dir(f.Path), 0755); err != nil {
+			return fmt.Errorf("creating parent directories for %s: %w", f.Path, err)
+		}
+
+		decoded, err := base64.StdEncoding.DecodeString(f.Content)
+		if err != nil {
+			return fmt.Errorf("decoding base64 content for %s: %w", f.Path, err)
+		}
+
+		// Create or overwrite the file with the specified mode
+		if err := writeFile(f.Path, f.Mode, decoded); err != nil {
+			return fmt.Errorf("writing file %s: %w", f.Path, err)
+		}
+	}
+	return nil
+}
+
 // mountPseudoFS mounts proc and sysfs
 func mountPseudoFS() error {
 	mounts := []struct {
@@ -232,6 +255,21 @@ func createProcSymlinks() error {
 		if err := unix.Symlinkat(link.oldname, 0, link.newname); err != nil {
 			return fmt.Errorf("failed to create symlink %s -> %s: %w",
 				link.newname, link.oldname, err)
+		}
+	}
+	return nil
+}
+
+func writeFile(path string, perm os.FileMode, content []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if len(content) > 0 {
+		if _, err := f.Write(content); err != nil {
+			return fmt.Errorf("writing content to %s: %w", path, err)
 		}
 	}
 	return nil

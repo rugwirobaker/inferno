@@ -32,7 +32,6 @@ type ExitStatus struct {
 // Base provides common functionality for process management
 type Base struct {
 	Name      string
-	Logger    *slog.Logger
 	IsPrimary bool
 
 	cmd  *exec.Cmd
@@ -51,6 +50,12 @@ func NewBaseProcess(name string, isPrimary bool) *Base {
 func (p *Base) SetupCommand(ctx context.Context, cmd string, args []string, env []string) error {
 	p.cmd = exec.CommandContext(ctx, cmd, args...)
 	p.cmd.Env = env
+    
+    slog.Debug("Command setup complete",
+        "path", cmd,
+        "args", args,
+        "env", env,
+    )
 	return nil
 }
 
@@ -87,7 +92,7 @@ func (p *Base) StartWithOutput(output io.WriteCloser) error {
 		p.done <- err
 	}()
 
-	p.Logger.Info("Started process",
+	slog.Info("Started process",
 		"name", p.Name,
 		"pid", p.cmd.Process.Pid,
 		"primary", p.IsPrimary,
@@ -103,13 +108,13 @@ func (p *Base) streamLogs(src io.ReadCloser, dst io.WriteCloser) {
 	for scanner.Scan() {
 		_, err := fmt.Fprintln(dst, scanner.Text())
 		if err != nil {
-			p.Logger.Error("Failed to write log line", "error", err)
+			slog.Error("Failed to write log line", "error", err)
 			return
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		p.Logger.Error("Error reading logs", "error", err)
+		slog.Error("Error reading logs", "error", err)
 	}
 }
 
@@ -120,14 +125,14 @@ func (p *Base) Stop(ctx context.Context) error {
 
 	// First try SIGTERM
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		p.Logger.Warn("Failed to send SIGTERM to process", "error", err)
+		slog.Warn("Failed to send SIGTERM to process", "error", err)
 		return p.cmd.Process.Kill()
 	}
 
 	// Wait for process to exit or context to cancel
 	select {
 	case <-ctx.Done():
-		p.Logger.Warn("Process didn't stop in time, forcing kill")
+		slog.Warn("Process didn't stop in time, forcing kill")
 		return p.cmd.Process.Kill()
 	case <-p.done:
 		return nil

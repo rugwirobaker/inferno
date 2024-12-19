@@ -152,7 +152,7 @@ generate_run_config() {
             user: {
                 name: "root",
                 group: "root",
-                create_if_missing: true
+                create: true
             },
             log: {
                 format: "text",

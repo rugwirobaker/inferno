@@ -131,12 +131,12 @@ generate_ssh_files() {
             {
                 "path": "/etc/inferno/ssh/host_key",
                 "content": $host_key,
-                "permission": "0600"
+                "mode": 420
             },
             {
                 "path": "/etc/inferno/ssh/authorized_keys",
                 "content": $auth_keys,
-                "permission": "0600"
+                "mode": 420
             }
         ]'
 }

@@ -25,13 +25,12 @@ func New(config image.Process, env map[string]string) *Primary {
 }
 
 func (p *Primary) Start(ctx context.Context, output io.WriteCloser) error {
-	// Convert env map to slice
-	var envSlice []string
+	var env []string
 	for k, v := range p.env {
-		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	if err := p.SetupCommand(ctx, p.config.Cmd, p.config.Args, envSlice); err != nil {
+	if err := p.SetupCommand(ctx, p.config.Cmd, p.config.Args, env); err != nil {
 		return err
 	}
 

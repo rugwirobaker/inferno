@@ -64,9 +64,9 @@ func NewServer(cfg *image.Config) (*Server, error) {
 func (s *Server) Start(ctx context.Context, output io.WriteCloser) error {
 	// Start the SSH server in a goroutine
 	go func() {
-		s.Logger.Info("Starting SSH server", "port", sshPort)
+		slog.Info("Starting SSH server", "port", sshPort)
 		if err := s.server.ListenAndServe(); err != nil {
-			s.Logger.Error("SSH server error", "error", err)
+			slog.Error("SSH server error", "error", err)
 			s.done <- err
 		}
 	}()

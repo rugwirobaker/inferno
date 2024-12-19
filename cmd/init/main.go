@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
@@ -21,7 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const paths = "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+const Path = "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 var LogLevel struct {
 	sync.Mutex
@@ -104,19 +103,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup the user environment
-	userManager := NewUserManager(config.User)
-	if err := userManager.Setup(); err != nil {
-		slog.Error("Failed to setup user", "error", err)
-		os.Exit(1)
-	}
-
 	if err := unix.Setrlimit(0, &unix.Rlimit{Cur: 10240, Max: 10240}); err != nil {
 		slog.Error("Failed to set rlimit", "error", err)
 		os.Exit(1)
 	}
 
-	if err := os.Setenv("PATH", paths); err != nil {
+	if err := os.Setenv("PATH", Path); err != nil {
 		slog.Error("Failed to set PATH env", "error", err)
 	}
 
@@ -148,12 +140,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	slog.Debug("Mounting user defined files")
+	if err := CreateUserFiles(config.Files); err != nil {
+		slog.Error("Failed to create user files", "error", err)
+		os.Exit(1)
+	}
+
 	if err := setupNetworking(*config); err != nil {
 		slog.Error("Failed to setup networking", "error", err)
 		os.Exit(1)
 	}
-	// Create VSOCK client to send exit status
 
+	// Setup the user environment
+	users := NewUserManager(config.User)
+	if err := users.Initialize(); err != nil {
+		slog.Error("Failed to setup user", "error", err)
+		os.Exit(1)
+	}
+
+	// Create VSOCK client to send exit status
 	exitClient, err := vsock.NewHostClient(ctx, uint32(config.VsockExitPort))
 	if err != nil {
 		slog.Error("Failed to create exit code vsock client", "error", err)
@@ -259,27 +264,6 @@ func handleSystemSignals(killChan chan syscall.Signal) {
 			killChan <- syscall.Signal(sig.(syscall.Signal))
 		}
 	}()
-}
-
-// Function to check if the process was killed by the OOM killer
-func checkOOMKill(pid int) (bool, error) {
-	file, err := os.Open("/dev/kmsg")
-	if err != nil {
-		return false, fmt.Errorf("failed to open /dev/kmsg: %w", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	matcher := fmt.Sprintf("Killed process %d", pid)
-
-	for scanner.Scan() {
-		if text := scanner.Text(); text != "" && time.Now().Before(time.Now().Add(1*time.Second)) {
-			if contains := text; contains == matcher {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
 }
 
 func configureLogger(c *image.Config) error {

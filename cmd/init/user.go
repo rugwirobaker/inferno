@@ -1,301 +1,329 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/rugwirobaker/inferno/internal/image"
-	"golang.org/x/sys/unix"
 )
 
+// UserManager handles user and group setup in the VM environment
 type UserManager struct {
 	config *image.UserConfig
 }
 
+// NewUserManager creates a new UserManager with the given config
 func NewUserManager(config *image.UserConfig) *UserManager {
 	return &UserManager{
 		config: config.WithDefaults(),
 	}
 }
 
-func (m *UserManager) Setup() error {
-	// First ensure group exists
-	group, err := m.ensureGroup()
+// Initialize sets up the user environment including groups, home directory, and permissions
+func (m *UserManager) Initialize() error {
+	if err := m.createSystemFiles(); err != nil {
+		return fmt.Errorf("creating system files: %w", err)
+	}
+
+	// Create group first, then user
+	gid, err := m.createOrGetGroup()
 	if err != nil {
-		return fmt.Errorf("group setup failed: %w", err)
+		return fmt.Errorf("managing group: %w", err)
 	}
 
-	// Then ensure user exists
-	usr, err := m.ensureUser(group)
-	if err != nil {
-		return fmt.Errorf("user setup failed: %w", err)
+	if err := m.createOrGetUser(gid); err != nil {
+		return fmt.Errorf("managing user: %w", err)
 	}
 
-	// Setup additional groups if specified
-	if err := m.setupAdditionalGroups(usr); err != nil {
-		return fmt.Errorf("additional groups setup failed: %w", err)
+	if err := m.createSecondaryGroups(); err != nil {
+		return fmt.Errorf("managing secondary groups: %w", err)
 	}
 
-	// Ensure home directory exists with correct permissions
-	if err := m.setupHomeDir(usr); err != nil {
-		return fmt.Errorf("home directory setup failed: %w", err)
+	if err := m.createHomeDirectory(); err != nil {
+		return fmt.Errorf("managing home directory: %w", err)
 	}
 
-	// Switch to the user
-	if err := m.switchUser(usr); err != nil {
-		return fmt.Errorf("switching user failed: %w", err)
+	// if err := m.assumeUserIdentity(); err != nil {
+	// 	return fmt.Errorf("assuming user identity: %w", err)
+	// }
+
+	return nil
+}
+
+func (m *UserManager) createSystemFiles() error {
+	files := []struct {
+		path string
+		perm os.FileMode
+	}{
+		{"/etc/passwd", 0644},
+		{"/etc/group", 0644},
+	}
+
+	for _, f := range files {
+		if err := ensureFile(f.path, f.perm); err != nil {
+			return fmt.Errorf("creating %s: %w", f.path, err)
+		}
+	}
+	return nil
+}
+
+func (m *UserManager) createOrGetGroup() (int, error) {
+	// Use configured GID or default
+	desiredGID := 1000
+	if m.config.GID != nil {
+		desiredGID = *m.config.GID
+	}
+
+	// Check if group exists
+	existingGID, err := lookupGroupID(m.config.Group)
+	if err == nil {
+		return existingGID, nil
+	}
+
+	// Create new group with desired GID
+	entry := fmt.Sprintf("%s:x:%d:\n", m.config.Group, desiredGID)
+	if err := appendToFile("/etc/group", entry); err != nil {
+		return 0, err
+	}
+
+	return desiredGID, nil
+}
+
+func (m *UserManager) createOrGetUser(gid int) error {
+	// Use configured UID or default
+	desiredUID := 1000
+	if m.config.UID != nil {
+		desiredUID = *m.config.UID
+	}
+
+	// Check if user exists
+	if _, err := lookupUserID(m.config.Name); err == nil {
+		return nil
+	}
+
+	entry := fmt.Sprintf("%s:x:%d:%d:%s:%s:%s\n",
+		m.config.Name, desiredUID, gid,
+		m.config.Name,
+		m.config.Home,
+		m.config.Shell)
+
+	return appendToFile("/etc/passwd", entry)
+}
+
+func (m *UserManager) createHomeDirectory() error {
+	// Create parent directories with standard permissions
+	parent := filepath.Dir(m.config.Home)
+	if parent != "/" {
+		if err := os.MkdirAll(parent, 0755); err != nil {
+			return fmt.Errorf("creating parent directories: %w", err)
+		}
+	}
+
+	// Create home directory with restricted permissions
+	if err := os.MkdirAll(m.config.Home, 0750); err != nil {
+		return fmt.Errorf("creating home directory: %w", err)
+	}
+
+	uid := 1000
+	if m.config.UID != nil {
+		uid = *m.config.UID
+	}
+
+	gid := 1000
+	if m.config.GID != nil {
+		gid = *m.config.GID
+	}
+
+	if err := os.Chown(m.config.Home, uid, gid); err != nil {
+		return fmt.Errorf("setting home directory ownership: %w", err)
 	}
 
 	return nil
 }
 
-func (m *UserManager) ensureGroup() (*user.Group, error) {
-	group, err := user.LookupGroup(m.config.Group)
-	if err == nil {
-		return group, nil
-	}
-
-	if !m.config.Create {
-		return nil, fmt.Errorf("group %s doesn't exist and creation not enabled", m.config.Group)
-	}
-
-	gid := 0
-	if m.config.GID != nil {
-		gid = *m.config.GID
-	}
-
-	if err := createGroup(m.config.Group, gid); err != nil {
-		return nil, err
-	}
-
-	return user.LookupGroup(m.config.Group)
-}
-
-func (m *UserManager) ensureUser(group *user.Group) (*user.User, error) {
-	usr, err := user.Lookup(m.config.Name)
-	if err == nil {
-		return usr, nil
-	}
-
-	if !m.config.Create {
-		return nil, fmt.Errorf("user %s doesn't exist and creation not enabled", m.config.Name)
-	}
-
-	uid := 0
-	if m.config.UID != nil {
-		uid = *m.config.UID
-	}
-
-	gid, _ := strconv.Atoi(group.Gid)
-	if err := createUser(m.config.Name, uid, gid, m.config.Home, m.config.Shell); err != nil {
-		return nil, err
-	}
-
-	return user.Lookup(m.config.Name)
-}
-
-func (m *UserManager) setupAdditionalGroups(usr *user.User) error {
+func (m *UserManager) createSecondaryGroups() error {
 	if len(m.config.Groups) == 0 {
 		return nil
 	}
 
 	for _, groupName := range m.config.Groups {
-		group, err := user.LookupGroup(groupName)
-		if err != nil {
-			if !m.config.Create {
-				return fmt.Errorf("additional group %s doesn't exist: %w", groupName, err)
-			}
-			if err := createGroup(groupName, 0); err != nil {
-				return fmt.Errorf("failed to create additional group %s: %w", groupName, err)
-			}
-			group, err = user.LookupGroup(groupName)
-			if err != nil {
-				return fmt.Errorf("failed to lookup newly created group %s: %w", groupName, err)
-			}
-		}
-
-		if err := addUserToGroup(usr.Username, group.Name); err != nil {
-			return fmt.Errorf("failed to add user to group %s: %w", group.Name, err)
+		if err := m.addUserToSecondaryGroup(groupName); err != nil {
+			return fmt.Errorf("managing secondary group %s: %w", groupName, err)
 		}
 	}
 
 	return nil
 }
 
-func (m *UserManager) setupHomeDir(usr *user.User) error {
-	if err := os.MkdirAll(usr.HomeDir, 0750); err != nil {
-		return fmt.Errorf("failed to create home directory: %w", err)
-	}
-
-	uid, _ := strconv.Atoi(usr.Uid)
-	gid, _ := strconv.Atoi(usr.Gid)
-
-	if err := os.Chown(usr.HomeDir, uid, gid); err != nil {
-		return fmt.Errorf("failed to chown home directory: %w", err)
-	}
-
-	// Copy skeleton files if user is not root and directory is empty
-	if usr.Username != "root" {
-		if empty, err := isDirEmpty(usr.HomeDir); err != nil {
-			return err
-		} else if empty {
-			if err := copySkelFiles(usr.HomeDir, uid, gid); err != nil {
-				return fmt.Errorf("failed to copy skel files: %w", err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (m *UserManager) switchUser(usr *user.User) error {
-	uid, _ := strconv.Atoi(usr.Uid)
-	gid, _ := strconv.Atoi(usr.Gid)
-
-	if err := unix.Setgroups([]int{gid}); err != nil {
-		return fmt.Errorf("failed to set groups: %w", err)
-	}
-
-	if err := unix.Setgid(gid); err != nil {
-		return fmt.Errorf("failed to set GID: %w", err)
-	}
-
-	if err := unix.Setuid(uid); err != nil {
-		return fmt.Errorf("failed to set UID: %w", err)
-	}
-
-	if err := os.Setenv("HOME", usr.HomeDir); err != nil {
-		return fmt.Errorf("failed to set HOME env: %w", err)
-	}
-
-	if err := os.Setenv("USER", usr.Username); err != nil {
-		return fmt.Errorf("failed to set USER env: %w", err)
-	}
-
-	if err := os.Setenv("SHELL", m.config.Shell); err != nil {
-		return fmt.Errorf("failed to set SHELL env: %w", err)
-	}
-
-	return nil
-}
-
-func isDirEmpty(path string) (bool, error) {
-	f, err := os.Open(path)
+func (m *UserManager) addUserToSecondaryGroup(groupName string) error {
+	_, err := lookupGroupID(groupName)
 	if err != nil {
-		return false, err
+		// Create new group if it doesn't exist
+		gid := findNextAvailableGID()
+		entry := fmt.Sprintf("%s:x:%d:%s\n", groupName, gid, m.config.Name)
+		return appendToFile("/etc/group", entry)
+	}
+
+	return addUserToGroup(m.config.Name, groupName)
+}
+
+// func (m *UserManager) assumeUserIdentity() error {
+// 	uid := 1000
+// 	if m.config.UID != nil {
+// 		uid = *m.config.UID
+// 	}
+
+// 	gid := 1000
+// 	if m.config.GID != nil {
+// 		gid = *m.config.GID
+// 	}
+
+// 	// Set supplementary groups first
+// 	if err := unix.Setgroups([]int{gid}); err != nil {
+// 		return fmt.Errorf("setting groups: %w", err)
+// 	}
+
+// 	if err := unix.Setgid(gid); err != nil {
+// 		return fmt.Errorf("setting GID: %w", err)
+// 	}
+
+// 	if err := unix.Setuid(uid); err != nil {
+// 		return fmt.Errorf("setting UID: %w", err)
+// 	}
+
+// 	// Set environment variables
+// 	envVars := map[string]string{
+// 		"HOME":  m.config.Home,
+// 		"USER":  m.config.Name,
+// 		"SHELL": m.config.Shell,
+// 	}
+
+// 	for key, value := range envVars {
+// 		if err := os.Setenv(key, value); err != nil {
+// 			return fmt.Errorf("setting %s environment variable: %w", key, err)
+// 		}
+// 	}
+
+// 	return nil
+// }
+
+// Helper functions
+
+func ensureFile(path string, perm os.FileMode) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, perm)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	}
+	return nil
+}
+
+func lookupUserID(username string) (int, error) {
+	f, err := os.Open("/etc/passwd")
+	if err != nil {
+		return 0, err
 	}
 	defer f.Close()
 
-	_, err = f.Readdirnames(1)
-	if err == nil {
-		return false, nil
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Split(scanner.Text(), ":")
+		if len(fields) >= 3 && fields[0] == username {
+			return strconv.Atoi(fields[2])
+		}
 	}
-	return err == io.EOF, nil
+	return 0, fmt.Errorf("user not found: %s", username)
 }
 
-func copySkelFiles(homedir string, uid, gid int) error {
-	skelDir := "/etc/skel"
-	if _, err := os.Stat(skelDir); os.IsNotExist(err) {
-		return nil // Skip if skel directory doesn't exist
-	}
-
-	return filepath.Walk(skelDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		relPath, err := filepath.Rel(skelDir, path)
-		if err != nil {
-			return err
-		}
-
-		targetPath := filepath.Join(homedir, relPath)
-
-		if info.IsDir() {
-			return os.MkdirAll(targetPath, info.Mode())
-		}
-
-		return copyFile(path, targetPath, uid, gid, info.Mode())
-	})
-}
-
-func copyFile(src, dst string, uid, gid int, mode os.FileMode) error {
-	data, err := os.ReadFile(src)
+func lookupGroupID(groupname string) (int, error) {
+	f, err := os.Open("/etc/group")
 	if err != nil {
-		return err
+		return 0, err
 	}
+	defer f.Close()
 
-	if err := os.WriteFile(dst, data, mode); err != nil {
-		return err
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Split(scanner.Text(), ":")
+		if len(fields) >= 3 && fields[0] == groupname {
+			return strconv.Atoi(fields[2])
+		}
 	}
-
-	return os.Chown(dst, uid, gid)
+	return 0, fmt.Errorf("group not found: %s", groupname)
 }
 
-// createGroup creates a new system group
-func createGroup(name string, gid int) error {
-	args := []string{"--system"}
-
-	if gid != 0 {
-		args = append(args, "-g", strconv.Itoa(gid))
+func appendToFile(path, content string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("opening file %s: %w", path, err)
 	}
-	args = append(args, name)
+	defer f.Close()
 
-	cmd := exec.Command("groupadd", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("groupadd failed: %s: %w", string(out), err)
+	if _, err := f.WriteString(content); err != nil {
+		return fmt.Errorf("writing to file %s: %w", path, err)
 	}
+
 	return nil
 }
 
-// createUser creates a new system user
-func createUser(name string, uid, gid int, home, shell string) error {
-	args := []string{
-		"--system",
-		"-g", strconv.Itoa(gid),
-	}
-
-	if uid != 0 {
-		args = append(args, "-u", strconv.Itoa(uid))
-	}
-
-	if home != "" {
-		args = append(args, "-d", home)
-	}
-
-	if shell != "" {
-		args = append(args, "-s", shell)
-	}
-
-	args = append(args, name)
-
-	cmd := exec.Command("useradd", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("useradd failed: %s: %w", string(out), err)
-	}
-	return nil
-}
-
-// addUserToGroup adds a user to an existing group
 func addUserToGroup(username, groupname string) error {
-	cmd := exec.Command("usermod", "-a", "-G", groupname, username)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("usermod failed: %s: %w", string(out), err)
+	content, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return fmt.Errorf("reading group file: %w", err)
 	}
-	return nil
+
+	lines := strings.Split(string(content), "\n")
+	modified := false
+
+	for i, line := range lines {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 4 && fields[0] == groupname {
+			members := strings.Split(fields[3], ",")
+			for _, member := range members {
+				if member == username {
+					return nil // User already in group
+				}
+			}
+			if fields[3] == "" {
+				fields[3] = username
+			} else {
+				fields[3] += "," + username
+			}
+			lines[i] = strings.Join(fields, ":")
+			modified = true
+			break
+		}
+	}
+
+	if !modified {
+		return fmt.Errorf("group not found: %s", groupname)
+	}
+
+	return os.WriteFile("/etc/group", []byte(strings.Join(lines, "\n")), 0644)
 }
 
-// Setuid sets the user ID for the current process
-func Setuid(uid int) error {
-	return unix.Setuid(uid)
-}
+func findNextAvailableGID() int {
+	maxGID := 1000
+	f, err := os.Open("/etc/group")
+	if err != nil {
+		return maxGID
+	}
+	defer f.Close()
 
-// Setgid sets the group ID for the current process
-func Setgid(gid int) error {
-	return unix.Setgid(gid)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Split(scanner.Text(), ":")
+		if len(fields) >= 3 {
+			if gid, err := strconv.Atoi(fields[2]); err == nil && gid >= maxGID {
+				maxGID = gid + 1
+			}
+		}
+	}
+	return maxGID
 }

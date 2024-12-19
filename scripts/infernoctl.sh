@@ -331,9 +331,6 @@ create_vm() {
         return 1
     }
 
-    # Cleanup initramfs directory as it's no longer needed
-    rm -rf "$initramfs_dir"
-
     # Fix file ownership
     log "Setting file ownership..."
     if [[ -n "$SUDO_USER" ]]; then

@@ -16,6 +16,7 @@ type Config struct {
 	Log     Log               `json:"log"`
 	Mounts  Mounts            `json:"mounts"`
 	User    *UserConfig       `json:"user,omitempty"`
+	Files   []File            `json:"files,omitempty"`
 
 	EtcResolv EtcResolv `json:"etc_resolv"`
 	EtcHost   []EtcHost `json:"etc_hosts,omitempty"`
@@ -75,6 +76,12 @@ type Volume struct {
 	MountPoint string   `json:"mount_point"` // e.g. / for root, /data for others
 	FSType     string   `json:"fs_type"`     // e.g. ext4
 	Options    []string `json:"options,omitempty"`
+}
+
+type File struct {
+	Path    string      `json:"path"`
+	Mode    os.FileMode `json:"mode"`
+	Content string      `json:"content"`
 }
 
 func (m *Mounts) Validate() error {
