@@ -17,11 +17,12 @@ create_vm_with_state() {
     local guest_ip="$4"
     local mac_address="$5"
     local nft_rules_hash="$6"
-    
+
     debug "Creating VM record for $name with tap device $tap_device"
-    
+
     local result
-    result=$(sqlite3 "$DB_PATH" <<EOF
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
     BEGIN TRANSACTION;
     INSERT INTO vms (name, tap_device, gateway_ip, guest_ip, mac_address)
     VALUES ('$name', '$tap_device', '$gateway_ip', '$guest_ip', '$mac_address')
@@ -43,7 +44,7 @@ EOF
         error "Failed to create VM record in database"
         return 1
     }
-    
+
     echo "$result"
 }
 
@@ -55,11 +56,12 @@ add_route_to_vm() {
     local hostname="$5"
     local public_ip="$6"
     local nft_rules_hash="$7"
-    
+
     debug "Adding route for VM $vm_name: $mode mode, host port $host_port -> guest port $guest_port"
-    
+
     local result
-    result=$(sqlite3 "$DB_PATH" <<EOF
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
     BEGIN TRANSACTION;
     INSERT INTO routes (vm_id, mode, host_port, guest_port, hostname, public_ip)
     SELECT id, '$mode', $host_port, $guest_port, NULLIF('$hostname', ''), NULLIF('$public_ip', '')
@@ -90,15 +92,15 @@ EOF
         error "Failed to add route to VM in database"
         return 1
     }
-    
+
     echo "$result"
 }
 
 get_vm_by_name() {
     local name="$1"
     debug "Fetching VM details for $name"
-    
-    sqlite3 "$DB_PATH" <<EOF || { error "Failed to fetch VM details"; return 1; }
+
+    sqlite3 "$DB_PATH" <<EOF || {
     SELECT json_object(
         'name', v.name,
         'tap_device', v.tap_device,
@@ -112,13 +114,16 @@ get_vm_by_name() {
     LEFT JOIN network_state ns ON ns.vm_id = v.id
     WHERE v.name = '$name';
 EOF
+        error "Failed to fetch VM details"
+        return 1
+    }
 }
 
 get_vm_routes() {
     local name="$1"
     debug "Fetching routes for VM $name"
-    
-    sqlite3 "$DB_PATH" <<EOF || { error "Failed to fetch VM routes"; return 1; }
+
+    sqlite3 "$DB_PATH" <<EOF || {
     SELECT json_group_array(
         json_object(
             'mode', mode,
@@ -134,11 +139,14 @@ get_vm_routes() {
     WHERE v.name = '$name'
     AND r.active = TRUE;
 EOF
+        error "Failed to fetch VM routes"
+        return 1
+    }
 }
 
 list_all_vms() {
     debug "Listing all VMs"
-    sqlite3 -json "$DB_PATH" <<EOF || { error "Failed to list VMs"; return 1; }
+    sqlite3 -json "$DB_PATH" <<EOF || {
     SELECT 
         v.name,
         v.tap_device,
@@ -150,13 +158,16 @@ list_all_vms() {
     LEFT JOIN routes r ON r.vm_id = v.id AND r.active = TRUE
     GROUP BY v.id;
 EOF
+        error "Failed to list VMs"
+        return 1
+    }
 }
 
 delete_vm() {
     local name="$1"
     debug "Deleting VM $name"
-    
-    sqlite3 "$DB_PATH" <<EOF || { error "Failed to delete VM from database"; return 1; }
+
+    sqlite3 "$DB_PATH" <<EOF || {
     BEGIN TRANSACTION;
     UPDATE network_state
     SET state = 'deleted',
@@ -169,14 +180,17 @@ delete_vm() {
     
     COMMIT;
 EOF
-    
+        error "Failed to delete VM from database"
+        return 1
+    }
+
     log "Successfully deleted VM $name from database"
 }
 
 get_tap_by_name() {
     local name="$1"
     debug "Fetching tap device for VM $name"
-    
+
     sqlite3 "$DB_PATH" "SELECT tap_device FROM vms WHERE name = '$name';" || {
         error "Failed to fetch tap device"
         return 1
@@ -186,7 +200,7 @@ get_tap_by_name() {
 vm_exists() {
     local name="$1"
     debug "Checking if VM $name exists"
-    
+
     local count
     count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM vms WHERE name = '$name';") || {
         error "Failed to check VM existence"
@@ -200,19 +214,20 @@ vm_exists() {
 create_volume() {
     local name="$1"
     local size_gb="$2"
-    
+
     local volume_id=$(generate_volume_id)
     local device_path="/dev/$VG_NAME/$volume_id"
-    
+
     # Create the LVM volume first
     create_lv "$volume_id" "$size_gb" || return 1
-    
+
     # Format the volume
     format_volume "$device_path" || return 1
-    
+
     # Store in database
     local result
-    result=$(sqlite3 "$DB_PATH" <<EOF
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
     INSERT INTO volumes (volume_id, name, size_gb, device_path)
     VALUES ('$volume_id', '$name', $size_gb, '$device_path')
     RETURNING json_object(
@@ -227,12 +242,12 @@ EOF
         error "Failed to create volume record in database"
         return 1
     }
-    
+
     echo "$result"
 }
 
 list_volumes() {
-    sqlite3 -json "$DB_PATH" <<EOF || { error "Failed to list volumes"; return 1; }
+    sqlite3 -json "$DB_PATH" <<EOF || {
     SELECT 
         v.volume_id,
         v.name,
@@ -244,11 +259,14 @@ list_volumes() {
     LEFT JOIN vms vm ON v.vm_id = vm.id
     ORDER BY v.created_at DESC;
 EOF
+        error "Failed to list volumes"
+        return 1
+    }
 }
 
 get_volume() {
     local volume_id="$1"
-    sqlite3 -json "$DB_PATH" <<EOF || { error "Failed to get volume"; return 1; }
+    sqlite3 -json "$DB_PATH" <<EOF || {
     SELECT 
         v.volume_id,
         v.name,
@@ -261,6 +279,168 @@ get_volume() {
     WHERE v.volume_id = '$volume_id'
     LIMIT 1;
 EOF
+        error "Failed to get volume"
+        return 1
+    }
+}
+
+update_volume_vm() {
+    local volume_id="$1"
+    local vm_name="$2"
+
+    debug "Updating volume $volume_id attachment to VM $vm_name"
+
+    sqlite3 "$DB_PATH" <<EOF || {
+        error "Failed to update volume-VM association"
+        return 1
+    }
+    UPDATE volumes 
+    SET vm_id = (
+        SELECT id FROM vms WHERE name = '$vm_name'
+    )
+    WHERE volume_id = '$volume_id';
+EOF
+    }
+}
+
+# Delete a volume
+delete_volume() {
+    local volume_id="$1"
+
+    debug "Deleting volume $volume_id"
+
+    # Check if volume is attached to a VM
+    local attached_vm
+    attached_vm=$(sqlite3 "$DB_PATH" "
+        SELECT vm.name 
+        FROM volumes v 
+        JOIN vms vm ON v.vm_id = vm.id 
+        WHERE v.volume_id = '$volume_id';
+    ")
+
+    if [[ -n "$attached_vm" ]]; then
+        error "Volume is still attached to VM: $attached_vm"
+        return 1
+    fi
+
+    # Get device path before deletion
+    local device_path
+    device_path=$(sqlite3 "$DB_PATH" "
+        SELECT device_path 
+        FROM volumes 
+        WHERE volume_id = '$volume_id';
+    ")
+
+    if [[ -z "$device_path" ]]; then
+        error "Volume not found: $volume_id"
+        return 1
+    fi
+
+    # Delete LVM volume
+    if ! delete_lv "$volume_id"; then
+        error "Failed to delete logical volume"
+        return 1
+    fi
+
+    # Remove from database
+    sqlite3 "$DB_PATH" "
+        DELETE FROM volumes 
+        WHERE volume_id = '$volume_id';
+    " || {
+        error "Failed to remove volume from database"
+        return 1
+    }
+    log "Volume $volume_id deleted successfully"
+}
+
+# Verify if a volume exists and is available
+verify_volume() {
+    local volume_id="$1"
+    local device_path
+
+    debug "Verifying volume $volume_id"
+
+    # Check database
+    device_path=$(sqlite3 "$DB_PATH" "
+        SELECT device_path 
+        FROM volumes 
+        WHERE volume_id = '$volume_id';
+    ") || return 1
+
+    if [[ -z "$device_path" ]]; then
+        error "Volume not found: $volume_id"
+        return 1
+    fi
+
+    # Check if device exists
+    if [[ ! -b "$device_path" ]]; then
+        error "Volume device not found: $device_path"
+        return 1
+    fi
+
+    # Verify LVM status
+    if ! lvs "$VG_NAME/$volume_id" >/dev/null 2>&1; then
+        error "Volume not found in LVM: $volume_id"
+        return 1
+    fi
+
+    return 0
+}
+
+# Get volumes attached to a VM
+get_vm_volumes() {
+    local vm_name="$1"
+
+    debug "Fetching volumes for VM $vm_name"
+
+    sqlite3 -json "$DB_PATH" <<EOF || {
+    SELECT 
+        v.volume_id,
+        v.name,
+        v.size_gb,
+        v.device_path,
+        v.created_at
+    FROM volumes v
+    JOIN vms vm ON v.vm_id = vm.id
+    WHERE vm.name = '$vm_name'
+    ORDER BY v.created_at DESC;
+EOF
+        error "Failed to fetch VM volumes"
+        return 1
+    }
+}
+
+get_volume_attachment() {
+    local volume_id="$1"
+    debug "Checking volume attachment status for $volume_id"
+
+    sqlite3 "$DB_PATH" "
+        SELECT vm.name 
+        FROM volumes v 
+        JOIN vms vm ON v.vm_id = vm.id 
+        WHERE v.volume_id = '$volume_id';
+    " || {
+        error "Failed to check volume attachment status"
+        return 1
+    }
+}
+
+# Detach a volume from its VM
+detach_volume() {
+    local volume_id="$1"
+
+    debug "Detaching volume $volume_id"
+
+    sqlite3 "$DB_PATH" "
+        UPDATE volumes 
+        SET vm_id = NULL 
+        WHERE volume_id = '$volume_id';
+    " || {
+        error "Failed to detach volume from VM"
+        return 1
+    }
+
+    log "Volume $volume_id detached successfully"
 }
 
 # Add to database.sh:
@@ -270,11 +450,12 @@ create_image() {
     local source_image="$3"
     local rootfs_path="$4"
     local manifest_path="$5"
-    
+
     debug "Creating image record for $name from $source_image"
-    
+
     local result
-    result=$(sqlite3 "$DB_PATH" <<EOF
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
     INSERT INTO images (
         image_id,
         name,
@@ -300,14 +481,14 @@ EOF
         error "Failed to create image record in database"
         return 1
     }
-    
+
     echo "$result"
 }
 
 list_images() {
     debug "Listing all images"
-    
-    sqlite3 -json "$DB_PATH" <<EOF || { error "Failed to list images"; return 1; }
+
+    sqlite3 -json "$DB_PATH" <<EOF || {
     SELECT 
         i.image_id,
         i.name,
@@ -319,13 +500,16 @@ list_images() {
     GROUP BY i.id
     ORDER BY i.created_at DESC;
 EOF
+        error "Failed to list images"
+        return 1
+    }
 }
 
 get_image() {
     local image_id="$1"
     debug "Fetching image details for $image_id"
-    
-    sqlite3 -json "$DB_PATH" <<EOF || { error "Failed to get image details"; return 1; }
+
+    sqlite3 -json "$DB_PATH" <<EOF || {
     SELECT json_object(
         'image_id', i.image_id,
         'name', i.name,
@@ -342,44 +526,50 @@ get_image() {
     FROM images i
     WHERE i.image_id = '$image_id';
 EOF
+        error "Failed to get image details"
+        return 1
+    }
 }
 
 delete_image() {
     local image_id="$1"
     debug "Deleting image $image_id"
-    
+
     # Check if image is in use
     local vm_count
     vm_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM vms WHERE image_id = (SELECT id FROM images WHERE image_id = '$image_id');")
-    
+
     if [ "$vm_count" -gt 0 ]; then
         error "Cannot delete image that is in use by VMs"
         return 1
     fi
-    
+
     # Get paths before deletion
     local paths
     paths=$(sqlite3 "$DB_PATH" "SELECT rootfs_path, manifest_path FROM images WHERE image_id = '$image_id';")
     read -r rootfs_path manifest_path <<<"$paths"
-    
+
     # Delete from database
     sqlite3 "$DB_PATH" "DELETE FROM images WHERE image_id = '$image_id';" || {
         error "Failed to delete image from database"
         return 1
     }
-    
+
     echo "$rootfs_path $manifest_path"
 }
 
 update_vm_image() {
     local vm_name="$1"
     local image_id="$2"
-    
+
     debug "Updating VM $vm_name to use image $image_id"
-    
-    sqlite3 "$DB_PATH" <<EOF || { error "Failed to update VM image"; return 1; }
+
+    sqlite3 "$DB_PATH" <<EOF || {
     UPDATE vms 
     SET image_id = (SELECT id FROM images WHERE image_id = '$image_id')
     WHERE name = '$vm_name';
 EOF
+        error "Failed to update VM image"
+        return 1
+    }
 }

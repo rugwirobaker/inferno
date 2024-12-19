@@ -16,6 +16,17 @@ DEPENDENCIES=(
     "sqlite3" # database operations
 )
 
+# Required LVM tools
+LVM_DEPENDENCIES=(
+    "pvcreate"  # physical volume management
+    "vgcreate"  # volume group management
+    "lvcreate"  # logical volume management
+    "lvs"       # volume status
+    "vgs"       # group status
+    "pvs"       # physical volume status
+    "mkfs.ext4" # ext4 filesystem tools
+)
+
 # Optional dependencies that enhance functionality
 OPTIONAL_DEPENDENCIES=(
     "haproxy" # load balancing (optional)
@@ -121,6 +132,28 @@ verify_dependencies() {
     done
 
     echo
+    log "Checking LVM Dependencies:"
+    echo "---------------------"
+    for dep in "${LVM_DEPENDENCIES[@]}"; do
+        printf "%-15s: " "$dep"
+        status=$(check_dependency "$dep")
+        if [ $? -eq 0 ]; then
+            echo "$status"
+        else
+            echo "MISSING"
+            case "$dep" in
+            pvcreate | vgcreate | lvcreate | lvs | vgs | pvs)
+                warn "  Install with: sudo apt-get install lvm2"
+                ;;
+            mkfs.ext4)
+                warn "  Install with: sudo apt-get install e2fsprogs"
+                ;;
+            esac
+            missing=$((missing + 1))
+        fi
+    done
+
+    echo
     log "Checking Inferno Binaries:"
     echo "---------------------"
     if [[ ! -d "$INFERNO_DIR" ]]; then
@@ -177,17 +210,25 @@ verify_dependencies() {
     return 0
 }
 
-# Function to generate installation script
 generate_install_script() {
     local missing_deps=()
+    local missing_lvm=()
 
+    # Check base dependencies
     for dep in "${DEPENDENCIES[@]}"; do
         if ! command -v "$dep" >/dev/null 2>&1; then
             missing_deps+=("$dep")
         fi
     done
 
-    if [ ${#missing_deps[@]} -eq 0 ]; then
+    # Check LVM dependencies
+    for dep in "${LVM_DEPENDENCIES[@]}"; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            missing_lvm+=("$dep")
+        fi
+    done
+
+    if [ ${#missing_deps[@]} -eq 0 ] && [ ${#missing_lvm[@]} -eq 0 ]; then
         log "All required dependencies are already installed."
         return 0
     fi
@@ -195,13 +236,14 @@ generate_install_script() {
     log "Generating installation script..."
 
     echo "#!/bin/bash"
-    echo "# Generated installation script for vm-network dependencies"
+    echo "# Generated installation script for inferno dependencies"
     echo
     echo "set -e"
     echo
     echo "echo 'Installing required dependencies...'"
     echo
 
+    # Install base dependencies
     for dep in "${missing_deps[@]}"; do
         case "$dep" in
         ip)
@@ -232,8 +274,15 @@ generate_install_script() {
         echo
     done
 
+    # Install LVM dependencies if needed
+    if [ ${#missing_lvm[@]} -gt 0 ]; then
+        echo "echo 'Installing LVM tools...'"
+        echo "sudo apt-get install -y lvm2 e2fsprogs"
+        echo
+    fi
+
     echo "echo 'All dependencies have been installed.'"
-    echo "echo 'Please run \"vm-network check\" to verify the installation.'"
+    echo "echo 'Please run \"infernoctl check\" to verify the installation.'"
 
     log "Installation script generated successfully."
 }

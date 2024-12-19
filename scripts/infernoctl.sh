@@ -165,6 +165,31 @@ create_vm() {
         return 1
     fi
 
+    # Handle volume verification early if specified
+    local volume_info
+    if [[ -n "$volume_id" ]]; then
+        log "Verifying volume..."
+        if ! verify_volume "$volume_id"; then
+            error "Invalid or inaccessible volume: $volume_id"
+            return 1
+        fi
+
+        # Check if volume is already attached
+        local attached_vm
+        attached_vm=$(get_volume_attachment "$volume_id") || return 1
+
+        if [[ -n "$attached_vm" ]]; then
+            error "Volume $volume_id is already attached to VM: $attached_vm"
+            return 1
+        fi
+
+        # Get volume information for later use
+        volume_info=$(get_volume "$volume_id") || {
+            error "Failed to get volume information"
+            return 1
+        }
+    fi
+
     # Setup VM root directory
     local vm_root rootfs_path
     vm_root=$(get_vm_dir "$name") || return 1
@@ -263,10 +288,11 @@ create_vm() {
     fi
     debug "Network configuration complete: $network_config"
 
-    # Handle volume attachment
+    # Attach volume if specified
     if [[ -n "$volume_id" ]]; then
         log "Attaching volume..."
         if ! update_volume_vm "$volume_id" "$name"; then
+            error "Failed to attach volume to VM"
             rm -rf "$vm_root"
             return 1
         fi
@@ -401,24 +427,63 @@ cleanup() {
         nft delete table ip inferno || warn "Failed to delete nftables table"
     fi
 
+    # Clean up volumes
+    log "Checking volumes..."
+    if lvs "$VG_NAME" >/dev/null 2>&1; then
+        while read -r volume_id; do
+            if [[ -n "$volume_id" ]]; then
+                if [[ $force -eq 1 ]] || ! is_volume_in_use "$volume_id"; then
+                    log "Removing volume: $volume_id"
+                    lvremove -f "$VG_NAME/$volume_id" >/dev/null 2>&1 ||
+                        warn "Failed to remove volume: $volume_id"
+                else
+                    warn "Skipping volume in use: $volume_id"
+                fi
+            fi
+        done < <(lvs --noheadings -o lv_name "$VG_NAME" 2>/dev/null | grep '^vol_')
+    fi
+
     # Clean up database state if forced
     if [[ $force -eq 1 ]]; then
         log "Cleaning up database state..."
         sqlite3 "$DB_PATH" <<EOF || warn "Failed to clean up database state"
         BEGIN TRANSACTION;
+        -- Clean network state
         UPDATE network_state 
         SET state = 'deleted', 
             last_updated = CURRENT_TIMESTAMP 
         WHERE state != 'deleted';
         
+        -- Clean up routes
         UPDATE routes 
         SET active = FALSE 
         WHERE active = TRUE;
+
+        -- Clean up volume attachments
+        UPDATE volumes
+        SET vm_id = NULL;
+        
         COMMIT;
 EOF
     fi
 
     log "Cleanup complete"
+}
+# Add this helper function to check if a volume is in use
+is_volume_in_use() {
+    local volume_id="$1"
+    local mounted
+
+    # Check if volume is mounted
+    mounted=$(lsblk -n -o MOUNTPOINT "/dev/$VG_NAME/$volume_id" 2>/dev/null)
+    if [[ -n "$mounted" ]]; then
+        return 0 # Volume is mounted
+    fi
+
+    # Check database for VM associations if not mounted
+    local attached
+    attached=$(get_volume_attachment "$volume_id")
+    [[ -n "$attached" ]]
 }
 
 # # Helper function to check if nftables has any inferno rules
