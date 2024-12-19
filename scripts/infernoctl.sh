@@ -85,6 +85,9 @@ ${YELLOW}EXAMPLES${NC}
     # Create a VM from Docker image
     $(basename $0) create web1 --image nginx:latest
 
+    # Create a volume of 5GB
+    $(basename $0) volume create data --size 5
+
     # Create a VM with volume
     $(basename $0) create web2 --image nginx:latest --volume vol_xyz789
 
@@ -107,21 +110,6 @@ check_privileges() {
         fi
         ;;
     esac
-}
-
-# Check if tap device is in use
-is_tap_in_use() {
-    local tap="$1"
-    local in_db
-
-    in_db=$(sqlite3 "$DB_PATH" "
-        SELECT COUNT(*) 
-        FROM vms v 
-        JOIN network_state ns ON ns.vm_id = v.id 
-        WHERE v.tap_device = '$tap' 
-        AND ns.state != 'deleted';")
-
-    [[ "$in_db" -gt 0 ]]
 }
 
 create_vm() {
@@ -410,7 +398,7 @@ cleanup() {
     while read -r tap; do
         if [[ -n "$tap" ]]; then
             local tap_name=$(echo "$tap" | awk '{print $2}' | sed 's/:$//')
-            if [[ $force -eq 1 ]] || ! is_tap_in_use "$tap_name"; then
+            if [[ $force -eq 1 ]] || ! is_tap_registered "$tap_name"; then
                 log "Removing tap device: $tap_name"
                 ip link set "$tap_name" down 2>/dev/null || true
                 ip link delete "$tap_name" 2>/dev/null || warn "Failed to remove tap device: $tap_name"

@@ -53,19 +53,30 @@ create_lv() {
     verify_volume_group || return 1
     verify_thin_pool || return 1
 
+    # Check available space in volume group
+    local vg_free
+    vg_free=$(vgs --noheadings --units g --nosuffix "$VG_NAME" -o vg_free | tr -d '[:space:]')
+
+    # Warn about overprovisioning but allow it
+    if (($(echo "$vg_free < $size_gb" | bc -l))); then
+        warn "Overprovisioning: Requested ${size_gb}GB with only ${vg_free}GB free in volume group"
+        warn "This is OK with thin provisioning but ensure you monitor space usage"
+    fi
+
+    # Check thin pool usage
+    local pool_usage
+    pool_usage=$(lvs --noheadings --units g --nosuffix "$VG_NAME/vm_pool" -o data_percent | tr -d '[:space:]')
+
+    if (($(echo "$pool_usage >= 80" | bc -l))); then
+        warn "Thin pool usage is at ${pool_usage}%. Monitor space carefully."
+    fi
+
     # Create thin volume
     log "Creating thin volume '${volume_id}' of size ${size_gb}GB..."
-    lvcreate -V "${size_gb}G" -T "$VG_NAME/vm_pool" -n "$volume_id" || {
+    if ! lvcreate -V "${size_gb}G" -T "$VG_NAME/vm_pool" -n "$volume_id" >/dev/null 2>&1; then
         error "Failed to create thin volume"
         return 1
-    }
-
-    # Format the new volume
-    format_volume "/dev/$VG_NAME/$volume_id" || {
-        error "Failed to format volume"
-        lvremove -f "$VG_NAME/$volume_id"
-        return 1
-    }
+    fi
 
     return 0
 }
