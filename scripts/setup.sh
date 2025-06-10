@@ -33,6 +33,7 @@ if [ ! -f "$FIRECRACKER_BINARY" ]; then
     latest_firecracker=$(basename $(curl -fsSLI -o /dev/null -w %{url_effective} ${FIRECRACKER_RELEASE_URL}/latest))
     curl -L "${FIRECRACKER_RELEASE_URL}/download/${latest_firecracker}/firecracker-${latest_firecracker}-${ARCH}.tgz" | tar -xz
     mv "release-${latest_firecracker}-${ARCH}/firecracker-${latest_firecracker}-${ARCH}" "$FIRECRACKER_BINARY" || handle_error "Failed to rename Firecracker binary."
+    rm -rf "release-${latest_firecracker}-${ARCH}" || handle_error "Failed to remove temporary directory."
 else
     log "Firecracker binary already exists. Skipping download."
 fi
