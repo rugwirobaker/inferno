@@ -302,47 +302,19 @@ _unix_http() {
 
 # Firecracker muxed vsock: "CONNECT <port>\n" then HTTP over same stream
 _vsock_http_mux() {
-  local sock="$1" port="$2" method="$3" path="$4" body="${5:-}" hdr len line
-
+  local sock="$1" port="$2" method="$3" path="$4" body="${5:-}"
+    
+  local req
   if [[ -n "$body" ]]; then
-    len=$(printf %s "$body" | wc -c)
-    hdr=$(printf "%s %s HTTP/1.1\r\nHost: vsock\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" \
-          "$method" "$path" "$len")
+    local len; len=$(printf %s "$body" | wc -c)
+    req="$(printf "CONNECT %d\n%s %s HTTP/1.1\r\nHost: vsock\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" \
+      "$port" "$method" "$path" "$len" "$body")"
   else
-    hdr=$(printf "%s %s HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n\r\n" "$method" "$path")
+    req="$(printf "CONNECT %d\n%s %s HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n\r\n" \
+      "$port" "$method" "$path")"
   fi
-
-  # Start the bidirectional client as a coprocess
-  if [[ "$EUID" -ne 0 && -n "${JAIL_UID:-}" ]] && getent passwd "$JAIL_UID" >/dev/null; then
-    local user; user="$(getent passwd "$JAIL_UID" | cut -d: -f1)"
-    coproc VS { sudo -n -u "$user" socat - "UNIX-CONNECT:${sock}"; } || { warn "coproc failed"; return 1; }
-  else
-    coproc VS { socat - "UNIX-CONNECT:${sock}"; } || { warn "coproc failed"; return 1; }
-  fi
-
-  # Ensure the FDs exist
-  if [[ -z "${VS[0]:-}" || -z "${VS[1]:-}" ]]; then
-    warn "coproc did not expose FDs"
-    return 1
-  fi
-
-  # 1) Tell the UDS mux which vsock port we want
-  printf "CONNECT %d\n" "$port" >&"${VS[1]}"
-
-  # 2) Read and ignore the ack line (Fly reads one line too)
-  #    We don't validate content; we just consume it.
-  if ! IFS= read -r -u "${VS[0]}" line; then
-    warn "no ack from vsock mux (sock=$sock port=$port)"
-    # don’t bail; some implementations don’t ack reliably
-  fi
-
-  # 3) Send HTTP over the same stream
-  printf "%s%s" "$hdr" "$body" >&"${VS[1]}"
-
-  # 4) Close writer, drain response, close reader
-  eval "exec ${VS[1]}>&-"
-  eval "cat <&${VS[0]}"
-  eval "exec ${VS[0]}>&-"
+    # Send the full request through socat with timeout
+  printf "%s" "$req" | timeout 5 socat - "UNIX-CONNECT:${sock}" 2>/dev/null
 }
 
 _http_status() {
@@ -376,36 +348,54 @@ _guest_cid() {
 }
 
 send_vm_signal() {
-  local name="$1" sig="${2:-TERM}" api_port="${3:-10002}"
-  local vm_root; vm_root="$(get_vm_dir "$name")"
+    local name="$1" sig="${2:-TERM}" api_port="${3:-10002}"
+    local vm_root; vm_root="$(get_vm_dir "$name")"
 
-  local sig_num; sig_num="$(_sig_num "$sig")"
-  local body;    body=$(jq -cn --argjson n "$sig_num" '{signal:$n}')
+    local sig_num; sig_num="$(_sig_num "$sig")"
+    local body; body=$(jq -cn --argjson n "$sig_num" '{signal:$n}')
 
-  local sock_line; sock_line="$(_control_sock_path "$api_port" "$vm_root")" || true
-  if [[ -z "$sock_line" ]]; then
-    warn "control.sock not found for ${name}."
+    local sock_line; sock_line="$(_control_sock_path "$api_port" "$vm_root")" || {
+        warn "control.sock not found for ${name}."
+        return 1
+    }
+    local sock="${sock_line%%|*}"
+
+    # Ensure socket exists and is accessible
+    if [[ ! -S "$sock" ]]; then
+        warn "Control socket does not exist: $sock"
+        return 1
+    fi
+
+    # Wait a moment for the socket to be ready
+    local attempts=0
+    while (( attempts < 5 )); do
+        if timeout 1 bash -c "true < '$sock'" 2>/dev/null; then
+            break
+        fi
+        sleep 0.2
+        (( attempts++ ))
+    done
+
+    debug "Attempting to send signal $sig to $name via $sock"
+
+    # Try the vsock mux connection
+    local resp
+    if resp="$(_vsock_http_mux "$sock" "$api_port" "POST" "/v1/signal" "$body")"; then
+        local status; status="$(_http_status "$resp")"
+        if [[ "$status" =~ ^(200|204)$ ]]; then
+            info "Guest API signal delivered (HTTP $status)"
+            return 0
+        else
+            debug "Guest API response: $resp"
+            warn "Guest API returned HTTP ${status:-<empty>}"
+        fi
+    else
+        debug "Failed to connect to guest API socket: $sock"
+    fi
+
     return 1
-  fi
-  local sock="${sock_line%%|*}"
-
-  # Make sure we can connect, even if firecracker created 0770
-  if [[ -S "$sock" ]]; then
-    chmod o+rw "$sock" 2>/dev/null || true
-  fi
-
-  local resp status
-  resp="$(_vsock_http_mux "$sock" "$api_port" "POST" "/v1/signal" "$body")"
-  status="$(_http_status "$resp")"
-
-  if [[ "$status" == "200" ]]; then
-    info "Guest API signaled via mux socket."
-    return 0
-  fi
-
-  warn "Guest API mux returned HTTP ${status:-<none>}."
-  return 1
 }
+
 
 _detect_tap_for_guest() {
   local ip="$1"
@@ -474,6 +464,203 @@ _prepare_firecracker_caps() {
   fi
 }
 
+ensure_global_vm_logs_socket() {
+    local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
+    local global_log_file="${INFERNO_ROOT}/logs/vm_combined.log"
+    local pid_file="${INFERNO_ROOT}/logs/vm_logs.pid"
+    
+    # Check if already running
+    if [[ -S "$global_socket" ]] && echo "test" | timeout 1 socat - "UNIX-CONNECT:${global_socket}" &>/dev/null 2>&1; then
+        debug "Global VM logs socket already running"
+        return 0
+    fi
+    
+    # Clean up stale files
+    rm -f "$global_socket" "$pid_file" 2>/dev/null || true
+    
+    # Ensure logs directory exists
+    mkdir -p "${INFERNO_ROOT}/logs"
+    
+    # Start global listener (one for all VMs)
+    (
+        exec socat -u \
+            "UNIX-LISTEN:${global_socket},fork,mode=666" \
+            "SYSTEM:while IFS= read -r line; do echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$line\" >> '$global_log_file'; done" \
+            &
+        echo $! > "$pid_file"
+        wait
+    ) &
+    
+    # Wait for socket creation
+    local attempts=0
+    while [[ ! -S "$global_socket" ]] && (( attempts < 20 )); do
+        sleep 0.1
+        (( attempts++ ))
+    done
+    
+    if [[ -S "$global_socket" ]]; then
+        chmod 666 "$global_socket" 2>/dev/null || true
+        info "Global VM logs socket started at $global_socket"
+        return 0
+    else
+        error "Failed to start global VM logs socket"
+        return 1
+    fi
+}
+
+# Link the global socket into a jail
+link_vm_logs_socket() {
+    local jail_root="$1"
+    local vm_name="$2"
+    
+    local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
+    local jail_socket="${jail_root}/vm_logs.sock"
+    
+    # Ensure global socket exists
+    ensure_global_vm_logs_socket || return 1
+    
+    # Remove any existing jail socket
+    rm -f "$jail_socket" 2>/dev/null || true
+    
+    # Create symlink (since you can't hard link sockets)
+    if ln -sf "$global_socket" "$jail_socket"; then
+        # Make sure jail can access it
+        chown -h "${INFERNO_JAIL_UID:-123}:${INFERNO_JAIL_GID:-100}" "$jail_socket" 2>/dev/null || true
+        debug "Linked global socket to jail: $jail_socket -> $global_socket"
+        return 0
+    else
+        error "Failed to link VM logs socket for $vm_name"
+        return 1
+    fi
+}
+
+# Clean up jail socket link
+unlink_vm_logs_socket() {
+    local jail_root="$1"
+    rm -f "${jail_root}/vm_logs.sock" 2>/dev/null || true
+}
+
+# Stop global socket (only when shutting down everything)
+stop_global_vm_logs_socket() {
+    local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
+    local pid_file="${INFERNO_ROOT}/logs/vm_logs.pid"
+    
+    if [[ -f "$pid_file" ]]; then
+        local pid; pid="$(cat "$pid_file" 2>/dev/null)" || true
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 0.5
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    fi
+    rm -f "$global_socket" 2>/dev/null || true
+}
+
+debug_control_socket() {
+    local name="$1"
+    local vm_root; vm_root="$(get_vm_dir "$name")"
+    
+    _resolve_vm_ctx "$name" || return 1
+    
+    local sock_line; sock_line="$(_control_sock_path 10002 "$vm_root")" || {
+        echo "[ERROR] control.sock not found"
+        return 1
+    }
+    local sock="${sock_line%%|*}"
+    
+    echo "Control Socket Debug for VM: $name"
+    echo "VM Root: $vm_root"
+    echo "Chroot: $CHROOT_DIR"
+    echo "Socket: $sock"
+    
+    if [[ -S "$sock" ]]; then
+        echo "Socket exists: YES"
+        echo "Permissions: $(stat -c '%A %a %U:%G' "$sock" 2>/dev/null)"
+        echo "Current user: $(id)"
+        
+        # Test socket connection
+        echo "Testing socket connection..."
+        if echo "test" | timeout 2 socat - "UNIX-CONNECT:${sock}" 2>/dev/null; then
+            echo "Basic socket connection: SUCCESS"
+        else
+            echo "Basic socket connection: FAILED"
+            echo "Socket details:"
+            ls -la "$sock"
+            echo "Parent directory:"
+            ls -la "$(dirname "$sock")"
+        fi
+        
+        # Test vsock mux connection
+        echo "Testing vsock mux connection..."
+        if timeout 2 bash -c "printf 'CONNECT 10002\nGET /v1/ping HTTP/1.1\nHost: vsock\n\n' | socat - 'UNIX-CONNECT:${sock}'" 2>/dev/null | grep -q "HTTP"; then
+            echo "Vsock mux connection: SUCCESS"
+        else
+            echo "Vsock mux connection: FAILED"
+        fi
+        
+        # Check if processes are running
+        echo "Related processes:"
+        local kiln_pid_file; kiln_pid_file="$(_find_kiln_pid_file "$vm_root")"
+        if [[ -f "$kiln_pid_file" ]]; then
+            local pid; pid="$(cat "$kiln_pid_file")"
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "kiln process: RUNNING (PID: $pid)"
+                echo "Command: $(ps -p "$pid" -o cmd= 2>/dev/null || echo 'unknown')"
+            else
+                echo "kiln process: NOT RUNNING (stale PID: $pid)"
+            fi
+        else
+            echo "kiln PID file: NOT FOUND"
+        fi
+        
+    else
+        echo "Socket exists: NO"
+        echo "Expected location: $sock"
+        echo "Directory contents:"
+        ls -la "$(dirname "$sock")" 2>/dev/null || echo "Directory doesn't exist"
+    fi
+}
+
+# Start global socket once
+start_global_vm_logs_socket() {
+  local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
+  local global_log_file="${INFERNO_ROOT}/logs/vm_combined.log"
+  local pid_file="${INFERNO_ROOT}/logs/vm_logs.pid"
+    
+  if [[ -S "$global_socket" ]] && echo "test" | timeout 1 socat - "UNIX-CONNECT:${global_socket}" &>/dev/null 2>&1; then
+    debug "Global VM logs socket already running"
+    return 0
+  fi
+    
+  rm -f "$global_socket" "$pid_file" 2>/dev/null || true
+  mkdir -p "${INFERNO_ROOT}/logs"
+    
+  (
+    exec socat -u \
+      "UNIX-LISTEN:${global_socket},fork,mode=666" \
+      "SYSTEM:while IFS= read -r line; do echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$line\" >> '$global_log_file'; done" \
+      &
+    echo $! > "$pid_file"
+    wait
+  ) &
+    
+  local attempts=0
+  while [[ ! -S "$global_socket" ]] && (( attempts < 20 )); do
+    sleep 0.1
+    (( attempts++ ))
+  done
+    
+  if [[ -S "$global_socket" ]]; then
+    chmod 666 "$global_socket" 2>/dev/null || true
+    info "Global VM logs socket started at $global_socket"
+    return 0
+  else
+    error "Failed to start global VM logs socket"
+    return 1
+  fi
+}
+
 usage() {
   cat <<'USAGE'
 infernoctl — manage Inferno VMs
@@ -522,8 +709,60 @@ cmd_init() {
   else
     warn "database.sh not loaded; skipping DB schema init."
   fi
+    
+  # Start the global VM logs socket
+  ensure_global_vm_logs_socket
 
   success "Init complete."
+}
+
+cmd_logs() {
+  local action="${1:-tail}"
+  local global_log_file="${INFERNO_ROOT}/logs/vm_combined.log"
+    
+  case "$action" in
+    start)
+      ensure_global_vm_logs_socket
+      ;;
+    stop)
+      stop_global_vm_logs_socket
+      info "Global VM logs socket stopped"
+      ;;
+    restart)
+      stop_global_vm_logs_socket
+      sleep 1
+      ensure_global_vm_logs_socket
+      ;;
+    tail)
+      if [[ -f "$global_log_file" ]]; then
+        tail -f "$global_log_file"
+      else
+        warn "No VM logs found at $global_log_file"
+        return 1
+      fi
+      ;;
+    clear)
+      true > "$global_log_file"
+      info "Cleared VM logs"
+      ;;
+    status)
+      local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
+      if [[ -S "$global_socket" ]] && echo "test" | timeout 1 socat - "UNIX-CONNECT:${global_socket}" &>/dev/null; then
+        info "Global VM logs socket is running"
+        local pid_file="${INFERNO_ROOT}/logs/vm_logs.pid"
+        if [[ -f "$pid_file" ]]; then
+          info "PID: $(cat "$pid_file")"
+        fi
+      else
+        warn "Global VM logs socket is not running"
+        return 1
+      fi
+      ;;
+    *)
+      echo "Usage: infernoctl logs {start|stop|restart|status|tail|clear}"
+      return 1
+      ;;
+  esac
 }
 
 cmd_haproxy_render() {
@@ -806,22 +1045,32 @@ cmd_start() {
   _purge_version_runtime "$CHROOT_DIR"
   _ensure_dev_nodes "$CHROOT_DIR" "$JAIL_UID" "$JAIL_GID"
 
-  # bind-mount host logs dir into the jail so /run/inferno/vm_logs.sock is visible
-  mkdir -p "${INFERNO_ROOT}/logs"
-  # World-writable/traversable is simplest to ensure jailed 123:100 can connect
-  chmod 0777 "${INFERNO_ROOT}/logs" 2>/dev/null || true
+  # Start global VM logs socket if not running
+  start_global_vm_logs_socket || warn "Global VM logs socket not available"
 
-  mkdir -p "${CHROOT_DIR}/run/inferno"
-  if ! mountpoint -q "${CHROOT_DIR}/run/inferno"; then
-    if ! mount --bind "${INFERNO_ROOT}/logs" "${CHROOT_DIR}/run/inferno"; then
-      warn "Failed to bind-mount ${INFERNO_ROOT}/logs into jail; logs socket may be unreachable"
-    fi
+  # Hard link the global VM logs socket into the chroot
+  log "Linking VM logs socket into jail..."
+  
+  local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
+  local jail_socket="$CHROOT_DIR/vm_logs.sock"
+  
+  if [[ -S "$global_socket" ]]; then
+      rm -f "$jail_socket" 2>/dev/null || true
+      if ln "$global_socket" "$jail_socket"; then
+          chown "${JAIL_UID}:${JAIL_GID}" "$jail_socket" 2>/dev/null || true
+          debug "Hard linked VM logs socket to jail"
+      else
+          warn "Failed to hard link VM logs socket - VM logs may not work"
+      fi
+  else
+      warn "Global VM logs socket not found at $global_socket"
   fi
-  # Optional: warn if the socket isn't up yet (Vector/socat not running)
-  if [[ ! -S "${INFERNO_ROOT}/logs/vm_logs.sock" ]]; then
-    warn "vm_logs.sock not found at ${INFERNO_ROOT}/logs/vm_logs.sock — start Vector or a dev listener"
-  fi
-  # ---------------------------------------------------------------------------
+
+  # Verify kiln.json has correct UID/GID expectations
+  _verify_kiln_ids "$CHROOT_DIR" "${JAIL_UID}" "${JAIL_GID}"
+
+  # Prepare firecracker capabilities if needed
+  _prepare_firecracker_caps
 
   # Jailer args: kiln takes NO args; it finds ./kiln.json in CWD
   local -a JARGS=(
@@ -837,17 +1086,17 @@ cmd_start() {
   info "Jail root:        ${CHROOT_DIR}"
 
   if [[ "$detach" == "1" ]]; then
-    info "Backgrounding; logs -> ${LOGF}"
+    info "Starting in background..."
     (
-      nohup env RUST_BACKTRACE=full "$jailer_bin" "${JARGS[@]}" -- >>"$LOGF" 2>&1 &
+      nohup env RUST_BACKTRACE=full "$jailer_bin" "${JARGS[@]}" -- &>/dev/null &
       echo $! > "$VM_ROOT/jailer.pid"
     ) </dev/null
     sleep 0.2
     local pid_file="${CHROOT_DIR}/kiln.pid"
     if [[ -f "$pid_file" ]]; then
-      success "VM ${name} starting (PID $(cat "$pid_file"))."
+      success "VM ${name} started (PID $(cat "$pid_file"))."
     else
-      warn "VM ${name} started (PID file not yet present)."
+      warn "VM ${name} started but PID file not yet present."
     fi
   else
     info "Foreground mode (Ctrl-C to stop)…"
@@ -1067,6 +1316,24 @@ cmd_images_exposed() {
   local img="${1:-}"; shift || true
   [[ -n "$img" ]] || die 2 "Usage: infernoctl images exposed <image>"
   images_exposed_ports "$img" | jq .
+}
+
+# Simple logs command:
+cmd_logs() {
+    case "${1:-tail}" in
+        start) start_global_vm_logs_socket ;;
+        status) 
+            local socket="${INFERNO_ROOT}/logs/vm_logs.sock"
+            if [[ -S "$socket" ]] && echo "test" | timeout 1 socat - "UNIX-CONNECT:${socket}" &>/dev/null; then
+                info "Global VM logs socket is running"
+            else
+                warn "Global VM logs socket is not running"
+                return 1
+            fi
+            ;;
+        tail) tail -f "${INFERNO_ROOT}/logs/vm_combined.log" ;;
+        *) echo "Usage: infernoctl logs {start|status|tail}" ;;
+    esac
 }
 
 # --- Dispatch ----------------------------------------------------------------
