@@ -358,6 +358,8 @@ func handleVMLogs(src net.Conn, logger *vm.Logger) {
 func configureLogger(c *Config) error {
 	if c.Log.Debug {
 		LogLevel.Set(slog.LevelDebug)
+	} else {
+		LogLevel.Set(slog.LevelInfo)
 	}
 
 	opts := slog.HandlerOptions{Level: &LogLevel}
