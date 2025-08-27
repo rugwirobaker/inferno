@@ -1,11 +1,19 @@
 #!/bin/bash
 
-# Source shared logging utilities
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-source "${SCRIPT_DIR}/logging.sh"
+# Version tag for copy/paste sync
+INIT_SH_VERSION="1.0.0"
 
-# Enable strict error handling
-set_error_handlers
+# Source shared env/logging (guarded) using BASH_SOURCE so sourcing works
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/env.sh"     ]] && source "${SCRIPT_DIR}/env.sh"
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/logging.sh" ]] && source "${SCRIPT_DIR}/logging.sh"
+
+# Enable strict error handling only if provided by logging.sh
+if declare -F set_error_handlers >/dev/null 2>&1; then
+  set_error_handlers
+fi
 
 # Base directory structure
 INFERNO_ROOT=${INFERNO_ROOT:-"/var/lib/inferno"}
@@ -20,7 +28,7 @@ SCHEMA_PATH="${SCRIPT_DIR}/schema.sql"
 create_secure_directory() {
     local dir="$1"
     local perms="${2:-700}"  # Default to 700 if not specified
-    
+
     if [[ ! -d "$dir" ]]; then
         mkdir -p "$dir" || {
             error "Failed to create directory: $dir"
@@ -39,10 +47,10 @@ create_secure_directory() {
 create_directory_structure() {
     # Create base directory
     create_secure_directory "$INFERNO_ROOT" "750" || return 1
-    
+
     # Create VMs directory
     create_secure_directory "$VM_DIR" "750" || return 1
-    
+
     return 0
 }
 
@@ -68,7 +76,7 @@ init_db() {
         error "Failed to create database file at $DB_PATH"
         return 1
     }
-    
+
     chmod 600 "$DB_PATH" || {
         error "Failed to set permissions on $DB_PATH"
         return 1
@@ -79,7 +87,7 @@ init_db() {
         log "Database initialized successfully at $DB_PATH"
         return 0
     else
-        error "Failed to initialize database" 
+        error "Failed to initialize database"
         return 1
     fi
 }

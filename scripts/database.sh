@@ -1,15 +1,66 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Database helpers for Inferno (SQLite)
+# Your original functions are preserved; only the header/sourcing is adjusted.
 
-# Source shared logging utilities
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+# shellcheck disable=SC2034  # Exposed for external introspection; may be read by other scripts
+DATABASE_SH_VERSION="1.2.4"
+
+# --- Bootstrap ---------------------------------------------------------------
+# Resolve this file's directory correctly even when *sourced*
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Load core env first (DB_PATH etc.), then logging/config. Keep init optional.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/env.sh"
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/logging.sh"
-source "${SCRIPT_DIR}/init.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/config.sh"
+# Optional libs used by volume helpers
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/libvol.sh"  ]] && source "${SCRIPT_DIR}/libvol.sh"
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/init.sh"    ]] && source "${SCRIPT_DIR}/init.sh"
 
-# Enable strict error handling
-set_error_handlers
+# Strict mode & traps (prefer logging.sh helper if available)
+if declare -F set_error_handlers >/dev/null 2>&1; then
+  set_error_handlers
+else
+  set -Eeuo pipefail
+fi
 
-SCHEMA_PATH="./scripts/schema.sql"
+# Default schema path; allow override via env. Works from installed location too.
+SCHEMA_PATH="${SCHEMA_PATH:-${SCRIPT_DIR%/scripts}/scripts/schema.sql}"
 
+# --- Schema bootstrap (used by infernoctl init) ------------------------------
+# Use your repo's schema.sql when present; otherwise just enable WAL.
+db_init() {
+  local owner="${1:-${SUDO_USER:-$USER}}"
+
+  [[ -n "${DB_PATH:-}" ]] || { error "DB_PATH is not set"; return 1; }
+  mkdir -p "$(dirname "$DB_PATH")"
+
+  if [[ -f "$DB_PATH" ]]; then
+    info "DB already initialized at $DB_PATH (owner=${owner})"
+    return 0
+  fi
+
+  info "Initializing SQLite DB at $DB_PATH (owner=${owner})"
+  if [[ -f "$SCHEMA_PATH" ]]; then
+    sqlite3 "$DB_PATH" < "$SCHEMA_PATH" || { error "Failed applying schema $SCHEMA_PATH"; return 1; }
+  else
+    warn "SCHEMA_PATH not found ($SCHEMA_PATH); creating DB with WAL enabled."
+    sqlite3 "$DB_PATH" 'PRAGMA journal_mode=WAL;' || { error "Failed to init DB"; return 1; }
+  fi
+
+  # Friendly perms (group write)
+  chgrp inferno "$DB_PATH" 2>/dev/null || true
+  chmod g+rw "$DB_PATH"     2>/dev/null || true
+
+  success "DB initialized at $DB_PATH"
+}
+
+# --- Your original functions (unchanged) -------------------------------------
 create_vm_with_state() {
     local name="$1"
     local tap_device="$2"
@@ -68,7 +119,7 @@ INSERT INTO routes (vm_id, mode, host_port, guest_port, hostname, public_ip)
 SELECT id, '$mode', $host_port, $guest_port, NULLIF('$hostname', ''), NULLIF('$public_ip', '')
 FROM vms WHERE name = '$vm_name';
 
-UPDATE network_state 
+UPDATE network_state
 SET nft_rules_hash = '$nft_rules_hash',
     state = 'exposed',
     last_updated = CURRENT_TIMESTAMP
@@ -163,7 +214,7 @@ list_all_vms() {
     local result
     result=$(
         sqlite3 -json "$DB_PATH" <<EOF
-SELECT 
+SELECT
     v.name,
     v.tap_device,
     v.guest_ip,
@@ -238,8 +289,7 @@ vm_exists() {
     [[ $count -gt 0 ]]
 }
 
-# Volume management functions
-
+# Volume management functions (unchanged)
 create_volume() {
     local name="$1"
     local size_gb="$2"
@@ -283,7 +333,7 @@ list_volumes() {
     local result
     result=$(
         sqlite3 -json "$DB_PATH" <<EOF
-SELECT 
+SELECT
     v.volume_id,
     v.name,
     v.size_gb,
@@ -308,7 +358,7 @@ get_volume() {
     local result
     result=$(
         sqlite3 -json "$DB_PATH" <<EOF
-SELECT 
+SELECT
     v.volume_id,
     v.name,
     v.size_gb,
@@ -336,7 +386,7 @@ update_volume_vm() {
     debug "Updating volume $volume_id attachment to VM $vm_name"
 
     sqlite3 "$DB_PATH" <<EOF
-UPDATE volumes 
+UPDATE volumes
 SET vm_id = (
     SELECT id FROM vms WHERE name = '$vm_name'
 )
@@ -357,9 +407,9 @@ delete_volume() {
     # Check if volume is attached to a VM
     local attached_vm
     attached_vm=$(sqlite3 "$DB_PATH" "
-        SELECT vm.name 
-        FROM volumes v 
-        JOIN vms vm ON v.vm_id = vm.id 
+        SELECT vm.name
+        FROM volumes v
+        JOIN vms vm ON v.vm_id = vm.id
         WHERE v.volume_id = '$volume_id';
     ")
     if [ $? -ne 0 ]; then
@@ -375,8 +425,8 @@ delete_volume() {
     # Get device path before deletion
     local device_path
     device_path=$(sqlite3 "$DB_PATH" "
-        SELECT device_path 
-        FROM volumes 
+        SELECT device_path
+        FROM volumes
         WHERE volume_id = '$volume_id';
     ")
     if [ $? -ne 0 ]; then
@@ -396,7 +446,7 @@ delete_volume() {
     fi
 
     sqlite3 "$DB_PATH" "
-        DELETE FROM volumes 
+        DELETE FROM volumes
         WHERE volume_id = '$volume_id';
     "
     if [ $? -ne 0 ]; then
@@ -414,8 +464,8 @@ verify_volume() {
     debug "Verifying volume $volume_id"
 
     device_path=$(sqlite3 "$DB_PATH" "
-        SELECT device_path 
-        FROM volumes 
+        SELECT device_path
+        FROM volumes
         WHERE volume_id = '$volume_id';
     ")
     if [ $? -ne 0 ]; then
@@ -448,7 +498,7 @@ get_vm_volumes() {
     local result
     result=$(
         sqlite3 -json "$DB_PATH" <<EOF
-SELECT 
+SELECT
     v.volume_id,
     v.name,
     v.size_gb,
@@ -474,9 +524,9 @@ get_volume_attachment() {
 
     local result
     result=$(sqlite3 "$DB_PATH" "
-        SELECT vm.name 
-        FROM volumes v 
-        JOIN vms vm ON v.vm_id = vm.id 
+        SELECT vm.name
+        FROM volumes v
+        JOIN vms vm ON v.vm_id = vm.id
         WHERE v.volume_id = '$volume_id';
     ")
     if [ $? -ne 0 ]; then
@@ -493,8 +543,8 @@ detach_volume() {
     debug "Detaching volume $volume_id"
 
     sqlite3 "$DB_PATH" "
-        UPDATE volumes 
-        SET vm_id = NULL 
+        UPDATE volumes
+        SET vm_id = NULL
         WHERE volume_id = '$volume_id';
     "
     if [ $? -ne 0 ]; then
@@ -553,7 +603,7 @@ list_images() {
     local result
     result=$(
         sqlite3 -json "$DB_PATH" <<EOF
-SELECT 
+SELECT
     i.image_id,
     i.name,
     i.source_image,
@@ -589,7 +639,7 @@ SELECT json_object(
     'created_at', i.created_at,
     'vms', (
         SELECT json_group_array(name)
-        FROM vms 
+        FROM vms
         WHERE image_id = i.id
     )
 )
@@ -648,7 +698,7 @@ update_vm_image() {
     debug "Updating VM $vm_name to use image $image_id"
 
     sqlite3 "$DB_PATH" <<EOF
-UPDATE vms 
+UPDATE vms
 SET image_id = (SELECT id FROM images WHERE image_id = '$image_id')
 WHERE name = '$vm_name';
 EOF
@@ -672,8 +722,8 @@ is_tap_registered() {
     local has_table
     has_table=$(
         sqlite3 "$DB_PATH" <<EOF
-SELECT COUNT(*) 
-FROM sqlite_master 
+SELECT COUNT(*)
+FROM sqlite_master
 WHERE type='table' AND name='vms';
 EOF
     )
@@ -690,10 +740,10 @@ EOF
     local count
     count=$(
         sqlite3 "$DB_PATH" <<EOF
-SELECT COUNT(*) 
-FROM vms v 
-JOIN network_state ns ON ns.vm_id = v.id 
-WHERE v.tap_device = '$tap' 
+SELECT COUNT(*)
+FROM vms v
+JOIN network_state ns ON ns.vm_id = v.id
+WHERE v.tap_device = '$tap'
 AND ns.state != 'deleted';
 EOF
     )
@@ -704,4 +754,98 @@ EOF
 
     # Return success if count > 0, failure otherwise
     [[ "$count" -gt 0 ]]
+}
+
+add_vm_version() {
+    local vm_name="$1"
+    local version="$2"
+
+    debug "Adding version $version for VM $vm_name"
+
+    local result
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
+INSERT INTO vms_versions (vm_id, version)
+SELECT id, '$version' FROM vms WHERE name = '$vm_name'
+RETURNING json_object(
+  'vm_name', (SELECT name FROM vms WHERE id = vm_id),
+  'version', version,
+  'created_at', created_at
+);
+EOF
+    )
+    if [ $? -ne 0 ]; then
+        error "Failed to add VM version"
+        return 1
+    fi
+
+    echo "$result"
+}
+
+list_vm_versions() {
+    local vm_name="$1"
+    debug "Listing versions for VM $vm_name"
+
+    local result
+    result=$(
+        sqlite3 -json "$DB_PATH" <<EOF
+SELECT version, created_at
+FROM vms_versions
+WHERE vm_id = (SELECT id FROM vms WHERE name = '$vm_name')
+ORDER BY version DESC;
+EOF
+    )
+    if [ $? -ne 0 ]; then
+        error "Failed to list VM versions"
+        return 1
+    fi
+
+    echo "$result"
+}
+
+get_vm_version() {
+    local version="$1"
+    debug "Fetching version record $version"
+
+    local result
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
+SELECT json_object(
+  'vm_name', (SELECT name FROM vms WHERE id = vv.vm_id),
+  'version', vv.version,
+  'created_at', vv.created_at
+)
+FROM vms_versions vv
+WHERE vv.version = '$version'
+LIMIT 1;
+EOF
+    )
+    if [ $? -ne 0 ]; then
+        error "Failed to fetch VM version"
+        return 1
+    fi
+
+    echo "$result"
+}
+
+get_latest_vm_version() {
+    local vm_name="$1"
+    debug "Fetching latest version for VM $vm_name"
+
+    local result
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
+SELECT version
+FROM vms_versions
+WHERE vm_id = (SELECT id FROM vms WHERE name = '$vm_name')
+ORDER BY version DESC
+LIMIT 1;
+EOF
+    )
+    if [ $? -ne 0 ]; then
+        error "Failed to get latest VM version"
+        return 1
+    fi
+
+    echo "$result"
 }

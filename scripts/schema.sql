@@ -35,12 +35,12 @@ CREATE TABLE IF NOT EXISTS network_state (
 );
 
 -- Add index for l7 routes
-CREATE UNIQUE INDEX IF NOT EXISTS idx_l7_routes 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_l7_routes
 ON routes(hostname, host_port)
 WHERE mode = 'l7' AND active = TRUE AND hostname IS NOT NULL;
 
 -- Add index for l4 routes
-CREATE UNIQUE INDEX IF NOT EXISTS idx_l4_routes 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_l4_routes
 ON routes(public_ip, host_port)
 WHERE mode = 'l4' AND active = TRUE AND public_ip IS NOT NULL;
 
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS volumes (
 
 -- Add to vm_details view
 CREATE VIEW IF NOT EXISTS vm_details AS
-SELECT 
+SELECT
     v.name,
     v.tap_device,
     v.guest_ip,
@@ -84,13 +84,26 @@ CREATE TABLE IF NOT EXISTS images (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Add vm_versions table
+CREATE TABLE IF NOT EXISTS vms_versions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    vm_id        INTEGER NOT NULL,
+    version      TEXT    NOT NULL,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(vm_id, version),
+    FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_vms_versions_vm_version ON vms_versions(vm_id, version DESC);
+
 -- Add image_id to vms table
 ALTER TABLE vms ADD COLUMN image_id INTEGER REFERENCES images(id);
 
 -- Update vm_details view
 DROP VIEW IF EXISTS vm_details;
 CREATE VIEW vm_details AS
-SELECT 
+SELECT
     v.name,
     v.tap_device,
     v.guest_ip,

@@ -1,12 +1,21 @@
 #!/bin/bash
 
-# Source shared logging utilities and config
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-source "${SCRIPT_DIR}/logging.sh"
-source "${SCRIPT_DIR}/config.sh"
+# Version (for copy/paste sync)
+LIBVOL_SH_VERSION="1.0.1"
 
-# Enable strict error handling
-set_error_handlers
+# Source shared logging utilities and config (guarded; works when sourced OR executed)
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/env.sh"     ]] && source "${SCRIPT_DIR}/env.sh"
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/logging.sh" ]] && source "${SCRIPT_DIR}/logging.sh"
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/config.sh"  ]] && source "${SCRIPT_DIR}/config.sh"
+
+# Enable strict error handling if available (don’t assume logging.sh is present)
+if declare -F set_error_handlers >/dev/null 2>&1; then
+    set_error_handlers
+fi
 
 VG_NAME="inferno_vg"
 
