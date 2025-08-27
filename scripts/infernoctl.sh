@@ -222,7 +222,8 @@ _find_control_sock() {
   local name; name="$(basename "$vm_root")"
   local ver;  ver="$(_version_for_vm "$name" 2>/dev/null || true)"
   if [[ -n "$ver" ]]; then
-    local root="$(_kiln_versions_dir)/$ver/root"
+    local root
+    root="$(_kiln_versions_dir)/$ver/root"
     if [[ -S "$root/control.sock" ]]; then
       debug "control.sock found at $root/control.sock (via versioned path)"
       echo "$root/control.sock|mux"; return 0
@@ -625,7 +626,8 @@ cmd_create() {
 
   # === VERSIONED CHROOT LAYOUT ================================================
   local version; version="$(_ulid_new)"
-  local base="$(_kiln_versions_dir)/${version}"
+  local base
+  base="$(_kiln_versions_dir)/${version}"
   local chroot_dir="${base}/root"
   local initramfs_dir="${base}/initramfs"
   local inferno_dir="${initramfs_dir}/inferno"
@@ -767,7 +769,7 @@ _purge_version_runtime() {
   rm -f "$root"/{kiln.pid,firecracker.pid,firecracker.sock,control.sock} 2>/dev/null || true
   rm -f "$root"/control.sock_* 2>/dev/null || true
   rm -f "$root"/exit_status.json 2>/dev/null || true
-  rm -rf "$root/dev" "$root/run" 2>/dev/null || true
+  rm -rf "${root:?}/dev" "${root:?}/run" 2>/dev/null || true
 }
 
 cmd_start() {
@@ -992,7 +994,8 @@ cmd_destroy() {
 
   # Best-effort graceful stop
   local api_port
-  local run_json_base="$(_kiln_versions_dir)/${JAIL_ID}/initramfs/inferno/run.json"
+  local run_json_base
+  run_json_base="$(_kiln_versions_dir)/${JAIL_ID}/initramfs/inferno/run.json"
   api_port="$(jq -r '.vsock_api_port // 10002' "$run_json_base" 2>/dev/null || echo 10002)"
   send_vm_signal "$name" "TERM" "$api_port" >/dev/null 2>&1 || true
   sleep 0.5
