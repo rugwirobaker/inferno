@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Inferno CLI wrapper
 # Provides user-facing commands and delegates to the library scripts.
-# Keep this file thin; most logic should live in libs (images, haproxy, db, …).
+# Keep this file thin; most logic should live in libs (images, haproxy, db, â€¦).
 INFERNOCTL_SH_VERSION="1.2.2"
 
 # --- Bootstrap ---------------------------------------------------------------
@@ -165,7 +165,6 @@ _resolve_vm_ctx() {
   [[ -n "$KILN_SRC" && -x "$KILN_SRC" ]] || die 1 "kiln binary not found in /usr/share/inferno or PATH"
   KILN_EXEC="$KILN_SRC"   # pass host path to jailer
 
- # Force these to match flyd (123:100) unless env overrides were provided.
   JAIL_UID="$DEFAULT_JAIL_UID"
   JAIL_GID="$DEFAULT_JAIL_GID"
 
@@ -373,7 +372,7 @@ send_vm_signal() {
             break
         fi
         sleep 0.2
-        (( attempts++ ))
+        attempts=$((attempts + 1))
     done
 
     debug "Attempting to send signal $sig to $name via $sock"
@@ -491,11 +490,11 @@ ensure_global_vm_logs_socket() {
         wait
     ) &
     
-    # Wait for socket creation
+    # Wait for socket creation - FIXED the (( attempts++ )) issue
     local attempts=0
     while [[ ! -S "$global_socket" ]] && (( attempts < 20 )); do
         sleep 0.1
-        (( attempts++ ))
+        attempts=$((attempts + 1))  # Use explicit assignment instead of post-increment
     done
     
     if [[ -S "$global_socket" ]]; then
@@ -622,48 +621,18 @@ debug_control_socket() {
     fi
 }
 
-# Start global socket once
-start_global_vm_logs_socket() {
-  local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
-  local global_log_file="${INFERNO_ROOT}/logs/vm_combined.log"
-  local pid_file="${INFERNO_ROOT}/logs/vm_logs.pid"
-    
-  if [[ -S "$global_socket" ]] && echo "test" | timeout 1 socat - "UNIX-CONNECT:${global_socket}" &>/dev/null 2>&1; then
-    debug "Global VM logs socket already running"
-    return 0
-  fi
-    
-  rm -f "$global_socket" "$pid_file" 2>/dev/null || true
-  mkdir -p "${INFERNO_ROOT}/logs"
-    
-  (
-    exec socat -u \
-      "UNIX-LISTEN:${global_socket},fork,mode=666" \
-      "SYSTEM:while IFS= read -r line; do echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$line\" >> '$global_log_file'; done" \
-      &
-    echo $! > "$pid_file"
-    wait
-  ) &
-    
-  local attempts=0
-  while [[ ! -S "$global_socket" ]] && (( attempts < 20 )); do
-    sleep 0.1
-    (( attempts++ ))
-  done
-    
-  if [[ -S "$global_socket" ]]; then
-    chmod 666 "$global_socket" 2>/dev/null || true
-    info "Global VM logs socket started at $global_socket"
-    return 0
-  else
-    error "Failed to start global VM logs socket"
-    return 1
-  fi
+_purge_version_runtime() {
+  local root="$1"
+  # remove sockets/pids the guest creates (but NOT the shared vm_logs.sock mount)
+  rm -f "$root"/{kiln.pid,firecracker.pid,firecracker.sock,control.sock} 2>/dev/null || true
+  rm -f "$root"/control.sock_* 2>/dev/null || true
+  rm -f "$root"/exit_status.json 2>/dev/null || true
+  rm -rf "${root:?}/dev" "${root:?}/run" 2>/dev/null || true
 }
 
 usage() {
   cat <<'USAGE'
-infernoctl — manage Inferno VMs
+infernoctl â€" manage Inferno VMs
 
 Usage:
   infernoctl version
@@ -677,6 +646,7 @@ Usage:
   infernoctl haproxy reload
   infernoctl images process <image> [entrypoint_json|string] [cmd_json|string]
   infernoctl images exposed <image>
+  infernoctl logs {start|stop|restart|status|tail|clear}
 
 Env:
   LOG_LEVEL              DEBUG/INFO/WARN/ERROR (default: INFO)
@@ -960,7 +930,7 @@ EOF
   # Sanity: enforce UID/GID in kiln.json to match 123/100 (or your env-provided overrides).
   _verify_kiln_ids "$chroot_dir" "${DEFAULT_JAIL_UID:-123}" "${DEFAULT_JAIL_GID:-100}"
 
-  # permissions (best-effort — kiln.json carries uid/gid expectations)
+  # permissions (best-effort â€" kiln.json carries uid/gid expectations)
   local uid gid
   # NOTE: correct fallbacks are 123/100, not 100/100.
   uid="$(jq -r '.uid // empty' "$chroot_dir/kiln.json" 2>/dev/null || true)"
@@ -1002,15 +972,6 @@ EOF
   }'
 }
 
-_purge_version_runtime() {
-  local root="$1"
-  # remove sockets/pids the guest creates (but NOT the shared vm_logs.sock mount)
-  rm -f "$root"/{kiln.pid,firecracker.pid,firecracker.sock,control.sock} 2>/dev/null || true
-  rm -f "$root"/control.sock_* 2>/dev/null || true
-  rm -f "$root"/exit_status.json 2>/dev/null || true
-  rm -rf "${root:?}/dev" "${root:?}/run" 2>/dev/null || true
-}
-
 cmd_start() {
   require_root
   require_cmd jq mount mountpoint
@@ -1046,7 +1007,7 @@ cmd_start() {
   _ensure_dev_nodes "$CHROOT_DIR" "$JAIL_UID" "$JAIL_GID"
 
   # Start global VM logs socket if not running
-  start_global_vm_logs_socket || warn "Global VM logs socket not available"
+  ensure_global_vm_logs_socket || warn "Global VM logs socket not available"
 
   # Hard link the global VM logs socket into the chroot
   log "Linking VM logs socket into jail..."
@@ -1099,7 +1060,7 @@ cmd_start() {
       warn "VM ${name} started but PID file not yet present."
     fi
   else
-    info "Foreground mode (Ctrl-C to stop)…"
+    info "Foreground mode (Ctrl-C to stop)â€¦"
     exec env RUST_BACKTRACE=full "$jailer_bin" "${JARGS[@]}" --
   fi
 }
@@ -1131,7 +1092,7 @@ cmd_stop() {
   local fc_pid="";     [[ -n "$fc_pid_file"     ]] && fc_pid="$(_read_pid "$fc_pid_file")"
   local jailer_pid=""; [[ -f "$jailer_pid_file" ]] && jailer_pid="$(_read_pid "$jailer_pid_file")"
 
-  info "Requesting graceful shutdown of ${name} (version=${JAIL_ID}, signal=${sig}, timeout=${timeout}s)…"
+  info "Requesting graceful shutdown of ${name} (version=${JAIL_ID}, signal=${sig}, timeout=${timeout}s)â€¦"
 
   # Resolve API port from the versioned run.json (fallback 10002)
   local api_port
@@ -1160,7 +1121,7 @@ cmd_stop() {
   if [[ "$do_kill" == "1" ]]; then
     for p in "$kiln_pid" "$fc_pid" "$jailer_pid"; do
       if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
-        warn "Escalating: SIGKILL PID ${p}…"
+        warn "Escalating: SIGKILL PID ${p}â€¦"
         kill -KILL "$p" 2>/dev/null || true
         _wait_pid_dead "$p" 2 >/dev/null || true
         ok="1"
@@ -1219,17 +1180,17 @@ cmd_destroy() {
   echo "About to destroy VM '${name}'. Planned actions:"
   _list_vm_resources "$name"
   echo "Filesystem:"
-  echo "  • Remove jailer chroot: $(_kiln_versions_dir)/${JAIL_ID}"
-  echo "  • Remove PID file: ${VM_ROOT}/jailer.pid (if present)"
+  echo "  â€¢ Remove jailer chroot: $(_kiln_versions_dir)/${JAIL_ID}"
+  echo "  â€¢ Remove PID file: ${VM_ROOT}/jailer.pid (if present)"
   if [[ "$keep_logs" == "1" ]]; then
-    echo "  • Keep log file: ${LOGF}"
+    echo "  â€¢ Keep log file: ${LOGF}"
   else
-    echo "  • Remove log file: ${LOGF} (if present)"
+    echo "  â€¢ Remove log file: ${LOGF} (if present)"
   fi
-  echo "  • Remove metadata dir: ${VM_ROOT}"
+  echo "  â€¢ Remove metadata dir: ${VM_ROOT}"
   if type -t db_delete_vm >/dev/null 2>&1; then
     echo "Database:"
-    echo "  • Delete VM record via database.sh: db_delete_vm \"$name\""
+    echo "  â€¢ Delete VM record via database.sh: db_delete_vm \"$name\""
   fi
 
   if [[ "$yes" != "1" ]]; then
@@ -1318,24 +1279,6 @@ cmd_images_exposed() {
   images_exposed_ports "$img" | jq .
 }
 
-# Simple logs command:
-cmd_logs() {
-    case "${1:-tail}" in
-        start) start_global_vm_logs_socket ;;
-        status) 
-            local socket="${INFERNO_ROOT}/logs/vm_logs.sock"
-            if [[ -S "$socket" ]] && echo "test" | timeout 1 socat - "UNIX-CONNECT:${socket}" &>/dev/null; then
-                info "Global VM logs socket is running"
-            else
-                warn "Global VM logs socket is not running"
-                return 1
-            fi
-            ;;
-        tail) tail -f "${INFERNO_ROOT}/logs/vm_combined.log" ;;
-        *) echo "Usage: infernoctl logs {start|status|tail}" ;;
-    esac
-}
-
 # --- Dispatch ----------------------------------------------------------------
 main() {
   local sub="${1:-}"; shift || true
@@ -1352,6 +1295,8 @@ main() {
     start)                cmd_start "$@";;
     stop)                 cmd_stop "$@";;
     destroy)              cmd_destroy "$@";;
+
+    logs)                 cmd_logs "$@";;
 
     haproxy) case "${1:-}" in
                render) shift; cmd_haproxy_render;;

@@ -52,7 +52,7 @@ func (vm *VM) Start(ctx context.Context) error {
 	defer vm.Mutex.Unlock()
 
 	if err := unix.Mkfifo(vm.Config.LogPathSock, 0o666); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("could not create firefly fifo: %w", err)
+		return fmt.Errorf("could not create kiln fifo: %w", err)
 	}
 
 	kilnConfigPath := filepath.Join(vm.Config.Chroot, "kiln.json")
