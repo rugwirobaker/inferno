@@ -1,8 +1,7 @@
 build:
 	@echo Running Build
-	CGO_ENABLED=0 go build -o bin/inferno ./cmd/inferno
-	CGO_ENABLED=0 go build -o bin/init ./cmd/init
-	CGO_ENABLED=0 go build -o bin/kiln ./cmd/kiln
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/init ./cmd/init
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o bin/kiln ./cmd/kiln
 
 clean:
 	@echo Running Clean

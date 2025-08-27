@@ -83,6 +83,13 @@ func New() *cobra.Command {
 			Name:        "init",
 			Description: "Hijacks the command flow to generate a kiln.json file for testing",
 		},
+
+		flag.String{Name: "id", Description: "Firecracker VM id (jailer passthrough)"},
+		flag.String{Name: "start-time-us", Description: "Firecracker start time (jailer passthrough)"},
+		flag.String{Name: "start-time-cpu-us", Description: "Firecracker parent CPU start time (jailer passthrough)"},
+		flag.String{Name: "parent-cpu-time-us", Description: "Firecracker parent CPU time us (jailer passthrough)"},
+		flag.String{Name: "seccomp-level", Description: "Firecracker seccomp level (jailer passthrough)"},
+		flag.String{Name: "api-sock", Description: "Firecracker API socket path (jailer passthrough)"},
 	)
 
 	return cmd
@@ -133,11 +140,26 @@ func run(ctx context.Context) error {
 		"--id", vmID,
 		"--api-sock", config.FirecrackerSocketPath,
 		"--config-file", config.FirecrackerConfigPath,
-		"--level", "Debug",
+		// "--level", "Debug",
 	}
 
+	if v := flag.GetString(ctx, "start-time-us"); v != "" {
+		args = append(args, "--start-time-us", v)
+	}
+	if v := flag.GetString(ctx, "start-time-cpu-us"); v != "" {
+		args = append(args, "--start-time-cpu-us", v)
+	}
+	if v := flag.GetString(ctx, "parent-cpu-time-us"); v != "" {
+		args = append(args, "--parent-cpu-time-us", v)
+	}
+	if v := flag.GetString(ctx, "seccomp-level"); v != "" {
+		args = append(args, "--seccomp-level", v)
+	}
+
+	slog.Debug("Firecracker arguments", "args", args)
+
 	// Start Firecracker using exec.Command
-	cmd := exec.Command("./firecracker", args...)
+	cmd := exec.Command("/firecracker", args...)
 	// cmd.Dir = chroot // Ensure we run Firecracker within the chroot directory
 
 	// Set output to stdout/stderr for logging
