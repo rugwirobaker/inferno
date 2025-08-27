@@ -3,6 +3,7 @@ inferno.y*ml
 dist/
 kiln.json
 firecracker
+jailer
 firecracker.json
 firecracker.sock
 vmlinux
