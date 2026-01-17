@@ -84,7 +84,6 @@ func New() *cobra.Command {
 			Description: "Hijacks the command flow to generate a kiln.json file for testing",
 		},
 
-		flag.String{Name: "id", Description: "Firecracker VM id (jailer passthrough)"},
 		flag.String{Name: "start-time-us", Description: "Firecracker start time (jailer passthrough)"},
 		flag.String{Name: "start-time-cpu-us", Description: "Firecracker parent CPU start time (jailer passthrough)"},
 		flag.String{Name: "parent-cpu-time-us", Description: "Firecracker parent CPU time us (jailer passthrough)"},
@@ -129,6 +128,14 @@ func run(ctx context.Context) error {
 	if err := configureLogger(config); err != nil {
 		slog.Error("Failed to configure logger", "error", err)
 		return err
+	}
+
+	// Write PID file for process management
+	pid := os.Getpid()
+	pidFile := "kiln.pid"
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", pid)), 0644); err != nil {
+		slog.Warn("Failed to write PID file", "error", err)
+		// Don't fail - this is not critical
 	}
 
 	var vmID = config.JailID
@@ -179,6 +186,12 @@ func run(ctx context.Context) error {
 
 	// some clean tasks to run at the end
 	var finalizers []FinalizerFunc
+
+	// Clean up PID file on exit
+	finalizers = append(finalizers, func() error {
+		os.Remove(pidFile)
+		return nil
+	})
 
 	vsockExitPath := fmt.Sprintf("%s_%d", config.FirecrackerVsockUDSPath, config.VsockExitPort)
 	exitListener, err := vsock.NewVsockUnixListener(vsockExitPath)

@@ -242,15 +242,12 @@ delete_vm() {
     result=$(
         sqlite3 "$DB_PATH" <<EOF
 BEGIN TRANSACTION;
-UPDATE network_state
-SET state = 'deleted',
-    last_updated = CURRENT_TIMESTAMP
-WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');
-
-UPDATE routes
-SET active = FALSE
-WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');
-
+-- Delete associated records first (due to foreign key constraints)
+DELETE FROM network_state WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');
+DELETE FROM routes WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');
+DELETE FROM vms_versions WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');
+-- Now delete the VM record itself
+DELETE FROM vms WHERE name = '$name';
 COMMIT;
 EOF
     )

@@ -226,7 +226,7 @@ generate_kiln_config() {
       firecracker_vsock_uds_path: "control.sock",
       vsock_stdout_port: 10000,
       vsock_exit_port: 10001,
-      vm_logs_socket_path: "/run/inferno/vm_logs.sock",
+      vm_logs_socket_path: "vm_logs.sock",
       exit_status_path: "exit_status.json",
       resources: {
         cpu_count: ($vcpus|tonumber),

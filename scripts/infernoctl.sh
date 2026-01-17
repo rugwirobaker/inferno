@@ -1052,8 +1052,15 @@ cmd_start() {
       nohup env RUST_BACKTRACE=full "$jailer_bin" "${JARGS[@]}" -- &>/dev/null &
       echo $! > "$VM_ROOT/jailer.pid"
     ) </dev/null
-    sleep 0.2
+
+    # Wait for kiln to write its PID file (up to 2 seconds)
     local pid_file="${CHROOT_DIR}/kiln.pid"
+    local retries=20
+    while [[ $retries -gt 0 ]] && [[ ! -f "$pid_file" ]]; do
+      sleep 0.1
+      ((retries--))
+    done
+
     if [[ -f "$pid_file" ]]; then
       success "VM ${name} started (PID $(cat "$pid_file"))."
     else
@@ -1188,9 +1195,9 @@ cmd_destroy() {
     echo "  â€¢ Remove log file: ${LOGF} (if present)"
   fi
   echo "  â€¢ Remove metadata dir: ${VM_ROOT}"
-  if type -t db_delete_vm >/dev/null 2>&1; then
+  if type -t delete_vm >/dev/null 2>&1; then
     echo "Database:"
-    echo "  â€¢ Delete VM record via database.sh: db_delete_vm \"$name\""
+    echo "  â€¢ Delete VM record via database.sh: delete_vm \"$name\""
   fi
 
   if [[ "$yes" != "1" ]]; then
@@ -1252,8 +1259,8 @@ cmd_destroy() {
   rm -rf "$(_kiln_versions_dir)/${JAIL_ID}" 2>/dev/null || true
 
   # DB cleanup (if available)
-  if type -t db_delete_vm >/dev/null 2>&1; then
-    db_delete_vm "$name" || warn "db_delete_vm failed"
+  if type -t delete_vm >/dev/null 2>&1; then
+    delete_vm "$name" || warn "delete_vm failed"
   fi
 
   # Logs and metadata dir
