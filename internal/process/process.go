@@ -16,6 +16,7 @@ import (
 type Process interface {
 	Start(context.Context, io.WriteCloser) error
 	Stop(context.Context) error
+	Signal(syscall.Signal) error  // Send signal without waiting
 	Wait() error
 	ExitCode() int
 	PID() int
@@ -118,13 +119,20 @@ func (p *Base) streamLogs(src io.ReadCloser, dst io.WriteCloser) {
 	}
 }
 
+func (p *Base) Signal(sig syscall.Signal) error {
+	if p.cmd == nil || p.cmd.Process == nil {
+		return fmt.Errorf("process not running")
+	}
+	return p.cmd.Process.Signal(sig)
+}
+
 func (p *Base) Stop(ctx context.Context) error {
 	if p.cmd == nil || p.cmd.Process == nil {
 		return nil
 	}
 
 	// First try SIGTERM
-	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := p.Signal(syscall.SIGTERM); err != nil {
 		slog.Warn("Failed to send SIGTERM to process", "error", err)
 		return p.cmd.Process.Kill()
 	}

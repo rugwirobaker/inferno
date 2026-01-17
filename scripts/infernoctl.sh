@@ -299,21 +299,50 @@ _unix_http() {
   fi
 }
 
-# Firecracker muxed vsock: "CONNECT <port>\n" then HTTP over same stream
+# Firecracker muxed vsock: "CONNECT <port>\n" then wait for OK, then HTTP over same stream
 _vsock_http_mux() {
   local sock="$1" port="$2" method="$3" path="$4" body="${5:-}"
-    
-  local req
+
+  # Build HTTP request (without CONNECT line)
+  local http_req
   if [[ -n "$body" ]]; then
     local len; len=$(printf %s "$body" | wc -c)
-    req="$(printf "CONNECT %d\n%s %s HTTP/1.1\r\nHost: vsock\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" \
-      "$port" "$method" "$path" "$len" "$body")"
+    http_req="$(printf "%s %s HTTP/1.1\r\nHost: vsock\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" \
+      "$method" "$path" "$len" "$body")"
   else
-    req="$(printf "CONNECT %d\n%s %s HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n\r\n" \
-      "$port" "$method" "$path")"
+    http_req="$(printf "%s %s HTTP/1.1\r\nHost: vsock\r\nConnection: close\r\n\r\n" \
+      "$method" "$path")"
   fi
-    # Send the full request through socat with timeout
-  printf "%s" "$req" | timeout 5 socat - "UNIX-CONNECT:${sock}" 2>/dev/null
+
+  # Use a bi-directional communication with socat
+  # Protocol: Send "CONNECT port\n", read "OK ...", then send HTTP request, read HTTP response
+  local result; local exit_code
+  result=$(
+    {
+      # Send CONNECT line
+      printf "CONNECT %d\n" "$port"
+      # Wait a moment for the OK response (firecracker should respond immediately)
+      sleep 0.1
+      # Send HTTP request
+      printf "%s" "$http_req"
+      # Wait for the guest to process and respond (critical!)
+      sleep 0.5
+    } | timeout 5 socat - "UNIX-CONNECT:${sock}" 2>&1
+  )
+  exit_code=$?
+
+  # If we got a connection error, log it at debug level
+  if [[ $exit_code -ne 0 ]]; then
+    debug "socat connection failed: exit_code=$exit_code, output=${result}"
+    return $exit_code
+  fi
+
+  # The result should start with "OK ..." line, then HTTP response
+  # Strip the OK line and return only the HTTP response
+  local http_response
+  http_response=$(printf "%s" "$result" | tail -n +2)
+
+  printf "%s" "$http_response"
 }
 
 _http_status() {
@@ -375,21 +404,31 @@ send_vm_signal() {
         attempts=$((attempts + 1))
     done
 
-    debug "Attempting to send signal $sig to $name via $sock"
+    debug "Attempting to send signal $sig (num=$sig_num) to $name via $sock (port=$api_port)"
+    debug "Request body: $body"
 
     # Try the vsock mux connection
-    local resp
-    if resp="$(_vsock_http_mux "$sock" "$api_port" "POST" "/v1/signal" "$body")"; then
-        local status; status="$(_http_status "$resp")"
-        if [[ "$status" =~ ^(200|204)$ ]]; then
-            info "Guest API signal delivered (HTTP $status)"
-            return 0
-        else
-            debug "Guest API response: $resp"
-            warn "Guest API returned HTTP ${status:-<empty>}"
-        fi
+    local resp exit_code
+    resp="$(_vsock_http_mux "$sock" "$api_port" "POST" "/v1/signal" "$body")"
+    exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        debug "Failed to connect to guest API socket: $sock (exit_code=$exit_code)"
+        return 1
+    fi
+
+    debug "Raw response: ${resp:0:200}"  # Show first 200 chars of response
+
+    local status; status="$(_http_status "$resp")"
+    if [[ "$status" =~ ^(200|204)$ ]]; then
+        info "Guest API signal delivered (HTTP $status)"
+        return 0
+    elif [[ -z "$status" ]]; then
+        debug "No HTTP status line found in response"
+        warn "Guest API returned empty or malformed response"
     else
-        debug "Failed to connect to guest API socket: $sock"
+        debug "Guest API response: ${resp:0:200}"
+        warn "Guest API returned HTTP $status"
     fi
 
     return 1

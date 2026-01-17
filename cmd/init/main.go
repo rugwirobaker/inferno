@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -173,6 +174,12 @@ func main() {
 	}
 	defer stdoutConn.Close()
 
+	// Reconfigure logger to write to vsock instead of stderr
+	// This ensures init's slog messages appear in the combined log
+	if err := configureLoggerWithOutput(config, stdoutConn); err != nil {
+		panic(fmt.Sprintf("could not reconfigure logger to vsock: %s", err))
+	}
+
 	apiListener, err := vsock.NewVsockListener(uint32(config.VsockAPIPort))
 	if err != nil {
 		slog.Error("Failed to create vsock listener", "error", err)
@@ -219,18 +226,22 @@ func main() {
 	supervisor.Add(sshServer, stdoutConn)
 
 	// Run supervisor
+	slog.Debug("Starting supervisor.Run()")
 	if err := supervisor.Run(ctx, killChan); err != nil {
 		slog.Error("Supervisor error", "error", err)
 		os.Exit(1)
 	}
+	slog.Info("Supervisor.Run() completed successfully")
 
 	// Shutdown API server
+	slog.Info("Shutting down API server")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("Error shutting down API server", "error", err)
 	}
+	slog.Info("API server shutdown complete")
 
 	slog.Info("init exiting")
 }
@@ -267,6 +278,10 @@ func handleSystemSignals(killChan chan syscall.Signal) {
 }
 
 func configureLogger(c *image.Config) error {
+	return configureLoggerWithOutput(c, os.Stderr)
+}
+
+func configureLoggerWithOutput(c *image.Config, output io.Writer) error {
 	if c.Log.Debug {
 		LogLevel.Set(slog.LevelDebug)
 	}
@@ -280,11 +295,11 @@ func configureLogger(c *image.Config) error {
 	var handler slog.Handler
 	switch format := c.Log.Format; format {
 	case "kernel":
-		handler = NewKernelStyleHandler(os.Stderr, "init", opts)
+		handler = NewKernelStyleHandler(output, "init", opts)
 	case "text":
-		handler = slog.NewTextHandler(os.Stderr, &opts)
+		handler = slog.NewTextHandler(output, &opts)
 	case "json":
-		handler = slog.NewJSONHandler(os.Stderr, &opts)
+		handler = slog.NewJSONHandler(output, &opts)
 	default:
 		return fmt.Errorf("invalid log format: %q", format)
 	}

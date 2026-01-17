@@ -70,16 +70,35 @@ func (s *Supervisor) Run(ctx context.Context, killChan chan syscall.Signal) erro
 	}()
 
 	var exit ExitStatus
+	var signalReceived syscall.Signal
 
 	// Wait for either a kill signal or primary process exit
+	slog.Debug("Waiting for kill signal or primary process exit")
 	select {
 	case signal := <-killChan:
-		slog.Debug("Received kill signal", "signal", signal)
-		exit = s.handleSignal(ctx, signal)
+		slog.Info("Received kill signal from API", "signal", signal)
+		signalReceived = signal
+
+		// Send the signal to the primary process but don't wait here
+		// because we're already waiting on primaryExit
+		if err := s.signalPrimary(ctx, signal); err != nil {
+			slog.Error("Failed to signal primary process", "error", err)
+		}
+		slog.Info("Signal sent to primary process, waiting for exit")
+
+		// Now wait for the process to actually exit
+		slog.Debug("Waiting for primary process to exit after signal")
+		err := <-primaryExit
+		slog.Info("Primary process exited", "error", err)
+		exit = s.handleExit(err)
+		exit.Signal = pointer.Int(int(signalReceived))
+		exit.Message = fmt.Sprintf("Process stopped by signal %d", signalReceived)
 
 	case err := <-primaryExit:
+		slog.Info("Primary process exited naturally", "error", err)
 		exit = s.handleExit(err)
 	}
+	slog.Info("Supervisor preparing to send exit status", "exitCode", exit.ExitCode)
 
 	// Send exit status before shutting down other processes
 	if err := s.sendExitStatus(ctx, exit); err != nil {
@@ -92,26 +111,14 @@ func (s *Supervisor) Run(ctx context.Context, killChan chan syscall.Signal) erro
 	return nil
 }
 
-func (s *Supervisor) handleSignal(ctx context.Context, signal syscall.Signal) ExitStatus {
-	// Signal the primary process and wait for it to exit
-	if err := s.primary.Stop(ctx); err != nil {
-		slog.Error("Failed to stop primary process", "error", err)
+// signalPrimary sends a signal to the primary process without waiting for it to exit
+func (s *Supervisor) signalPrimary(ctx context.Context, signal syscall.Signal) error {
+	if s.primary == nil {
+		return fmt.Errorf("no primary process")
 	}
 
-	if err := s.primary.Wait(); err != nil {
-		return ExitStatus{
-			ExitCode:  -1,
-			OOMKilled: false,
-			Signal:    pointer.Int(int(signal)),
-			Message:   fmt.Sprintf("Process terminated with signal %d", signal),
-		}
-	}
-
-	return ExitStatus{
-		ExitCode: s.primary.ExitCode(),
-		Signal:   pointer.Int(int(signal)),
-		Message:  fmt.Sprintf("Process stopped by signal %d", signal),
-	}
+	slog.Info("Sending signal to primary process", "signal", signal)
+	return s.primary.Signal(signal)
 }
 
 func (s *Supervisor) handleExit(err error) ExitStatus {
@@ -131,15 +138,16 @@ func (s *Supervisor) handleExit(err error) ExitStatus {
 		}
 	}
 
-	pid := s.primary.PID()
-	if pid > 0 {
-		if oom, err := checkOOMKill(pid); err != nil {
-			slog.Error("Failed to check OOM kill", "error", err)
-		} else if oom {
-			exit.OOMKilled = true
-			exit.Message = "Primary process was killed by the OOM killer"
-		}
-	}
+	// TODO: Fix OOM check - the current implementation blocks forever on /dev/kmsg
+	// pid := s.primary.PID()
+	// if pid > 0 {
+	// 	if oom, err := checkOOMKill(pid); err != nil {
+	// 		slog.Error("Failed to check OOM kill", "error", err)
+	// 	} else if oom {
+	// 		exit.OOMKilled = true
+	// 		exit.Message = "Primary process was killed by the OOM killer"
+	// 	}
+	// }
 	return exit
 }
 
