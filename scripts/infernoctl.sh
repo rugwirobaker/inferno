@@ -669,6 +669,21 @@ _purge_version_runtime() {
   rm -rf "${root:?}/dev" "${root:?}/run" 2>/dev/null || true
 }
 
+# Verify if VM is actually running by checking PID
+# Returns 0 if running, 1 if not
+_verify_vm_running() {
+  local vm_name="$1"
+  local vm_root; vm_root="$(get_vm_dir "$vm_name" 2>/dev/null)" || return 1
+
+  local kiln_pid_file; kiln_pid_file="$(_find_kiln_pid_file "$vm_root" 2>/dev/null)" || return 1
+  [[ -n "$kiln_pid_file" && -f "$kiln_pid_file" ]] || return 1
+
+  local pid; pid="$(_read_pid "$kiln_pid_file" 2>/dev/null)" || return 1
+  [[ -n "$pid" ]] || return 1
+
+  kill -0 "$pid" 2>/dev/null
+}
+
 usage() {
   cat <<'USAGE'
 infernoctl â€" manage Inferno VMs
@@ -677,15 +692,36 @@ Usage:
   infernoctl version
   infernoctl env print
   infernoctl init [--owner <user>]
+
+  infernoctl list [--format table|json] [--state created|running|stopped]
+  infernoctl ls   [--format table|json] [--state created|running|stopped]
+  infernoctl status <name> [--format human|json]
+
   infernoctl create  <name> --image <ref> [--vcpus N] [--memory MB] [--volume VOL_ID]
   infernoctl start   <name> [--detach]
   infernoctl stop    <name> [--signal SIGTERM] [--timeout SECONDS] [--kill]
   infernoctl destroy <name> [--yes] [--keep-logs]
+
+  infernoctl logs {start|stop|restart|status|tail|clear}
+
   infernoctl haproxy render
   infernoctl haproxy reload
   infernoctl images process <image> [entrypoint_json|string] [cmd_json|string]
   infernoctl images exposed <image>
-  infernoctl logs {start|stop|restart|status|tail|clear}
+
+Examples:
+  # List all VMs
+  infernoctl list
+  infernoctl ls --state running
+
+  # Get detailed status
+  infernoctl status web1
+  infernoctl status web1 --format json
+
+  # Create and manage VMs
+  infernoctl create web1 --image nginx:latest
+  infernoctl start web1 --detach
+  infernoctl stop web1
 
 Env:
   LOG_LEVEL              DEBUG/INFO/WARN/ERROR (default: INFO)
@@ -772,6 +808,326 @@ cmd_logs() {
       return 1
       ;;
   esac
+}
+
+cmd_list() {
+  require_root
+  require_cmd jq sqlite3
+
+  local format="table"
+  local state_filter=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format)  format="$2"; shift 2;;
+      --state)   state_filter="$2"; shift 2;;
+      -*)        die 2 "Unknown option: $1";;
+      *)         die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  # Validate format
+  case "$format" in
+    table|json) ;;
+    *) die 2 "Invalid format: $format. Use 'table' or 'json'";;
+  esac
+
+  # Validate state filter
+  if [[ -n "$state_filter" ]]; then
+    case "$state_filter" in
+      created|running|stopped) ;;
+      *) die 2 "Invalid state: $state_filter. Use 'created', 'running', or 'stopped'";;
+    esac
+  fi
+
+  # Get VM list from database
+  local vms_json
+  vms_json="$(list_vms_detailed "$state_filter")" || die 1 "Failed to list VMs"
+
+  # Check if empty
+  local count; count="$(echo "$vms_json" | jq -r 'length')"
+  if [[ "$count" -eq 0 ]]; then
+    if [[ "$format" == "json" ]]; then
+      echo "[]"
+    else
+      info "No VMs found"
+    fi
+    return 0
+  fi
+
+  # Verify state for running VMs
+  local verified_json="[]"
+  while read -r vm; do
+    local name; name="$(echo "$vm" | jq -r '.name')"
+    local state; state="$(echo "$vm" | jq -r '.state')"
+    local state_verified="true"
+
+    # Verify if VM is actually running
+    if [[ "$state" == "running" ]]; then
+      if ! _verify_vm_running "$name"; then
+        state_verified="false"
+      fi
+    fi
+
+    # Add state_verified field
+    local updated_vm; updated_vm="$(echo "$vm" | jq --arg verified "$state_verified" '. + {state_verified: ($verified == "true")}')"
+    verified_json="$(echo "$verified_json" | jq --argjson vm "$updated_vm" '. += [$vm]')"
+  done < <(echo "$vms_json" | jq -c '.[]')
+
+  # Output based on format
+  if [[ "$format" == "json" ]]; then
+    echo "$verified_json" | jq .
+  else
+    # Table format
+    printf "%-20s %-10s %-16s %-30s %-7s %s\n" "NAME" "STATE" "GUEST IP" "IMAGE" "ROUTES" "CREATED"
+    printf "%s\n" "$(printf '─%.0s' {1..100})"
+
+    while read -r vm; do
+      local name; name="$(echo "$vm" | jq -r '.name')"
+      local state; state="$(echo "$vm" | jq -r '.state')"
+      local verified; verified="$(echo "$vm" | jq -r '.state_verified')"
+      local guest_ip; guest_ip="$(echo "$vm" | jq -r '.guest_ip')"
+      local image; image="$(echo "$vm" | jq -r '.image')"
+      local routes; routes="$(echo "$vm" | jq -r '.active_routes')"
+      local created; created="$(echo "$vm" | jq -r '.created_at')"
+
+      # Truncate long image names
+      if [[ ${#image} -gt 28 ]]; then
+        image="${image:0:25}..."
+      fi
+
+      # Add asterisk for state mismatch
+      if [[ "$state" == "running" && "$verified" == "false" ]]; then
+        state="${state}*"
+      fi
+
+      printf "%-20s %-10s %-16s %-30s %-7s %s\n" \
+        "$name" "$state" "$guest_ip" "$image" "$routes" "$created"
+    done < <(echo "$verified_json" | jq -c '.[]')
+
+    # Show legend if there are state mismatches
+    if echo "$verified_json" | jq -e '.[] | select(.state == "running" and .state_verified == false)' >/dev/null 2>&1; then
+      printf "\n"
+      warn "* State mismatch: Database shows 'running' but process not found"
+    fi
+  fi
+}
+
+cmd_status() {
+  require_root
+  require_cmd jq sqlite3
+
+  local name=""
+  local format="human"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format)  format="$2"; shift 2;;
+      -*)        die 2 "Unknown option: $1";;
+      *)         name="$1"; shift;;
+    esac
+  done
+
+  [[ -n "$name" ]] || die 2 "Usage: infernoctl status <name> [--format human|json]"
+
+  # Validate format
+  case "$format" in
+    human|json) ;;
+    *) die 2 "Invalid format: $format. Use 'human' or 'json'";;
+  esac
+
+  # Check if VM exists
+  vm_exists "$name" || die 1 "VM not found: $name"
+
+  # Get VM details from database
+  local vm_json
+  vm_json="$(get_vm_detailed "$name")" || die 1 "Failed to get VM details"
+
+  # Extract basic info
+  local state; state="$(echo "$vm_json" | jq -r '.state')"
+  local version; version="$(echo "$vm_json" | jq -r '.version')"
+  local guest_ip; guest_ip="$(echo "$vm_json" | jq -r '.guest_ip')"
+
+  # Resolve VM context
+  _resolve_vm_ctx "$name"
+
+  # Get resource information from kiln.json
+  local kiln_json="${VM_ROOT}/kiln/${version}/root/kiln.json"
+  local vcpus="<unknown>"
+  local memory="<unknown>"
+  if [[ -f "$kiln_json" ]]; then
+    vcpus="$(jq -r '.resources.cpu_count // "<unknown>"' "$kiln_json" 2>/dev/null)" || vcpus="<unknown>"
+    memory="$(jq -r '.resources.memory_mb // "<unknown>"' "$kiln_json" 2>/dev/null)" || memory="<unknown>"
+  fi
+
+  # Get runtime information
+  local kiln_pid=""
+  local kiln_running="false"
+  local fc_pid=""
+  local fc_running="false"
+  local state_verified="true"
+
+  if [[ "$state" == "running" ]]; then
+    # Check kiln PID
+    local kiln_pid_file; kiln_pid_file="$(_find_kiln_pid_file "$VM_ROOT" 2>/dev/null)"
+    if [[ -n "$kiln_pid_file" && -f "$kiln_pid_file" ]]; then
+      kiln_pid="$(_read_pid "$kiln_pid_file" 2>/dev/null)" || kiln_pid=""
+      if [[ -n "$kiln_pid" ]] && kill -0 "$kiln_pid" 2>/dev/null; then
+        kiln_running="true"
+      else
+        state_verified="false"
+      fi
+    else
+      state_verified="false"
+    fi
+
+    # Check firecracker PID
+    local fc_pid_file; fc_pid_file="$(_find_firecracker_pid_file "$VM_ROOT" 2>/dev/null)"
+    if [[ -n "$fc_pid_file" && -f "$fc_pid_file" ]]; then
+      fc_pid="$(_read_pid "$fc_pid_file" 2>/dev/null)" || fc_pid=""
+      if [[ -n "$fc_pid" ]] && kill -0 "$fc_pid" 2>/dev/null; then
+        fc_running="true"
+      fi
+    fi
+  fi
+
+  # Check control socket
+  local sock_status="not found"
+  local sock_line; sock_line="$(_control_sock_path 10002 "$VM_ROOT" 2>/dev/null)" || true
+  if [[ -n "$sock_line" ]]; then
+    local sock="${sock_line%%|*}"
+    if [[ -S "$sock" ]]; then
+      sock_status="exists"
+      # Try to test if accessible (non-blocking)
+      if timeout 0.1 bash -c "true 2>/dev/null <> '$sock'" 2>/dev/null; then
+        sock_status="accessible"
+      fi
+    fi
+  fi
+
+  # Get routes
+  local routes_json
+  routes_json="$(sqlite3 -json "$DB_PATH" "SELECT mode, host_port, guest_port, hostname FROM routes WHERE vm_id = (SELECT id FROM vms WHERE name = '$name') AND active = TRUE;" 2>/dev/null)" || routes_json="[]"
+  [[ -z "$routes_json" ]] && routes_json="[]"
+
+  # Get volumes
+  local volumes_json
+  volumes_json="$(sqlite3 -json "$DB_PATH" "SELECT volume_id, name, size_gb FROM volumes WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');" 2>/dev/null)" || volumes_json="[]"
+  [[ -z "$volumes_json" ]] && volumes_json="[]"
+
+  # Output based on format
+  if [[ "$format" == "json" ]]; then
+    # Build complete JSON output
+    jq -n \
+      --argjson vm "$vm_json" \
+      --arg vcpus "$vcpus" \
+      --arg memory "$memory" \
+      --arg kiln_pid "$kiln_pid" \
+      --argjson kiln_running "$kiln_running" \
+      --arg fc_pid "$fc_pid" \
+      --argjson fc_running "$fc_running" \
+      --arg sock_status "$sock_status" \
+      --argjson state_verified "$state_verified" \
+      --argjson routes "$routes_json" \
+      --argjson volumes "$volumes_json" \
+      '{
+        name: $vm.name,
+        state: $vm.state,
+        state_verified: $state_verified,
+        version: $vm.version,
+        image: $vm.image,
+        image_id: $vm.image_id,
+        created_at: $vm.created_at,
+        network: {
+          guest_ip: $vm.guest_ip,
+          gateway_ip: $vm.gateway_ip,
+          tap_device: $vm.tap_device,
+          mac_address: $vm.mac_address
+        },
+        resources: {
+          vcpus: $vcpus,
+          memory_mb: $memory
+        },
+        runtime: {
+          kiln_pid: $kiln_pid,
+          kiln_running: $kiln_running,
+          firecracker_pid: $fc_pid,
+          firecracker_running: $fc_running,
+          control_socket: $sock_status
+        },
+        routes: $routes,
+        volumes: $volumes
+      }'
+  else
+    # Human-readable format
+    local state_display="$state"
+    if [[ "$state" == "running" && "$state_verified" == "false" ]]; then
+      state_display="$state (WARNING: Process not found)"
+    elif [[ "$state" == "running" && "$state_verified" == "true" ]]; then
+      state_display="$state (verified)"
+    fi
+
+    cat <<EOF
+
+VM Status: $name
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Basic Information:
+  Name:          $name
+  State:         $state_display
+  Version:       $version
+  Image:         $(echo "$vm_json" | jq -r '.image')
+  Created:       $(echo "$vm_json" | jq -r '.created_at')
+
+Network:
+  Guest IP:      $(echo "$vm_json" | jq -r '.guest_ip')
+  Gateway IP:    $(echo "$vm_json" | jq -r '.gateway_ip')
+  TAP Device:    $(echo "$vm_json" | jq -r '.tap_device')
+  MAC Address:   $(echo "$vm_json" | jq -r '.mac_address')
+
+Resources:
+  vCPUs:         $vcpus
+  Memory:        $memory MB
+
+Runtime:
+  kiln PID:      ${kiln_pid:-<not running>} $([ "$kiln_running" == "true" ] && echo "(running)" || echo "")
+  Firecracker:   ${fc_pid:-<not running>} $([ "$fc_running" == "true" ] && echo "(running)" || echo "")
+  Control Socket: $sock_status
+
+EOF
+
+    # Show routes
+    local route_count; route_count="$(echo "$routes_json" | jq 'length')"
+    if [[ "$route_count" -gt 0 ]]; then
+      echo "Routes ($route_count active):"
+      while read -r route; do
+        local mode; mode="$(echo "$route" | jq -r '.mode')"
+        local host_port; host_port="$(echo "$route" | jq -r '.host_port')"
+        local guest_port; guest_port="$(echo "$route" | jq -r '.guest_port')"
+        local hostname; hostname="$(echo "$route" | jq -r '.hostname // empty')"
+
+        if [[ "$mode" == "l7" ]]; then
+          echo "  • L7: ${hostname}:${host_port} → ${guest_ip}:${guest_port}"
+        else
+          echo "  • L4: 0.0.0.0:${host_port} → ${guest_ip}:${guest_port}"
+        fi
+      done < <(echo "$routes_json" | jq -c '.[]')
+      echo
+    fi
+
+    # Show volumes
+    local vol_count; vol_count="$(echo "$volumes_json" | jq 'length')"
+    if [[ "$vol_count" -gt 0 ]]; then
+      echo "Volumes ($vol_count attached):"
+      while read -r volume; do
+        local vol_id; vol_id="$(echo "$volume" | jq -r '.volume_id')"
+        local vol_name; vol_name="$(echo "$volume" | jq -r '.name')"
+        local vol_size; vol_size="$(echo "$volume" | jq -r '.size_gb')"
+        echo "  • $vol_id ($vol_name) - ${vol_size} GB"
+      done < <(echo "$volumes_json" | jq -c '.[]')
+      echo
+    fi
+  fi
 }
 
 cmd_haproxy_render() {
@@ -1370,6 +1726,9 @@ main() {
          esac ;;
 
     init)                 cmd_init "$@";;
+
+    list|ls)              cmd_list "$@";;
+    status)               cmd_status "$@";;
 
     create)               cmd_create "$@";;
     start)                cmd_start "$@";;

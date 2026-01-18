@@ -11,6 +11,7 @@ Inferno runs Docker/OCI container images as lightweight Firecracker microVMs ins
 - **Fast startup** - Boot times under 500ms for small images
 - **Network isolation** - Each VM gets its own TAP device and private subnet
 - **Resource limits** - Configure CPU and memory per VM
+- **VM inspection** - List VMs and view detailed status with runtime verification
 - **Centralized logging** - All VM logs stream to a single aggregation point
 - **No daemon required** - Unlike Docker, no background service needed
 
@@ -52,8 +53,14 @@ infernoctl init
 # Create a VM from nginx image
 sudo infernoctl create web1 --image nginx:latest
 
+# List all VMs
+sudo infernoctl list
+
 # Start the VM
 sudo infernoctl start web1 --detach
+
+# Check VM status
+sudo infernoctl status web1
 
 # View logs from all VMs
 infernoctl logs tail
@@ -114,6 +121,17 @@ infernoctl stop <name> [--signal SIGTERM] [--timeout SECONDS]
 
 # Destroy VM
 infernoctl destroy <name> [--yes] [--keep-logs]
+```
+
+### VM Inspection
+
+```bash
+# List all VMs
+infernoctl list [--format table|json] [--state created|running|stopped]
+infernoctl ls   [--format table|json] [--state created|running|stopped]
+
+# Get detailed VM status
+infernoctl status <name> [--format human|json]
 ```
 
 ### Logging
@@ -180,7 +198,13 @@ for i in {1..3}; do
 done
 
 # View all VMs
-sqlite3 ~/.local/share/inferno/inferno.db "SELECT name, guest_ip FROM vms;"
+sudo infernoctl list
+
+# View running VMs only
+sudo infernoctl list --state running
+
+# Get detailed status of a specific VM
+sudo infernoctl status web1
 
 # Stop all VMs
 for i in {1..3}; do
@@ -235,10 +259,11 @@ sudo infernoctl create app1 --image myapp:latest --volume data1
 **Symptom:** `control.sock not found` when stopping VM
 
 **Solutions:**
-1. Check VM is actually running: `ps aux | grep kiln`
-2. Verify socket exists: `find ~/.local/share/inferno -name control.sock`
-3. Check permissions: `stat <socket_path>`
-4. Try hard kill: `sudo infernoctl stop vm1 --kill`
+1. Check VM status: `sudo infernoctl status vm1` or `sudo infernoctl list`
+2. Check VM is actually running: `ps aux | grep kiln`
+3. Verify socket exists: `find ~/.local/share/inferno -name control.sock`
+4. Check permissions: `stat <socket_path>`
+5. Try hard kill: `sudo infernoctl stop vm1 --kill`
 
 ### Logs Not Appearing
 

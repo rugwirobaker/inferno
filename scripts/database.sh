@@ -884,3 +884,86 @@ EOF
         return 1
     fi
 }
+
+# List all VMs with detailed information
+list_vms_detailed() {
+    local state_filter="${1:-}"
+    local where_clause=""
+
+    if [[ -n "$state_filter" ]]; then
+        where_clause="WHERE v.state = '$state_filter'"
+    fi
+
+    debug "Listing VMs with detailed information (filter: ${state_filter:-none})"
+
+    local result
+    result=$(
+        sqlite3 -json "$DB_PATH" <<EOF
+SELECT
+    v.name,
+    v.state,
+    v.guest_ip,
+    v.created_at,
+    COALESCE(i.source_image, '<unknown>') as image,
+    COALESCE(
+        (SELECT version FROM vms_versions
+         WHERE vm_id = v.id
+         ORDER BY version DESC
+         LIMIT 1),
+        '<unknown>'
+    ) as version,
+    COUNT(r.id) as active_routes
+FROM vms v
+LEFT JOIN images i ON v.image_id = i.id
+LEFT JOIN routes r ON r.vm_id = v.id AND r.active = TRUE
+$where_clause
+GROUP BY v.id
+ORDER BY v.created_at DESC;
+EOF
+    )
+    if [ $? -ne 0 ]; then
+        error "Failed to list VMs with detailed information"
+        return 1
+    fi
+
+    echo "$result"
+}
+
+# Get detailed information for a specific VM
+get_vm_detailed() {
+    local name="$1"
+    debug "Fetching detailed information for VM $name"
+
+    local result
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
+SELECT json_object(
+    'name', v.name,
+    'state', v.state,
+    'guest_ip', v.guest_ip,
+    'gateway_ip', v.gateway_ip,
+    'tap_device', v.tap_device,
+    'mac_address', v.mac_address,
+    'created_at', v.created_at,
+    'image', COALESCE(i.source_image, '<unknown>'),
+    'image_id', i.image_id,
+    'version', COALESCE(
+        (SELECT version FROM vms_versions
+         WHERE vm_id = v.id
+         ORDER BY version DESC
+         LIMIT 1),
+        '<unknown>'
+    )
+)
+FROM vms v
+LEFT JOIN images i ON v.image_id = i.id
+WHERE v.name = '$name';
+EOF
+    )
+    if [ $? -ne 0 ]; then
+        error "Failed to get detailed VM information"
+        return 1
+    fi
+
+    echo "$result"
+}
