@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS vms (
     gateway_ip TEXT NOT NULL,
     guest_ip TEXT UNIQUE NOT NULL,
     mac_address TEXT UNIQUE NOT NULL,
+    state TEXT NOT NULL DEFAULT 'created' CHECK (state IN ('created', 'running', 'stopped')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

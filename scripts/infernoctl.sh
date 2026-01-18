@@ -1025,6 +1025,15 @@ cmd_start() {
   done
   [[ -n "$name" ]] || die 2 "Usage: infernoctl start <name> [--detach]"
 
+  # Check VM state before attempting to start
+  if type -t get_vm_state >/dev/null 2>&1; then
+    local current_state; current_state="$(get_vm_state "$name" 2>/dev/null || true)"
+    if [[ "$current_state" == "running" ]]; then
+      warn "VM ${name} is already running."
+      return 0
+    fi
+  fi
+
   _resolve_vm_ctx "$name"
 
   local jailer_bin; jailer_bin="$(_jailer_bin)"
@@ -1101,12 +1110,20 @@ cmd_start() {
     done
 
     if [[ -f "$pid_file" ]]; then
+      # Update VM state to running
+      if type -t set_vm_state >/dev/null 2>&1; then
+        set_vm_state "$name" "running" || warn "Failed to update VM state to running"
+      fi
       success "VM ${name} started (PID $(cat "$pid_file"))."
     else
       warn "VM ${name} started but PID file not yet present."
     fi
   else
     info "Foreground mode (Ctrl-C to stop)â€¦"
+    # Update VM state to running (for foreground mode)
+    if type -t set_vm_state >/dev/null 2>&1; then
+      set_vm_state "$name" "running" || warn "Failed to update VM state to running"
+    fi
     exec env RUST_BACKTRACE=full "$jailer_bin" "${JARGS[@]}" --
   fi
 }
@@ -1126,6 +1143,18 @@ cmd_stop() {
     esac
   done
   [[ -n "$name" ]] || die 2 "Usage: infernoctl stop <name> [--signal SIGTERM] [--timeout SECONDS] [--kill]"
+
+  # Check VM state before attempting to stop
+  if type -t get_vm_state >/dev/null 2>&1; then
+    local current_state; current_state="$(get_vm_state "$name" 2>/dev/null || true)"
+    if [[ "$current_state" == "stopped" ]]; then
+      info "VM ${name} is already stopped."
+      return 0
+    elif [[ "$current_state" == "created" ]]; then
+      info "VM ${name} has not been started yet."
+      return 0
+    fi
+  fi
 
   _resolve_vm_ctx "$name"  # sets: VM_ROOT, JAIL_ID, JAIL_UID/GID, EXEC_BASE=kiln, CHROOT_DIR, LOGF
 
@@ -1195,6 +1224,11 @@ cmd_stop() {
   done
 
   if [[ -z "$still" ]]; then
+    # Update VM state to stopped
+    if type -t set_vm_state >/dev/null 2>&1; then
+      set_vm_state "$name" "stopped" || warn "Failed to update VM state to stopped"
+    fi
+
     if [[ "$ok" == "1" ]]; then
       success "Stopped ${name} (version ${JAIL_ID})."
     else

@@ -846,3 +846,41 @@ EOF
 
     echo "$result"
 }
+
+# VM state management functions
+get_vm_state() {
+    local vm_name="$1"
+    debug "Fetching state for VM $vm_name"
+
+    local result
+    result=$(
+        sqlite3 "$DB_PATH" <<EOF
+SELECT state
+FROM vms
+WHERE name = '$vm_name';
+EOF
+    )
+    if [ $? -ne 0 ]; then
+        error "Failed to get VM state"
+        return 1
+    fi
+
+    echo "$result"
+}
+
+set_vm_state() {
+    local vm_name="$1"
+    local new_state="$2"
+    debug "Setting state for VM $vm_name to $new_state"
+
+    sqlite3 "$DB_PATH" <<EOF
+UPDATE vms
+SET state = '$new_state'
+WHERE name = '$vm_name';
+EOF
+
+    if [ $? -ne 0 ]; then
+        error "Failed to update VM state"
+        return 1
+    fi
+}
