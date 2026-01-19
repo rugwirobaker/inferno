@@ -99,11 +99,14 @@ sudo infernoctl destroy web1
 
 ## Architecture
 
-Inferno consists of three main components:
+### High-Level Components
+
+Inferno consists of four main components:
 
 1. **infernoctl** (Bash) - CLI that manages VM lifecycle, networking, and state
-2. **kiln** (Go) - Firecracker supervisor that handles VM execution and vsock communication
-3. **init** (Go) - Guest-side init process that bootstraps the environment and runs your application
+2. **jailer** (Rust) - Firecracker's security isolation tool (chroot, cgroups, privilege dropping)
+3. **kiln** (Go) - Firecracker supervisor that handles VM execution and vsock communication
+4. **init** (Go) - Guest-side init process that bootstraps the environment and runs your application
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -114,12 +117,20 @@ Inferno consists of three main components:
 └────────────────┬────────────────────────────┘
                  │ spawns
 ┌────────────────▼────────────────────────────┐
+│  jailer (Rust security layer)               │
+│  ├─ Create chroot jail                      │
+│  ├─ Set up cgroups (cpu, memory)            │
+│  ├─ Drop privileges (setuid/setgid)         │
+│  └─ exec() into kiln (same PID!)            │
+└────────────────┬────────────────────────────┘
+                 │ exec() transformation
+┌────────────────▼────────────────────────────┐
 │  kiln (Go supervisor)                       │
 │  ├─ Firecracker lifecycle management        │
 │  ├─ Vsock communication                     │
 │  └─ Log aggregation                         │
 └────────────────┬────────────────────────────┘
-                 │ launches
+                 │ spawns child
 ┌────────────────▼────────────────────────────┐
 │  Firecracker microVM                        │
 │  └─ init (Go process)                       │
@@ -128,6 +139,197 @@ Inferno consists of three main components:
 │     ├─ Run container process                │
 │     └─ Handle signals                       │
 └─────────────────────────────────────────────┘
+```
+
+### Process Execution Flow (Critical for Understanding Inferno)
+
+Understanding how processes are launched is essential for debugging and development. Inferno uses a specific execution pattern involving **process transformation** via the UNIX `exec()` system call.
+
+#### The Four Binaries
+
+1. **jailer** (`/usr/share/inferno/jailer`) - Rust binary from Firecracker project
+   - Creates chroot jail in versioned directory
+   - Sets up cgroups v2 for resource limits (cpu.max, memory.max)
+   - Drops root privileges via setuid(123)/setgid(100)
+   - Uses `exec()` to **transform into kiln** (same PID!)
+
+2. **kiln** (`/usr/share/inferno/kiln`) - Go binary, Inferno's supervisor
+   - Runs inside the chroot jail as non-root user (uid 123)
+   - Sets up vsock Unix sockets for guest communication
+   - Spawns Firecracker as a child process
+   - Monitors VM lifecycle and collects exit status
+
+3. **firecracker** (`/usr/share/inferno/firecracker`) - Rust binary, VMM
+   - Child process of kiln
+   - Boots Linux kernel with initramfs
+   - Provides device emulation (virtio, vsock)
+   - Runs guest workload
+
+4. **init** (`/initramfs/inferno/init`) - Go binary, runs inside the guest
+   - First process in the VM (PID 1)
+   - Mounts filesystems (rootfs, proc, sys, dev)
+   - Configures network (assigns IP, sets routes)
+   - Executes container entrypoint/cmd
+
+#### Understanding exec() - The Key Transformation
+
+The jailer uses the UNIX `exec()` system call to **replace itself** with kiln. This is **NOT** spawning a child process:
+
+```
+Before exec():                After exec():
+PID 12345: /jailer     →      PID 12345: /kiln
+(jailer code in memory)       (kiln code in memory)
+```
+
+**Why this matters:**
+- Jailer and kiln are **the same process** (same PID)
+- Cgroup membership is **preserved** across exec()
+- File descriptors, working directory, and environment carry over
+- The `jailer.pid` file contains what is now kiln's PID
+- In `ps` output, you see `/kiln`, not `/jailer` (jailer code is gone)
+
+This is why resource limits work: the jailer creates cgroups and adds its PID to them, then exec's into kiln **without changing PID**, so kiln (and its child Firecracker) inherit the cgroup limits.
+
+#### Complete Execution Flow with All Details
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Step 1: infernoctl.sh (bash script, running as root)               │
+│                                                                     │
+│  • Builds jail directory: ~/.local/share/inferno/vms/kiln/<ULID>/  │
+│  • Reads resource limits from database                              │
+│  • Converts limits to cgroup format:                                │
+│    - vcpus=1  → cpu.max="100000 100000"  (1 core)                  │
+│    - memory=128 → memory.max="134217728"  (128MB in bytes)         │
+│  • Executes jailer with full flags:                                 │
+│                                                                     │
+│    /usr/share/inferno/jailer \                                      │
+│      --id <version-ulid> \                                          │
+│      --exec-file /usr/share/inferno/kiln \                          │
+│      --uid 123 --gid 100 \                                          │
+│      --cgroup-version 2 \                                           │
+│      --parent-cgroup firecracker \                                  │
+│      --cgroup "cpu.max=100000 100000" \                             │
+│      --cgroup "memory.max=134217728" \                              │
+│      --chroot-base-dir ~/.local/share/inferno/vms/kiln \            │
+│      --                                                             │
+│                                                                     │
+│  • Saves jailer's PID to <vm-root>/jailer.pid                       │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓ fork() + exec()
+┌─────────────────────────────────────────────────────────────────────┐
+│ Step 2: jailer (PID 65393, running as root temporarily)            │
+│                                                                     │
+│  • Creates chroot at: ~/.local/share/inferno/vms/kiln/<ULID>/root/ │
+│  • Creates cgroup hierarchy:                                        │
+│    /sys/fs/cgroup/firecracker/<ULID>/                              │
+│  • Writes cgroup files:                                             │
+│    - cpu.max ← "100000 100000"                                      │
+│    - memory.max ← "134217728"                                       │
+│  • Adds own PID (65393) to cgroup.procs                             │
+│  • chroot() into jail directory                                     │
+│  • setuid(123), setgid(100) - drops root privileges                │
+│  • exec("/kiln") - REPLACES JAILER CODE WITH KILN                   │
+│    (same PID 65393, still in cgroup!)                               │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓ exec() - SAME PID!
+┌─────────────────────────────────────────────────────────────────────┐
+│ Step 3: kiln (PID 65393, uid 123, inside chroot jail)              │
+│                                                                     │
+│  • Working directory: / (inside chroot)                             │
+│  • Reads ./kiln.json from current directory                         │
+│  • Sets up vsock Unix socket listeners:                             │
+│    - control.sock_10000 (stdout from guest)                         │
+│    - control.sock_10001 (exit status from guest)                    │
+│  • Writes kiln.pid file (contains 65393)                            │
+│  • Executes Firecracker:                                            │
+│                                                                     │
+│    /firecracker \                                                   │
+│      --id <version-ulid> \                                          │
+│      --api-sock firecracker.sock \                                  │
+│      --config-file firecracker.json                                 │
+│                                                                     │
+│  • Waits for Firecracker process, collects exit status             │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓ fork() + exec()
+┌─────────────────────────────────────────────────────────────────────┐
+│ Step 4: firecracker (PID 65403, child of kiln, uid 123)           │
+│                                                                     │
+│  • Inherits cgroup limits from parent (kiln/jailer)                 │
+│  • Reads ./firecracker.json                                         │
+│  • Opens /dev/kvm for virtualization                                │
+│  • Boots Linux kernel (vmlinux) with initramfs                      │
+│  • Guest init process starts inside VM                              │
+│  • Guest connects back via vsock for logs/status                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Process Tree Example
+
+When you inspect a running VM, here's what you see:
+
+```bash
+$ cat ~/.local/share/inferno/vms/web1/jailer.pid
+65393
+
+$ ps -p 65393 -o pid,ppid,cmd,user
+    PID    PPID CMD                              USER
+  65393       1 /kiln --id 19BD59DBC0DEC8E...   123
+
+$ pstree -p 65393
+kiln(65393)───firecracker(65403)─┬─{firecracker}(65406)
+                                  └─{firecracker}(65411)
+```
+
+**Key observations:**
+- The jailer is **not visible** in the process tree (it exec'd into kiln)
+- `jailer.pid` contains **65393**, which is now running `/kiln`
+- Firecracker (PID 65403) is a **child** of kiln (normal parent-child)
+- Both processes run as uid **123** (non-root)
+
+#### Cgroup Hierarchy on Disk
+
+```bash
+$ cat /sys/fs/cgroup/firecracker/19BD59DBC0DEC8E443D2517C000/cgroup.procs
+65393   # kiln
+65403   # firecracker (inherited from parent)
+
+$ cat /sys/fs/cgroup/firecracker/19BD59DBC0DEC8E443D2517C000/cpu.max
+100000 100000   # 1 full CPU core
+
+$ cat /sys/fs/cgroup/firecracker/19BD59DBC0DEC8E443D2517C000/memory.max
+134217728   # 128 MiB
+
+$ cat /sys/fs/cgroup/firecracker/19BD59DBC0DEC8E443D2517C000/memory.current
+67108864    # Currently using ~64 MiB
+```
+
+#### Resource Limit Conversion Reference
+
+When configuring VMs, resources are specified in friendly units and converted to cgroup format:
+
+**CPU Limits (cpu.max):**
+- Format: `<quota> <period>` (both in microseconds)
+- 1 vCPU = `100000 100000` (100ms quota / 100ms period = 100%)
+- 2 vCPUs = `200000 100000` (200ms quota / 100ms period = 200%)
+- 0.5 vCPU = `50000 100000` (50ms quota / 100ms period = 50%)
+- 4 vCPUs = `400000 100000` (400ms quota / 100ms period = 400%)
+
+**Memory Limits (memory.max):**
+- Format: `<bytes>` (decimal, no suffixes in cgroup file)
+- 128 MB = 128 × 1024 × 1024 = `134217728`
+- 256 MB = 256 × 1024 × 1024 = `268435456`
+- 512 MB = 512 × 1024 × 1024 = `536870912`
+- 1 GB = 1024 × 1024 × 1024 = `1073741824`
+- 2 GB = 2 × 1024 × 1024 × 1024 = `2147483648`
+
+**Formula:**
+```bash
+cpu_quota=$((vcpus * 100000))
+memory_bytes=$((memory_mb * 1024 * 1024))
+
+--cgroup "cpu.max=${cpu_quota} 100000"
+--cgroup "memory.max=${memory_bytes}"
 ```
 
 ## Commands

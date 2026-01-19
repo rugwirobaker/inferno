@@ -4,11 +4,26 @@
 
 Inferno is a lightweight container runtime that runs Docker/OCI images as Firecracker microVMs instead of traditional containers. Think "Docker but with VM-level isolation."
 
-**Current Architecture:** Primarily bash-based CLI layer (`scripts/`) with two critical Go components:
-- **kiln** - Firecracker supervisor/jailer that manages VM lifecycle and vsock communication
-- **init** - Guest-side init process that bootstraps the VM and runs your containerized process
+**Current Architecture:** Primarily bash-based CLI layer (`scripts/`) with critical binaries:
+- **jailer** - Firecracker's security tool (Rust) - chroot, cgroups, privilege dropping, then exec() into kiln
+- **kiln** - Firecracker supervisor (Go) - vsock communication, lifecycle management
+- **init** - Guest-side init process (Go) - bootstraps VM and runs containerized process
 
 **Not a daemon:** Unlike Docker, Inferno doesn't run a background daemon. Each VM is a standalone process supervised by `kiln`.
+
+## Process Execution Architecture (CRITICAL)
+
+**MUST READ FIRST:** Before working on any code, understand the jailer → kiln → firecracker execution flow.
+
+See [README.md - Process Execution Flow](README.md#process-execution-flow-critical-for-understanding-inferno) for complete details including:
+- The four binaries and their roles
+- How `exec()` transforms jailer into kiln (same PID!)
+- Complete execution flow with cgroup setup
+- Process tree examples
+- Cgroup hierarchy structure
+- Resource limit conversion formulas (vcpus → cpu.max, memory → memory.max)
+
+**Key takeaway:** The jailer creates cgroups and adds its PID, then `exec()`s into kiln **without changing PID**. This is why resource limits work - kiln and Firecracker inherit the cgroup membership.
 
 ## Project Structure
 

@@ -1010,6 +1010,51 @@ cmd_status() {
     memory="$(jq -r '.resources.memory_mb // "<unknown>"' "$kiln_json" 2>/dev/null)" || memory="<unknown>"
   fi
 
+  # Get cgroup information if VM is running
+  local cgroup_cpu_limit="<not available>"
+  local cgroup_memory_limit="<not available>"
+  local cgroup_memory_usage="<not available>"
+
+  if [[ "$state" == "running" && -n "$version" ]]; then
+    local cgroup_path="/sys/fs/cgroup/firecracker/${version}"
+
+    if [[ -d "$cgroup_path" ]]; then
+      # Read CPU limit (format: "quota period")
+      if [[ -f "${cgroup_path}/cpu.max" ]]; then
+        local cpu_max; cpu_max="$(cat "${cgroup_path}/cpu.max" 2>/dev/null)" || cpu_max=""
+        if [[ -n "$cpu_max" && "$cpu_max" != "max 100000" ]]; then
+          local quota; quota="$(echo "$cpu_max" | awk '{print $1}')"
+          local period; period="$(echo "$cpu_max" | awk '{print $2}')"
+          if [[ -n "$quota" && -n "$period" && "$quota" != "max" ]]; then
+            # Convert to vCPUs (quota / period)
+            local vcpu_float; vcpu_float="$(awk "BEGIN {printf \"%.2f\", $quota / $period}")"
+            cgroup_cpu_limit="${vcpu_float} vCPU"
+          fi
+        fi
+      fi
+
+      # Read memory limit (bytes)
+      if [[ -f "${cgroup_path}/memory.max" ]]; then
+        local mem_max; mem_max="$(cat "${cgroup_path}/memory.max" 2>/dev/null)" || mem_max=""
+        if [[ -n "$mem_max" && "$mem_max" != "max" ]]; then
+          # Convert bytes to MB
+          local mem_mb; mem_mb="$((mem_max / 1024 / 1024))"
+          cgroup_memory_limit="${mem_mb} MB"
+        fi
+      fi
+
+      # Read current memory usage (bytes)
+      if [[ -f "${cgroup_path}/memory.current" ]]; then
+        local mem_current; mem_current="$(cat "${cgroup_path}/memory.current" 2>/dev/null)" || mem_current=""
+        if [[ -n "$mem_current" ]]; then
+          # Convert bytes to MB
+          local mem_usage_mb; mem_usage_mb="$((mem_current / 1024 / 1024))"
+          cgroup_memory_usage="${mem_usage_mb} MB"
+        fi
+      fi
+    fi
+  fi
+
   # Get runtime information
   local kiln_pid=""
   local kiln_running="false"
@@ -1096,6 +1141,9 @@ cmd_status() {
       --argjson vm "$vm_json" \
       --arg vcpus "$vcpus" \
       --arg memory "$memory" \
+      --arg cgroup_cpu_limit "$cgroup_cpu_limit" \
+      --arg cgroup_memory_limit "$cgroup_memory_limit" \
+      --arg cgroup_memory_usage "$cgroup_memory_usage" \
       --arg kiln_pid "$kiln_pid" \
       --argjson kiln_running "$kiln_running" \
       --arg fc_pid "$fc_pid" \
@@ -1120,7 +1168,10 @@ cmd_status() {
         },
         resources: {
           vcpus: $vcpus,
-          memory_mb: $memory
+          memory_mb: $memory,
+          cgroup_cpu_limit: $cgroup_cpu_limit,
+          cgroup_memory_limit: $cgroup_memory_limit,
+          cgroup_memory_usage: $cgroup_memory_usage
         },
         runtime: {
           kiln_pid: $kiln_pid,
@@ -1162,6 +1213,9 @@ Network:
 Resources:
   vCPUs:         $vcpus
   Memory:        $memory MB
+  CPU Limit:     $cgroup_cpu_limit
+  Memory Limit:  $cgroup_memory_limit
+  Memory Usage:  $cgroup_memory_usage
 
 Runtime:
   kiln PID:      ${kiln_pid:-<not running>} $([ "$kiln_running" == "true" ] && echo "(running)" || echo "")
@@ -1654,12 +1708,33 @@ cmd_start() {
   # Prepare firecracker capabilities if needed
   _prepare_firecracker_caps
 
+  # Read resource limits from kiln.json for cgroup configuration
+  local vcpus memory_mb
+  vcpus="$(jq -r '.resources.cpu_count // 1' "$CHROOT_DIR/kiln.json" 2>/dev/null)" || vcpus=1
+  memory_mb="$(jq -r '.resources.memory_mb // 128' "$CHROOT_DIR/kiln.json" 2>/dev/null)" || memory_mb=128
+
+  # Convert to cgroup v2 format
+  # CPU: vcpus * 100000 microseconds per 100000 microsecond period
+  # Memory: memory_mb * 1024 * 1024 bytes
+  local cpu_quota memory_bytes
+  cpu_quota=$((vcpus * 100000))
+  memory_bytes=$((memory_mb * 1024 * 1024))
+
+  debug "Resource limits: vcpus=${vcpus}, memory=${memory_mb}MB"
+  debug "Cgroup values: cpu.max=${cpu_quota} 100000, memory.max=${memory_bytes}"
+
   # Jailer args: kiln takes NO args; it finds ./kiln.json in CWD
+  # Using cgroups v2 with proper format for cpu.max and memory.max
+  # NOTE: The space in "cpu.max=X Y" must be quoted as a single argument
   local -a JARGS=(
     --id "$version"
     --uid "$JAIL_UID" --gid "$JAIL_GID"
     --exec-file "$KILN_EXEC"
     --chroot-base-dir "$(_chroot_base_dir)"
+    --cgroup-version "2"
+    --parent-cgroup "firecracker"
+    --cgroup "cpu.max=${cpu_quota} 100000"
+    --cgroup "memory.max=${memory_bytes}"
   )
 
   mkdir -p "${INFERNO_ROOT}/logs"
