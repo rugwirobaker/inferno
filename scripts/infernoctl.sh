@@ -699,6 +699,7 @@ Usage:
   infernoctl list [--format table|json] [--state created|running|stopped]
   infernoctl ls   [--format table|json] [--state created|running|stopped]
   infernoctl status <name> [--format human|json]
+  infernoctl reconcile
 
   infernoctl create  <name> --image <ref> [--vcpus N] [--memory MB] [--volume VOL_ID]
   infernoctl start   <name> [--detach]
@@ -716,6 +717,9 @@ Examples:
   # List all VMs
   infernoctl list
   infernoctl ls --state running
+
+  # Fix state mismatches (e.g., after Ctrl+C on foreground VM)
+  infernoctl reconcile
 
   # Get detailed status
   infernoctl status web1
@@ -811,6 +815,48 @@ cmd_logs() {
       return 1
       ;;
   esac
+}
+
+cmd_reconcile() {
+  require_root
+  require_cmd sqlite3
+
+  info "Checking VM states for mismatches..."
+
+  local fixed=0
+  local checked=0
+
+  # Get all VMs marked as running
+  local vms_data
+  vms_data="$(sqlite3 "$DB_PATH" "SELECT name FROM vms WHERE state = 'running';" 2>/dev/null)" || {
+    warn "Failed to query database"
+    return 1
+  }
+
+  while IFS= read -r vm_name; do
+    [[ -z "$vm_name" ]] && continue
+    ((checked++))
+
+    # Check if VM is actually running
+    if ! _verify_vm_running "$vm_name"; then
+      warn "VM '$vm_name' marked as running but process not found - fixing"
+
+      # Update state to stopped
+      if type -t set_vm_state >/dev/null 2>&1; then
+        set_vm_state "$vm_name" "stopped" || warn "Failed to update state for $vm_name"
+      fi
+
+      ((fixed++))
+    fi
+  done <<< "$vms_data"
+
+  if [[ $fixed -gt 0 ]]; then
+    success "Fixed $fixed state mismatch(es) out of $checked VMs checked"
+  elif [[ $checked -gt 0 ]]; then
+    info "All $checked running VMs are in sync"
+  else
+    info "No running VMs found"
+  fi
 }
 
 cmd_list() {
@@ -912,6 +958,7 @@ cmd_list() {
     if echo "$verified_json" | jq -e '.[] | select(.state == "running" and .state_verified == false)' >/dev/null 2>&1; then
       printf "\n"
       warn "* State mismatch: Database shows 'running' but process not found"
+      info "  Run 'infernoctl reconcile' to fix state mismatches"
     fi
   fi
 }
@@ -990,6 +1037,30 @@ cmd_status() {
       fc_pid="$(_read_pid "$fc_pid_file" 2>/dev/null)" || fc_pid=""
       if [[ -n "$fc_pid" ]] && kill -0 "$fc_pid" 2>/dev/null; then
         fc_running="true"
+      fi
+    fi
+
+    # Fallback: Find firecracker as child of kiln
+    if [[ -z "$fc_pid" && -n "$kiln_pid" && "$kiln_running" == "true" ]]; then
+      # Try pgrep first (finds children of kiln)
+      if command -v pgrep >/dev/null 2>&1; then
+        fc_pid="$(pgrep -P "$kiln_pid" 2>/dev/null | head -n1)" || fc_pid=""
+      fi
+
+      # Fallback to ps if pgrep not available
+      if [[ -z "$fc_pid" ]] && command -v ps >/dev/null 2>&1; then
+        fc_pid="$(ps --ppid "$kiln_pid" -o pid= 2>/dev/null | tr -d ' ' | head -n1)" || fc_pid=""
+      fi
+
+      # Verify it's actually firecracker
+      if [[ -n "$fc_pid" ]]; then
+        local proc_name; proc_name="$(ps -p "$fc_pid" -o comm= 2>/dev/null || true)"
+        if [[ "$proc_name" == "firecracker" ]]; then
+          fc_running="true"
+        else
+          # Not firecracker, clear it
+          fc_pid=""
+        fi
       fi
     fi
   fi
@@ -1626,7 +1697,42 @@ cmd_start() {
     if type -t set_vm_state >/dev/null 2>&1; then
       set_vm_state "$name" "running" || warn "Failed to update VM state to running"
     fi
-    exec env RUST_BACKTRACE=full "$jailer_bin" "${JARGS[@]}" --
+
+    # Setup cleanup trap for foreground mode
+    _cleanup_foreground() {
+      local exit_code=$?
+      warn "Caught signal, cleaning up..."
+
+      # Update database state
+      if type -t set_vm_state >/dev/null 2>&1; then
+        set_vm_state "$name" "stopped" 2>/dev/null || true
+      fi
+
+      # Kill jailer process if it's still running
+      if [[ -f "$VM_ROOT/jailer.pid" ]]; then
+        local jpid; jpid="$(_read_pid "$VM_ROOT/jailer.pid" 2>/dev/null)" || jpid=""
+        if [[ -n "$jpid" ]] && kill -0 "$jpid" 2>/dev/null; then
+          kill -TERM "$jpid" 2>/dev/null || true
+          sleep 1
+          kill -KILL "$jpid" 2>/dev/null || true
+        fi
+      fi
+
+      exit $exit_code
+    }
+    trap '_cleanup_foreground' SIGINT SIGTERM
+
+    # Start jailer in foreground (not using exec so trap works)
+    env RUST_BACKTRACE=full "$jailer_bin" "${JARGS[@]}" --
+    local jailer_exit=$?
+
+    # Normal exit cleanup
+    trap - SIGINT SIGTERM
+    if type -t set_vm_state >/dev/null 2>&1; then
+      set_vm_state "$name" "stopped" || warn "Failed to update VM state to stopped"
+    fi
+
+    return $jailer_exit
   fi
 }
 
@@ -1900,6 +2006,7 @@ main() {
 
     list|ls)              cmd_list "$@";;
     status)               cmd_status "$@";;
+    reconcile)            cmd_reconcile "$@";;
 
     create)               cmd_create "$@";;
     start)                cmd_start "$@";;
