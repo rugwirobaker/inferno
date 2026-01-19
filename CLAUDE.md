@@ -87,6 +87,88 @@ sudo ./scripts/install.sh --mode prod
 # Does NOT auto-initialize database (security)
 ```
 
+**LVM Rootfs Setup** (recommended for efficiency):
+
+Inferno uses **LVM thin snapshots** by default for rootfs deduplication and ephemeral behavior. This provides:
+- **Deduplication**: 10 VMs from same image = ~1.5GB vs 10GB
+- **Always ephemeral**: Snapshots deleted on stop, fresh state on start
+- **Static 5GB** per base image (configurable via `ROOTFS_SIZE_MB`)
+
+**Option 1: Loopback Device (Testing/Development)**
+```bash
+# Create a 30GB sparse file (uses minimal space initially)
+sudo truncate -s 30G /var/lib/inferno_rootfs.img
+
+# Set up as loopback device
+sudo losetup -f /var/lib/inferno_rootfs.img
+
+# Find the loopback device name
+LOOP_DEV=$(sudo losetup -j /var/lib/inferno_rootfs.img | cut -d: -f1)
+echo "Loop device: $LOOP_DEV"  # e.g., /dev/loop0
+
+# Install with loopback device
+sudo ./scripts/install.sh --mode dev --rootfs-disk $LOOP_DEV --user $USER
+
+# What this does:
+# - Creates physical volume on loop device
+# - Creates volume group: inferno_rootfs_vg
+# - Creates thin pool: rootfs_pool (20GB)
+# - Enables LVM mode by default
+```
+
+**To make loopback persistent across reboots**, add to `/etc/rc.local` or systemd:
+```bash
+# /etc/systemd/system/inferno-loopback.service
+[Unit]
+Description=Setup Inferno rootfs loopback device
+Before=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/losetup -f /var/lib/inferno_rootfs.img
+RemainAfterExit=yes
+
+[Install]
+WantedBy=local-fs.target
+```
+
+**Option 2: Real Disk (Production)**
+```bash
+# Identify available disk
+lsblk
+
+# Install with dedicated disk (CAUTION: erases disk!)
+sudo ./scripts/install.sh --mode prod --rootfs-disk /dev/sdb
+
+# What this does:
+# - Creates physical volume on /dev/sdb
+# - Creates volume group: inferno_rootfs_vg
+# - Creates thin pool: rootfs_pool (20GB, expandable)
+```
+
+**Option 3: File-based Fallback (No LVM)**
+```bash
+# Install without --rootfs-disk
+sudo ./scripts/install.sh --mode dev --user $USER
+
+# Behavior:
+# - Falls back to 1GB file per VM (no deduplication)
+# - Still works, just less efficient
+# - Each VM creates ~/.local/share/inferno/vms/kiln/*/root/rootfs.img
+```
+
+**Verify LVM Setup:**
+```bash
+# Check volume group
+sudo vgs inferno_rootfs_vg
+
+# Check thin pool
+sudo lvs inferno_rootfs_vg/rootfs_pool
+
+# Monitor pool usage
+sudo lvs --units g -o lv_name,data_percent inferno_rootfs_vg/rootfs_pool
+```
+
 ### Running Inferno
 
 **Initialize data directory** (first time only, or after changing INFERNO_ROOT):

@@ -40,6 +40,31 @@ This installs:
 - Firecracker hypervisor and kernel
 - Network and database management utilities
 
+### LVM Rootfs Setup (Recommended)
+
+For efficient storage with deduplication and ephemeral rootfs, set up LVM thin provisioning:
+
+**Testing/Development with loopback device:**
+```bash
+# Create a 30GB sparse file
+sudo truncate -s 30G /var/lib/inferno_rootfs.img
+sudo losetup -f /var/lib/inferno_rootfs.img
+
+# Install with loopback device
+LOOP_DEV=$(sudo losetup -j /var/lib/inferno_rootfs.img | cut -d: -f1)
+sudo ./scripts/install.sh --mode dev --rootfs-disk $LOOP_DEV --user $USER
+```
+
+**Production with dedicated disk:**
+```bash
+# Use a dedicated disk (CAUTION: erases disk!)
+sudo ./scripts/install.sh --mode prod --rootfs-disk /dev/sdb
+```
+
+Without `--rootfs-disk`, Inferno falls back to file-based rootfs (1GB per VM, no deduplication).
+
+See [CLAUDE.md](CLAUDE.md#lvm-rootfs-setup-recommended-for-efficiency) for detailed setup instructions including persistent loopback configuration.
+
 ### Initialize Inferno
 
 First-time setup (creates data directory and database):

@@ -30,6 +30,8 @@ source "${SCRIPT_DIR}/config.sh"
 # shellcheck disable=SC1091
 [[ -f "${SCRIPT_DIR}/libvol.sh"       ]] && source "${SCRIPT_DIR}/libvol.sh"
 # shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/librootfs.sh"    ]] && source "${SCRIPT_DIR}/librootfs.sh"
+# shellcheck disable=SC1091
 [[ -f "${SCRIPT_DIR}/libvnet.sh"      ]] && source "${SCRIPT_DIR}/libvnet.sh"
 # shellcheck disable=SC1091
 [[ -f "${SCRIPT_DIR}/init.sh"         ]] && source "${SCRIPT_DIR}/init.sh"
@@ -1219,6 +1221,60 @@ cmd_create() {
     rm -rf "$vm_root"; die 1 "No images metadata helper (get_container_metadata or images_process_json)."
   fi
 
+  # === IMAGE METADATA PERSISTENCE ==============================================
+  log "Storing image metadata..."
+
+  local image_manifest image_manifest_raw
+  if type -t images_inspect_json >/dev/null 2>&1; then
+    image_manifest_raw="$(images_inspect_json "$image" 2>/dev/null)" || { warn "Failed to inspect image $image"; image_manifest_raw="{}"; }
+    image_manifest="$image_manifest_raw"
+  else
+    warn "images_inspect_json not available; skipping image metadata storage"
+    image_manifest="{}"
+  fi
+
+  local docker_digest
+  docker_digest="$(jq -r '.Id // empty' <<<"$image_manifest" 2>/dev/null || true)"
+
+  # Fallback: Generate synthetic ID if no digest available
+  if [[ -z "$docker_digest" ]]; then
+    warn "No Docker digest found for $image; generating synthetic image_id"
+    docker_digest="synthetic_$(echo -n "$image" | sha256sum | awk '{print $1}')"
+  fi
+
+  # Normalize image name (remove registry prefix, library/ prefix)
+  local image_name
+  image_name="$(echo "$image" | sed -E 's|^[^/]+/||;s|^library/||')"
+
+  # Create manifests directory
+  local manifest_dir="${IMAGES_DIR}/manifests"
+  mkdir -p "$manifest_dir" 2>/dev/null || warn "Failed to create manifests directory"
+
+  # Store manifest JSON to disk (sanitize digest for filename)
+  local manifest_path="${manifest_dir}/${docker_digest//:/_}.json"
+  echo "$image_manifest" > "$manifest_path" 2>/dev/null || warn "Failed to write manifest to $manifest_path"
+
+  # Create or update image record in database
+  if type -t create_image >/dev/null 2>&1 && type -t update_vm_image >/dev/null 2>&1; then
+    local existing_image
+    existing_image="$(sqlite3 "$DB_PATH" "SELECT image_id FROM images WHERE image_id = '$docker_digest';" 2>/dev/null || true)"
+
+    if [[ -z "$existing_image" ]]; then
+      debug "Creating new image record: $docker_digest"
+      create_image "$docker_digest" "$image_name" "$image" "pending" "$manifest_path" >/dev/null 2>&1 \
+        || warn "Failed to create image record (non-fatal)"
+    else
+      debug "Image $docker_digest already exists in database"
+    fi
+
+    # Link VM to image
+    update_vm_image "$name" "$docker_digest" 2>/dev/null \
+      || warn "Failed to link VM to image (non-fatal)"
+  else
+    warn "Database image functions not available; skipping image persistence"
+  fi
+  # === END IMAGE METADATA PERSISTENCE ==========================================
+
   local ssh_config="{}"
   if type -t generate_ssh_files >/dev/null 2>&1; then
     log "Generating SSH configuration..."
@@ -1262,23 +1318,50 @@ cmd_create() {
   (cd "$initramfs_dir" && find . | cpio -H newc -o >"$chroot_dir/initrd.cpio") \
     || { rm -rf "$base"; die 1 "Failed to create initrd.cpio"; }
 
-  # Root filesystem image (lives only inside the chroot)
-  local rootfs_path="$chroot_dir/rootfs.img"
-  log "Creating root filesystem image..."
-  dd if=/dev/zero of="$rootfs_path" bs=1M count=1024 status=none \
-    || { rm -rf "$base"; die 1 "Failed to create rootfs image"; }
-  mkfs.ext4 -F -q "$rootfs_path" \
-    || { rm -rf "$base"; die 1 "Failed to format rootfs image"; }
+  # === ROOT FILESYSTEM (FILE-BASED OR LVM) =====================================
+  local rootfs_mode="file"
 
-  if type -t extract_docker_image >/dev/null 2>&1; then
-    extract_docker_image "$image" "$rootfs_path" \
-      || { rm -rf "$base"; die 1 "Failed to extract image $image to rootfs"; }
-  elif type -t images_extract_rootfs >/dev/null 2>&1; then
-    images_extract_rootfs "$image" "$rootfs_path" \
-      || { rm -rf "$base"; die 1 "Failed to extract image $image to rootfs"; }
+  # Check if LVM rootfs is available
+  if type -t rootfs_lvm_available >/dev/null 2>&1 && rootfs_lvm_available; then
+    rootfs_mode="lvm"
+    log "Using LVM thin snapshots for rootfs"
+
+    # Create or reuse base image (snapshot created on start)
+    local base_lv_path
+    if type -t rootfs_create_base >/dev/null 2>&1; then
+      base_lv_path="$(rootfs_create_base "$image" "$docker_digest")" \
+        || { rm -rf "$base"; die 1 "Failed to create base image LV"; }
+      log "Base image ready: $base_lv_path"
+    else
+      rm -rf "$base"; die 1 "librootfs.sh not loaded; cannot use LVM mode"
+    fi
+
   else
-    rm -rf "$base"; die 1 "No image extraction helper found (need extract_docker_image or images_extract_rootfs)."
+    # Traditional file-based rootfs
+    rootfs_mode="file"
+    log "Using file-based rootfs"
+
+    local rootfs_path="$chroot_dir/rootfs.img"
+    log "Creating root filesystem image..."
+    dd if=/dev/zero of="$rootfs_path" bs=1M count=1024 status=none \
+      || { rm -rf "$base"; die 1 "Failed to create rootfs image"; }
+    mkfs.ext4 -F -q "$rootfs_path" \
+      || { rm -rf "$base"; die 1 "Failed to format rootfs image"; }
+
+    if type -t extract_docker_image >/dev/null 2>&1; then
+      extract_docker_image "$image" "$rootfs_path" \
+        || { rm -rf "$base"; die 1 "Failed to extract image $image to rootfs"; }
+    elif type -t images_extract_rootfs >/dev/null 2>&1; then
+      images_extract_rootfs "$image" "$rootfs_path" \
+        || { rm -rf "$base"; die 1 "Failed to extract image $image to rootfs"; }
+    else
+      rm -rf "$base"; die 1 "No image extraction helper found."
+    fi
   fi
+
+  # Store rootfs mode for start/stop logic
+  echo "$rootfs_mode" > "$chroot_dir/rootfs.mode" || true
+  # === END ROOT FILESYSTEM ======================================================
 
   # Static assets into the chroot + host exec under the version dir
   log "Placing firecracker/vmlinux/kiln once into versioned chroot..."
@@ -1409,6 +1492,54 @@ cmd_start() {
 
   _purge_version_runtime "$CHROOT_DIR"
   _ensure_dev_nodes "$CHROOT_DIR" "$JAIL_UID" "$JAIL_GID"
+
+  # === EPHEMERAL SNAPSHOT CREATION (LVM MODE) ==================================
+  local rootfs_mode="file"
+  [[ -f "$CHROOT_DIR/rootfs.mode" ]] && rootfs_mode="$(cat "$CHROOT_DIR/rootfs.mode" 2>/dev/null || echo file)"
+
+  if [[ "$rootfs_mode" == "lvm" ]]; then
+    log "Creating ephemeral rootfs snapshot..."
+
+    # Get VM ID from database
+    local vm_id
+    vm_id="$(sqlite3 "$DB_PATH" "SELECT id FROM vms WHERE name = '$name';" 2>/dev/null || true)"
+    if [[ -z "$vm_id" ]]; then
+      die 1 "VM not found in database: $name"
+    fi
+
+    # Get Docker digest from database
+    local docker_digest
+    docker_digest="$(sqlite3 "$DB_PATH" "SELECT i.image_id FROM images i JOIN vms v ON v.image_id = i.id WHERE v.name = '$name';" 2>/dev/null || true)"
+    if [[ -z "$docker_digest" ]]; then
+      die 1 "Image digest not found for VM $name"
+    fi
+
+    # Create ephemeral snapshot
+    local snap_path
+    if type -t rootfs_create_snapshot >/dev/null 2>&1; then
+      snap_path="$(rootfs_create_snapshot "$name" "$vm_id" "$docker_digest" "$version")" \
+        || die 1 "Failed to create ephemeral snapshot"
+    else
+      die 1 "librootfs.sh not loaded; cannot create snapshot"
+    fi
+
+    log "Ephemeral snapshot created: $snap_path"
+
+    # Update firecracker.json with snapshot path
+    log "Updating firecracker config with snapshot path..."
+    if jq --arg path "$snap_path" '.drives[0].path_on_host = $path' "$CHROOT_DIR/firecracker.json" > "$CHROOT_DIR/firecracker.json.tmp" 2>/dev/null; then
+      mv "$CHROOT_DIR/firecracker.json.tmp" "$CHROOT_DIR/firecracker.json"
+      chown "$JAIL_UID:$JAIL_GID" "$CHROOT_DIR/firecracker.json" 2>/dev/null || true
+    else
+      warn "Failed to update firecracker.json with snapshot path"
+    fi
+
+    # Check thin pool usage
+    if type -t rootfs_check_pool_usage >/dev/null 2>&1; then
+      rootfs_check_pool_usage || warn "Thin pool usage check failed"
+    fi
+  fi
+  # === END EPHEMERAL SNAPSHOT CREATION =========================================
 
   # Start global VM logs socket if not running
   ensure_global_vm_logs_socket || warn "Global VM logs socket not available"
@@ -1560,6 +1691,21 @@ cmd_stop() {
     done
   fi
 
+  # === EPHEMERAL SNAPSHOT DELETION (LVM MODE) ==================================
+  local rootfs_mode="file"
+  [[ -f "$CHROOT_DIR/rootfs.mode" ]] && rootfs_mode="$(cat "$CHROOT_DIR/rootfs.mode" 2>/dev/null || echo file)"
+
+  if [[ "$rootfs_mode" == "lvm" ]]; then
+    log "Deleting ephemeral rootfs snapshot..."
+
+    if type -t rootfs_delete_snapshot >/dev/null 2>&1; then
+      rootfs_delete_snapshot "$name" || warn "Failed to delete snapshot (non-fatal)"
+    else
+      warn "librootfs.sh not loaded; snapshot not deleted"
+    fi
+  fi
+  # === END EPHEMERAL SNAPSHOT DELETION =========================================
+
   # Clean transient artifacts in the versioned chroot
   rm -f "${CHROOT_DIR}/${EXEC_BASE}.pid" \
         "${CHROOT_DIR}/kiln.pid" \
@@ -1691,6 +1837,16 @@ cmd_destroy() {
   if type -t delete_vm >/dev/null 2>&1; then
     delete_vm "$name" || warn "delete_vm failed"
   fi
+
+  # === BASE IMAGE CLEANUP (LVM MODE) ===========================================
+  # Ensure snapshot is deleted (defensive cleanup)
+  if type -t rootfs_delete_snapshot >/dev/null 2>&1; then
+    rootfs_delete_snapshot "$name" 2>/dev/null || true
+  fi
+
+  # Note: Base images are NOT deleted here (kept cached for reuse)
+  # Use 'infernoctl gc' (future feature) to prune unused base images
+  # === END BASE IMAGE CLEANUP ==================================================
 
   # Logs and metadata dir
   if [[ "$keep_logs" != "1" ]]; then

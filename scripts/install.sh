@@ -4,9 +4,10 @@ set -euo pipefail
 INSTALL_SH_VERSION="1.3.2"
 
 # ===== Pretty logging =====
-info() { printf "\033[1;32m[INFO]\033[0m %s\n" "$*"; }
-warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$*" >&2; }
-err()  { printf "\033[1;31m[ERROR]\033[0m %s\n" "$*" >&2; exit 1; }
+info()    { printf "\033[1;32m[INFO]\033[0m %s\n" "$*"; }
+success() { printf "\033[1;32m[✓]\033[0m %s\n" "$*"; }
+warn()    { printf "\033[1;33m[WARN]\033[0m %s\n" "$*" >&2; }
+err()     { printf "\033[1;31m[ERROR]\033[0m %s\n" "$*" >&2; exit 1; }
 
 # ===== Defaults (overridable by flags) =====
 # Note: --mode dev|prod is the primary control now. We still accept legacy MODE env if --mode is omitted.
@@ -25,6 +26,7 @@ CREATE_GROUP="${CREATE_GROUP:-1}"
 # Optional knobs
 HAPROXY_MODE="${HAPROXY_MODE:-}"            # "worker" | "edge"
 HAPROXY_BIND="${HAPROXY_BIND:-auto}"        # "auto" or IP
+ROOTFS_DISK="${ROOTFS_DISK:-}"              # Disk device for LVM rootfs VG (e.g., /dev/sdb)
 
 # Release asset names (if you use prod mode)
 ASSET_INFERNO_AMD64="inferno_Linux_x86_64.tar.gz"
@@ -40,7 +42,7 @@ KERNEL_LIST_URL="http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/v1
 
 usage() {
   cat <<EOF
-Usage: sudo ./scripts/install.sh --mode dev|prod
+Usage: sudo ./scripts/install.sh --mode dev|prod [--rootfs-disk /dev/sdX]
        [--prefix PATH] [--libdir PATH] [--scripts-dir PATH]
        [--sharedir PATH] [--etcdir PATH] [--data-dir PATH]
        [--repo ORG/REPO] [--release TAG] [--user USER] [--no-group]
@@ -50,6 +52,10 @@ Notes:
   - --mode controls defaults:
       dev  -> INFERNO_ROOT=\$HOME/.local/share/inferno (for USER), auto-init DB as that USER
       prod -> INFERNO_ROOT=/var/lib/inferno (unless --data-dir), do not auto-init DB
+
+  - --rootfs-disk is RECOMMENDED for LVM thin provisioning (5GB per base image with CoW):
+      Example: --rootfs-disk /dev/sdb
+      Without it, Inferno falls back to file-based rootfs (1GB per VM, no deduplication)
 
 Compatibility:
   - Legacy env MODE=dev|prod is still honored if --mode is omitted.
@@ -80,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --no-group) CREATE_GROUP=0; shift;;
     --haproxy) HAPROXY_MODE="$2"; shift 2;;
     --haproxy-bind) HAPROXY_BIND="$2"; shift 2;;
+    --rootfs-disk) ROOTFS_DISK="$2"; shift 2;;
     -h|--help) usage;;
     *) err "Unknown flag: $1";;
   esac
@@ -336,6 +343,89 @@ if [[ "$MODE" == "dev" ]]; then
       warn "runuser not available; please run 'infernoctl init' as $USER_TO_ADD"
     fi
   fi
+fi
+
+# ===== Setup LVM rootfs VG =====
+ROOTFS_VG_NAME="${ROOTFS_VG_NAME:-inferno_rootfs_vg}"
+ROOTFS_POOL_NAME="${ROOTFS_POOL_NAME:-rootfs_pool}"
+ROOTFS_POOL_SIZE="${ROOTFS_POOL_SIZE:-20G}"
+
+if [[ -n "$ROOTFS_DISK" ]]; then
+  info "Setting up LVM rootfs on disk: $ROOTFS_DISK"
+
+  # Validate disk exists
+  if [[ ! -b "$ROOTFS_DISK" ]]; then
+    err "Disk not found: $ROOTFS_DISK (must be a block device)"
+  fi
+
+  # Check if disk is mounted
+  if mount | grep -q "^${ROOTFS_DISK}"; then
+    err "Disk $ROOTFS_DISK is currently mounted. Unmount it first."
+  fi
+
+  # Warn if disk has partitions
+  if lsblk -n "$ROOTFS_DISK" | grep -q "part"; then
+    warn "Disk $ROOTFS_DISK has partitions. This will use the entire disk."
+    read -p "Continue? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      err "Aborted by user"
+    fi
+  fi
+
+  # Create physical volume if needed
+  if ! pvs "$ROOTFS_DISK" >/dev/null 2>&1; then
+    info "Creating physical volume on $ROOTFS_DISK..."
+    pvcreate "$ROOTFS_DISK" || err "Failed to create physical volume"
+  else
+    info "Physical volume already exists on $ROOTFS_DISK"
+  fi
+
+  # Create volume group if needed
+  if ! vgs "$ROOTFS_VG_NAME" >/dev/null 2>&1; then
+    info "Creating volume group: $ROOTFS_VG_NAME"
+    vgcreate "$ROOTFS_VG_NAME" "$ROOTFS_DISK" || err "Failed to create volume group"
+  else
+    info "Volume group already exists: $ROOTFS_VG_NAME"
+  fi
+
+  # Create thin pool if needed
+  if ! lvs "$ROOTFS_VG_NAME/$ROOTFS_POOL_NAME" >/dev/null 2>&1; then
+    info "Creating thin pool: $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME ($ROOTFS_POOL_SIZE)"
+    lvcreate -L "$ROOTFS_POOL_SIZE" -T "$ROOTFS_VG_NAME/$ROOTFS_POOL_NAME" \
+      || err "Failed to create thin pool"
+  else
+    info "Thin pool already exists: $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME"
+  fi
+
+  info "LVM rootfs setup complete!"
+  info "  Volume group: $ROOTFS_VG_NAME"
+  info "  Thin pool: $ROOTFS_POOL_NAME"
+  info "  Pool size: $ROOTFS_POOL_SIZE"
+
+elif vgs "$ROOTFS_VG_NAME" >/dev/null 2>&1; then
+  # VG exists but no disk was specified
+  info "LVM rootfs volume group detected: $ROOTFS_VG_NAME"
+
+  if lvs "$ROOTFS_VG_NAME/$ROOTFS_POOL_NAME" >/dev/null 2>&1; then
+    info "LVM rootfs available (thin pool: $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME)"
+  else
+    warn "Thin pool not found: $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME"
+    warn "  To create it manually:"
+    warn "    sudo lvcreate -L 20G -T $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME"
+  fi
+
+else
+  # No VG and no disk specified
+  warn "LVM rootfs not configured!"
+  warn "  Inferno will fall back to file-based rootfs (1GB per VM, no deduplication)"
+  warn "  To enable LVM rootfs, re-run install with:"
+  warn "    sudo ./scripts/install.sh --mode $MODE --rootfs-disk /dev/sdX"
+  warn ""
+  warn "  Or create manually:"
+  warn "    sudo pvcreate /dev/sdX"
+  warn "    sudo vgcreate $ROOTFS_VG_NAME /dev/sdX"
+  warn "    sudo lvcreate -L 20G -T $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME"
 fi
 
 # ===== Optional: seed HAProxy base (markers only) if requested =====

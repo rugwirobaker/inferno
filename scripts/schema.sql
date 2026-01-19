@@ -121,3 +121,55 @@ LEFT JOIN routes r ON r.vm_id = v.id AND r.active = TRUE
 LEFT JOIN volumes vol ON vol.vm_id = v.id
 LEFT JOIN images i ON i.id = v.image_id
 GROUP BY v.id;
+
+-- ============================================================================
+-- LVM Thin Snapshots Support
+-- ============================================================================
+
+-- Base images (LVM thin volumes for rootfs)
+CREATE TABLE IF NOT EXISTS base_images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    docker_ref TEXT NOT NULL,              -- "nginx:latest"
+    docker_digest TEXT UNIQUE NOT NULL,    -- "sha256:abc123..."
+    lv_name TEXT UNIQUE NOT NULL,          -- "base_abc123"
+    lv_path TEXT NOT NULL,                 -- "/dev/mapper/inferno_rootfs_vg-base_abc123"
+    size_mb INTEGER NOT NULL,
+    manifest_json TEXT,                    -- Full docker inspect JSON
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index for fast lookup by digest
+CREATE INDEX IF NOT EXISTS idx_base_images_digest ON base_images(docker_digest);
+
+-- Ephemeral snapshots (track active VM snapshots)
+CREATE TABLE IF NOT EXISTS ephemeral_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vm_id INTEGER NOT NULL UNIQUE,         -- One snapshot per VM at a time
+    base_image_id INTEGER NOT NULL,
+    lv_name TEXT UNIQUE NOT NULL,          -- "snap_vmname_version"
+    lv_path TEXT NOT NULL,                 -- "/dev/mapper/inferno_rootfs_vg-snap_vmname_version"
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE CASCADE,
+    FOREIGN KEY (base_image_id) REFERENCES base_images(id)
+);
+
+-- Index for cleanup operations
+CREATE INDEX IF NOT EXISTS idx_ephemeral_snapshots_vm ON ephemeral_snapshots(vm_id);
+
+-- View: VMs with their rootfs info
+DROP VIEW IF EXISTS vm_rootfs_details;
+CREATE VIEW vm_rootfs_details AS
+SELECT
+    v.name AS vm_name,
+    v.state AS vm_state,
+    bi.docker_ref AS base_image,
+    bi.docker_digest AS image_digest,
+    bi.size_mb AS base_size_mb,
+    bi.lv_name AS base_lv,
+    es.lv_name AS snapshot_lv,
+    es.lv_path AS snapshot_path,
+    es.created_at AS snapshot_created_at
+FROM vms v
+LEFT JOIN ephemeral_snapshots es ON es.vm_id = v.id
+LEFT JOIN base_images bi ON es.base_image_id = bi.id;

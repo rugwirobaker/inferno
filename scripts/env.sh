@@ -59,6 +59,12 @@ SCRIPTS_DIR="$(_expand_tilde "$SCRIPTS_DIR")"
 # LVM volume group used by libvol/database
 : "${VG_NAME:=inferno_vg}"
 
+# LVM rootfs configuration (default enabled)
+: "${INFERNO_ROOTFS_LVM_ENABLED:=1}"       # 0=file-based, 1=LVM thin snapshots
+: "${ROOTFS_VG_NAME:=inferno_rootfs_vg}"
+: "${ROOTFS_POOL_NAME:=rootfs_pool}"
+: "${ROOTFS_SIZE_MB:=5120}"                # 5GB static size for all rootfs
+
 # HAProxy defaults (used by haproxy.sh unless overridden)
 : "${HAPROXY_CFG:=/etc/haproxy/haproxy.cfg}"
 : "${HAPROXY_ENABLE:=1}"          # 1=managed by systemd reload/restart
@@ -77,6 +83,10 @@ export DB_PATH
 export VM_DIR
 export IMAGES_DIR
 export VG_NAME
+export INFERNO_ROOTFS_LVM_ENABLED
+export ROOTFS_VG_NAME
+export ROOTFS_POOL_NAME
+export ROOTFS_SIZE_MB
 export HAPROXY_CFG
 export HAPROXY_ENABLE
 export HAPROXY_MODE
