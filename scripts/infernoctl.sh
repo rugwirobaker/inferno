@@ -86,6 +86,7 @@ _ensure_dev_nodes() {
   _mk "$dev/null" c 1 3 0666
   _mk "$dev/zero" c 1 5 0666
   _mk "$dev/tty"  c 5 0 0666
+  # NOTE: /dev/kvm is created by the jailer, not here
   # _mk "$dev/net/tun"   c 10 200 0666
 }
 
@@ -1525,9 +1526,23 @@ cmd_start() {
 
     log "Ephemeral snapshot created: $snap_path"
 
-    # Update firecracker.json with snapshot path
+    # Create device node inside chroot for snapshot
+    log "Creating device node in chroot..."
+    local snap_dev_major snap_dev_minor
+    snap_dev_major="$(stat -L -c '%t' "$snap_path" 2>/dev/null)"
+    snap_dev_minor="$(stat -L -c '%T' "$snap_path" 2>/dev/null)"
+    snap_dev_major=$((16#$snap_dev_major))
+    snap_dev_minor=$((16#$snap_dev_minor))
+
+    local chroot_dev_path="$CHROOT_DIR/dev/rootfs"
+    rm -f "$chroot_dev_path" 2>/dev/null || true
+    mknod "$chroot_dev_path" b "$snap_dev_major" "$snap_dev_minor" || die 1 "Failed to create device node in chroot"
+    chown "$JAIL_UID:$JAIL_GID" "$chroot_dev_path" 2>/dev/null || true
+    chmod 0660 "$chroot_dev_path" 2>/dev/null || true
+
+    # Update firecracker.json with relative device path
     log "Updating firecracker config with snapshot path..."
-    if jq --arg path "$snap_path" '.drives[0].path_on_host = $path' "$CHROOT_DIR/firecracker.json" > "$CHROOT_DIR/firecracker.json.tmp" 2>/dev/null; then
+    if jq '.drives[0].path_on_host = "dev/rootfs"' "$CHROOT_DIR/firecracker.json" > "$CHROOT_DIR/firecracker.json.tmp" 2>/dev/null; then
       mv "$CHROOT_DIR/firecracker.json.tmp" "$CHROOT_DIR/firecracker.json"
       chown "$JAIL_UID:$JAIL_GID" "$CHROOT_DIR/firecracker.json" 2>/dev/null || true
     else

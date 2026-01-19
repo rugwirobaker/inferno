@@ -116,6 +116,38 @@ need_cmd tar
 command -v ip >/dev/null 2>&1 || true
 command -v nft >/dev/null 2>&1 || true
 
+# ===== KVM availability check =====
+check_kvm() {
+  # Check if KVM is supported by CPU
+  if ! grep -qE 'vmx|svm' /proc/cpuinfo; then
+    warn "CPU does not support virtualization (no vmx/svm flags)"
+    warn "Inferno requires KVM support to run Firecracker VMs"
+    return 1
+  fi
+
+  # Check if KVM module is loaded
+  if ! lsmod | grep -q '^kvm'; then
+    info "KVM module not loaded, attempting to load..."
+    if grep -q 'vmx' /proc/cpuinfo; then
+      modprobe kvm_intel 2>/dev/null || warn "Failed to load kvm_intel module"
+    elif grep -q 'svm' /proc/cpuinfo; then
+      modprobe kvm_amd 2>/dev/null || warn "Failed to load kvm_amd module"
+    fi
+  fi
+
+  # Check if /dev/kvm exists
+  if [[ ! -e /dev/kvm ]]; then
+    warn "/dev/kvm device not found"
+    warn "KVM may not be properly configured. VMs will fail to start."
+    return 1
+  fi
+
+  info "KVM support detected and available"
+  return 0
+}
+
+check_kvm || warn "KVM checks failed - VMs may not start properly"
+
 # ===== Arch mapping for release assets (prod) =====
 ARCH="$(uname -m)"
 case "$ARCH" in

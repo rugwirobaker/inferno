@@ -242,6 +242,19 @@ rootfs_create_snapshot() {
         return 1
     fi
 
+    # Clear skip-activation flag and activate (thin snapshots default to -k for crash consistency)
+    if ! lvchange -kn "$ROOTFS_VG_NAME/$snap_lv" >/dev/null 2>&1; then
+        error "Failed to clear skip-activation flag on $snap_lv"
+        lvremove -f "$ROOTFS_VG_NAME/$snap_lv" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if ! lvchange -ay "$ROOTFS_VG_NAME/$snap_lv" >/dev/null 2>&1; then
+        error "Failed to activate snapshot $snap_lv"
+        lvremove -f "$ROOTFS_VG_NAME/$snap_lv" >/dev/null 2>&1 || true
+        return 1
+    fi
+
     # Set permissions for jailer UID (best effort)
     local jail_uid="${JAIL_UID:-${DEFAULT_JAIL_UID:-123}}"
     local jail_gid="${JAIL_GID:-${DEFAULT_JAIL_GID:-100}}"
