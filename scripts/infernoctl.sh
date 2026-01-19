@@ -1380,6 +1380,10 @@ cmd_create() {
   local manifest_path="${manifest_dir}/${docker_digest//:/_}.json"
   echo "$image_manifest" > "$manifest_path" 2>/dev/null || warn "Failed to write manifest to $manifest_path"
 
+  # Generate a unique rootfs path reference (actual storage may be LVM or file-based)
+  # This is primarily for tracking; actual rootfs creation happens later
+  local rootfs_ref="${IMAGES_DIR}/rootfs/${docker_digest//:/_}.img"
+
   # Create or update image record in database
   if type -t create_image >/dev/null 2>&1 && type -t update_vm_image >/dev/null 2>&1; then
     local existing_image
@@ -1387,7 +1391,7 @@ cmd_create() {
 
     if [[ -z "$existing_image" ]]; then
       debug "Creating new image record: $docker_digest"
-      create_image "$docker_digest" "$image_name" "$image" "pending" "$manifest_path" >/dev/null 2>&1 \
+      create_image "$docker_digest" "$image_name" "$image" "$rootfs_ref" "$manifest_path" >/dev/null 2>&1 \
         || warn "Failed to create image record (non-fatal)"
     else
       debug "Image $docker_digest already exists in database"

@@ -95,10 +95,20 @@ __to_json_argv() {
 images_inspect_json() {
   local img; img="$(images_norm_ref "$1")"
   if ! _images_exists_locally "$img"; then
-    _images_pull "$img"
+    _images_pull "$img" || { error "Failed to pull image $img"; return 1; }
   fi
   # Some tools yield an array; normalize to first element
-  _images_inspect "$img" | jq 'if type=="array" then .[0] else . end'
+  local result
+  result="$(_images_inspect "$img" 2>&1)" || { error "Failed to inspect image $img"; return 1; }
+
+  # Validate the raw output is valid JSON before processing
+  if ! jq -e . >/dev/null 2>&1 <<<"$result"; then
+    error "Invalid JSON returned from docker/podman inspect for $img"
+    return 1
+  fi
+
+  # Normalize array to single object
+  jq 'if type=="array" then .[0] else . end' <<<"$result"
 }
 
 # Compose argv from (override_entrypoint + override_cmd) or image (Entrypoint+Cmd).
@@ -111,14 +121,20 @@ images_process_json() {
   local img="$1" ep_override="${2:-}" cmd_override="${3:-}"
   [[ -n "$img" ]] || die 2 "image ref required"
 
-  local meta; meta="$(images_inspect_json "$img")"
+  local meta; meta="$(images_inspect_json "$img")" || return 1
+
+  # Validate that meta is actually valid JSON
+  if ! jq -e . >/dev/null 2>&1 <<<"$meta"; then
+    error "Invalid JSON returned from image inspect"
+    return 1
+  fi
 
   # Extract config pieces
   local img_ep img_cmd img_env img_workdir
-  img_ep="$(jq -c '.Config.Entrypoint // []' <<<"$meta")"
-  img_cmd="$(jq -c '.Config.Cmd        // []' <<<"$meta")"
-  img_env="$(jq -c '.Config.Env        // []' <<<"$meta")"
-  img_workdir="$(jq -r '.Config.WorkingDir // "/"' <<<"$meta")"
+  img_ep="$(jq -c '.Config.Entrypoint // []' <<<"$meta")" || { error "Failed to extract Entrypoint"; return 1; }
+  img_cmd="$(jq -c '.Config.Cmd        // []' <<<"$meta")" || { error "Failed to extract Cmd"; return 1; }
+  img_env="$(jq -c '.Config.Env        // []' <<<"$meta")" || { error "Failed to extract Env"; return 1; }
+  img_workdir="$(jq -r '.Config.WorkingDir // "/"' <<<"$meta")" || { error "Failed to extract WorkingDir"; return 1; }
   debug "image Entrypoint: $img_ep"
   debug "image Cmd:        $img_cmd"
   debug "image Env:        $img_env"
@@ -177,11 +193,18 @@ get_container_metadata() {
   [[ -n "$img" ]] || die 2 "image ref required"
 
   local meta; meta="$(images_inspect_json "$img")" || return 1
+
+  # Validate that meta is actually valid JSON
+  if ! jq -e . >/dev/null 2>&1 <<<"$meta"; then
+    error "Invalid JSON returned from image inspect"
+    return 1
+  fi
+
   # Entrypoint+Cmd combine
   local ep cmd
-  ep="$(jq -c '.Config.Entrypoint // []' <<<"$meta")"
-  cmd="$(jq -c '.Config.Cmd        // []' <<<"$meta")"
-  local argv; argv="$(jq -cn --argjson ep "$ep" --argjson cmd "$cmd" '$ep+$cmd | if length==0 then ["/bin/sh"] else . end')"
+  ep="$(jq -c '.Config.Entrypoint // []' <<<"$meta")" || { error "Failed to extract Entrypoint from image metadata"; return 1; }
+  cmd="$(jq -c '.Config.Cmd        // []' <<<"$meta")" || { error "Failed to extract Cmd from image metadata"; return 1; }
+  local argv; argv="$(jq -cn --argjson ep "$ep" --argjson cmd "$cmd" '$ep+$cmd | if length==0 then ["/bin/sh"] else . end')" || { error "Failed to build argv from Entrypoint and Cmd"; return 1; }
 
   # Split into cmd + args
   local first; first="$(jq -r '.[0]' <<<"$argv")"
