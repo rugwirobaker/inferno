@@ -26,6 +26,7 @@ require (
 	github.com/charmbracelet/ssh v0.0.0-20241211182756-4fe22b0f1b7c
 	github.com/charmbracelet/wish v1.4.4
 	github.com/creack/pty v1.1.21
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (

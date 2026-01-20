@@ -175,7 +175,7 @@ generate_run_config() {
         "PATH": "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
       },
       user: { name: "root", group: "root", create: true },
-      log:  { format: "text", timestamp: true, debug: true },
+      log:  { format: "json", timestamp: true, debug: true },
       etc_resolv: { nameservers: ["8.8.8.8","1.1.1.1"] },
       mounts: $mounts,
       vsock_stdout_port: 10000,
@@ -215,6 +215,11 @@ generate_kiln_config() {
     --arg mem "$memory" \
     --argjson uid "$uid" \
     --argjson gid "$gid" \
+    --arg log_dir "./logs" \
+    --argjson max_size_mb "${INFERNO_LOG_MAX_SIZE_MB:-100}" \
+    --argjson max_files "${INFERNO_LOG_MAX_FILES:-5}" \
+    --argjson max_age_days "${INFERNO_LOG_MAX_AGE_DAYS:-30}" \
+    --argjson compress "${INFERNO_LOG_COMPRESS:-true}" \
     '{
       jail_id: $jail_id,
       machine_id: $machine_id,
@@ -226,7 +231,13 @@ generate_kiln_config() {
       firecracker_vsock_uds_path: "control.sock",
       vsock_stdout_port: 10000,
       vsock_exit_port: 10001,
-      vm_logs_socket_path: "vm_logs.sock",
+      log_dir: $log_dir,
+      log_rotation: {
+        max_size_mb: $max_size_mb,
+        max_files: $max_files,
+        max_age_days: $max_age_days,
+        compress: $compress
+      },
       exit_status_path: "exit_status.json",
       resources: {
         cpu_count: ($vcpus|tonumber),

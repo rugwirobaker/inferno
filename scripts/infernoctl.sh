@@ -505,99 +505,6 @@ _prepare_firecracker_caps() {
   fi
 }
 
-ensure_global_vm_logs_socket() {
-    local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
-    local global_log_file="${INFERNO_ROOT}/logs/vm_combined.log"
-    local pid_file="${INFERNO_ROOT}/logs/vm_logs.pid"
-    
-    # Check if already running
-    if [[ -S "$global_socket" ]] && echo "test" | timeout 1 socat - "UNIX-CONNECT:${global_socket}" &>/dev/null 2>&1; then
-        debug "Global VM logs socket already running"
-        return 0
-    fi
-    
-    # Clean up stale files
-    rm -f "$global_socket" "$pid_file" 2>/dev/null || true
-    
-    # Ensure logs directory exists
-    mkdir -p "${INFERNO_ROOT}/logs"
-    
-    # Start global listener (one for all VMs)
-    (
-        exec socat -u \
-            "UNIX-LISTEN:${global_socket},fork,mode=666" \
-            "SYSTEM:while IFS= read -r line; do echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] \$line\" >> '$global_log_file'; done" \
-            &
-        echo $! > "$pid_file"
-        wait
-    ) &
-    
-    # Wait for socket creation - FIXED the (( attempts++ )) issue
-    local attempts=0
-    while [[ ! -S "$global_socket" ]] && (( attempts < 20 )); do
-        sleep 0.1
-        attempts=$((attempts + 1))  # Use explicit assignment instead of post-increment
-    done
-    
-    if [[ -S "$global_socket" ]]; then
-        chmod 666 "$global_socket" 2>/dev/null || true
-        info "Global VM logs socket started at $global_socket"
-        return 0
-    else
-        error "Failed to start global VM logs socket"
-        return 1
-    fi
-}
-
-# Link the global socket into a jail
-link_vm_logs_socket() {
-    local jail_root="$1"
-    local vm_name="$2"
-    
-    local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
-    local jail_socket="${jail_root}/vm_logs.sock"
-    
-    # Ensure global socket exists
-    ensure_global_vm_logs_socket || return 1
-    
-    # Remove any existing jail socket
-    rm -f "$jail_socket" 2>/dev/null || true
-    
-    # Create symlink (since you can't hard link sockets)
-    if ln -sf "$global_socket" "$jail_socket"; then
-        # Make sure jail can access it
-        chown -h "${INFERNO_JAIL_UID:-123}:${INFERNO_JAIL_GID:-100}" "$jail_socket" 2>/dev/null || true
-        debug "Linked global socket to jail: $jail_socket -> $global_socket"
-        return 0
-    else
-        error "Failed to link VM logs socket for $vm_name"
-        return 1
-    fi
-}
-
-# Clean up jail socket link
-unlink_vm_logs_socket() {
-    local jail_root="$1"
-    rm -f "${jail_root}/vm_logs.sock" 2>/dev/null || true
-}
-
-# Stop global socket (only when shutting down everything)
-stop_global_vm_logs_socket() {
-    local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
-    local pid_file="${INFERNO_ROOT}/logs/vm_logs.pid"
-    
-    if [[ -f "$pid_file" ]]; then
-        local pid; pid="$(cat "$pid_file" 2>/dev/null)" || true
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            kill -TERM "$pid" 2>/dev/null || true
-            sleep 0.5
-            kill -KILL "$pid" 2>/dev/null || true
-        fi
-        rm -f "$pid_file"
-    fi
-    rm -f "$global_socket" 2>/dev/null || true
-}
-
 debug_control_socket() {
     local name="$1"
     local vm_root; vm_root="$(get_vm_dir "$name")"
@@ -752,7 +659,7 @@ cmd_env_print() {
 cmd_init() {
   local owner="${1:-${SUDO_USER:-$USER}}"
   info "Initializing Inferno data dir at ${INFERNO_ROOT} (owner=${owner})"
-  mkdir -p "${INFERNO_ROOT}"/{images,vms,volumes,logs,tmp}
+  mkdir -p "${INFERNO_ROOT}"/{images,vms,volumes,logs,logs/vm,tmp}
   chgrp -R inferno "${INFERNO_ROOT}" 2>/dev/null || true
   chmod -R g+rwXs "${INFERNO_ROOT}" 2>/dev/null || true
 
@@ -761,60 +668,82 @@ cmd_init() {
   else
     warn "database.sh not loaded; skipping DB schema init."
   fi
-    
-  # Start the global VM logs socket
-  ensure_global_vm_logs_socket
 
   success "Init complete."
 }
 
 cmd_logs() {
   local action="${1:-tail}"
-  local global_log_file="${INFERNO_ROOT}/logs/vm_combined.log"
-    
+  shift
+
+  local vm_filter=""
+  local source_filter=""
+  local level_filter=""
+  local format="human"
+  local lines="50"
+
+  # Parse flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vm)     vm_filter="$2"; shift 2;;
+      --source) source_filter="$2"; shift 2;;
+      --level)  level_filter="$2"; shift 2;;
+      --json)   format="json"; shift;;
+      --lines|-n) lines="$2"; shift 2;;
+      *) break;;
+    esac
+  done
+
+  # Determine log file
+  if [[ -z "$vm_filter" ]]; then
+    local file="${INFERNO_ROOT}/logs/inferno.log"
+  else
+    local file="${INFERNO_ROOT}/logs/vm/${vm_filter}.log"
+  fi
+
+  [[ ! -f "$file" ]] && die 1 "Log file not found: $file"
+
   case "$action" in
-    start)
-      ensure_global_vm_logs_socket
-      ;;
-    stop)
-      stop_global_vm_logs_socket
-      info "Global VM logs socket stopped"
-      ;;
-    restart)
-      stop_global_vm_logs_socket
-      sleep 1
-      ensure_global_vm_logs_socket
-      ;;
     tail)
-      if [[ -f "$global_log_file" ]]; then
-        tail -f "$global_log_file"
+      if [[ "$format" == "json" ]]; then
+        tail -f "$file" | _apply_log_filters "$source_filter" "$level_filter"
       else
-        warn "No VM logs found at $global_log_file"
-        return 1
+        tail -f "$file" | _apply_log_filters "$source_filter" "$level_filter" | _format_logs_human
       fi
       ;;
-    clear)
-      true > "$global_log_file"
-      info "Cleared VM logs"
-      ;;
-    status)
-      local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
-      if [[ -S "$global_socket" ]] && echo "test" | timeout 1 socat - "UNIX-CONNECT:${global_socket}" &>/dev/null; then
-        info "Global VM logs socket is running"
-        local pid_file="${INFERNO_ROOT}/logs/vm_logs.pid"
-        if [[ -f "$pid_file" ]]; then
-          info "PID: $(cat "$pid_file")"
-        fi
+    show)
+      if [[ "$format" == "json" ]]; then
+        tail -n "$lines" "$file" | _apply_log_filters "$source_filter" "$level_filter"
       else
-        warn "Global VM logs socket is not running"
-        return 1
+        tail -n "$lines" "$file" | _apply_log_filters "$source_filter" "$level_filter" | _format_logs_human
       fi
       ;;
     *)
-      echo "Usage: infernoctl logs {start|stop|restart|status|tail|clear}"
+      echo "Usage: infernoctl logs {tail|show} [--vm <name>] [--source <source>] [--level <level>] [--json]"
       return 1
       ;;
   esac
+}
+
+_apply_log_filters() {
+  local source="$1" level="$2"
+  local jq_filter='.'
+
+  [[ -n "$source" ]] && jq_filter+=" | select(.source == \"$source\")"
+  [[ -n "$level" ]] && jq_filter+=" | select(.level == \"$level\")"
+
+  jq -c --unbuffered "$jq_filter"
+}
+
+_format_logs_human() {
+  jq -r --unbuffered '
+    .timestamp as $ts |
+    .level as $lvl |
+    .source as $src |
+    .vm_id as $vm |
+    .message as $msg |
+    "\($ts | sub("\\.[0-9]+Z$"; "Z")) [\($lvl)] [\($src)] \($vm): \($msg)"
+  '
 }
 
 cmd_reconcile() {
@@ -1530,7 +1459,7 @@ EOF
     || { rm -rf "$base"; die 1 "Failed to generate kiln.json"; }
   else
     cat >"$chroot_dir/kiln.json" <<EOF
-{"jail_id":"${version}","machine_id":"${name}","uid":${DEFAULT_JAIL_UID:-123},"gid":${DEFAULT_JAIL_GID:-100},"resources":{"cpu_count":${vcpus},"memory_mb":${memory},"cpu_kind":"C3"},"log":{"format":"text","timestamp":true,"debug":true},"firecracker_socket_path":"firecracker.sock","firecracker_config_path":"firecracker.json","firecracker_vsock_uds_path":"control.sock","vsock_stdout_port":10000,"vsock_exit_port":10001,"vm_logs_socket_path":"vm_logs.sock","exit_status_path":"exit_status.json"}
+{"jail_id":"${version}","machine_id":"${name}","uid":${DEFAULT_JAIL_UID:-123},"gid":${DEFAULT_JAIL_GID:-100},"resources":{"cpu_count":${vcpus},"memory_mb":${memory},"cpu_kind":"C3"},"log":{"format":"text","timestamp":true,"debug":true},"firecracker_socket_path":"firecracker.sock","firecracker_config_path":"firecracker.json","firecracker_vsock_uds_path":"control.sock","vsock_stdout_port":10000,"vsock_exit_port":10001,"log_dir":"./logs","log_rotation":{"max_size_mb":${INFERNO_LOG_MAX_SIZE_MB:-100},"max_files":${INFERNO_LOG_MAX_FILES:-5},"max_age_days":${INFERNO_LOG_MAX_AGE_DAYS:-30},"compress":${INFERNO_LOG_COMPRESS:-true}},"exit_status_path":"exit_status.json"}
 EOF
   fi
   unset INFERNO_JAILER_ID
@@ -1685,27 +1614,6 @@ cmd_start() {
   fi
   # === END EPHEMERAL SNAPSHOT CREATION =========================================
 
-  # Start global VM logs socket if not running
-  ensure_global_vm_logs_socket || warn "Global VM logs socket not available"
-
-  # Hard link the global VM logs socket into the chroot
-  log "Linking VM logs socket into jail..."
-  
-  local global_socket="${INFERNO_ROOT}/logs/vm_logs.sock"
-  local jail_socket="$CHROOT_DIR/vm_logs.sock"
-  
-  if [[ -S "$global_socket" ]]; then
-      rm -f "$jail_socket" 2>/dev/null || true
-      if ln "$global_socket" "$jail_socket"; then
-          chown "${JAIL_UID}:${JAIL_GID}" "$jail_socket" 2>/dev/null || true
-          debug "Hard linked VM logs socket to jail"
-      else
-          warn "Failed to hard link VM logs socket - VM logs may not work"
-      fi
-  else
-      warn "Global VM logs socket not found at $global_socket"
-  fi
-
   # Verify kiln.json has correct UID/GID expectations
   _verify_kiln_ids "$CHROOT_DIR" "${JAIL_UID}" "${JAIL_GID}"
 
@@ -1741,7 +1649,22 @@ cmd_start() {
     --cgroup "memory.max=${memory_bytes}"
   )
 
-  mkdir -p "${INFERNO_ROOT}/logs"
+  mkdir -p "${INFERNO_ROOT}/logs/vm"
+
+  # Ensure logs directories are writable by jailed UID/GID (for lumberjack to create log files)
+  chown "${JAIL_UID}:${JAIL_GID}" "${INFERNO_ROOT}/logs" 2>/dev/null || true
+  chown "${JAIL_UID}:${JAIL_GID}" "${INFERNO_ROOT}/logs/vm" 2>/dev/null || true
+  chmod 755 "${INFERNO_ROOT}/logs" 2>/dev/null || true
+  chmod 755 "${INFERNO_ROOT}/logs/vm" 2>/dev/null || true
+
+  # Bind mount logs directory into chroot so kiln can write logs
+  mkdir -p "${CHROOT_DIR}/logs"
+  if ! mount --bind "${INFERNO_ROOT}/logs" "${CHROOT_DIR}/logs"; then
+    warn "Failed to bind mount logs directory"
+  else
+    debug "Bind mounted ${INFERNO_ROOT}/logs to ${CHROOT_DIR}/logs"
+  fi
+
   info "Starting ${name} with jailer (jail_id=${version}, uid=${JAIL_UID}, gid=${JAIL_GID})"
   info "Exec file (host): $KILN_EXEC"
   info "Jail root:        ${CHROOT_DIR}"
@@ -1911,11 +1834,11 @@ cmd_stop() {
         "${CHROOT_DIR}/kiln.pid" \
         "${CHROOT_DIR}/firecracker.pid" \
         "${CHROOT_DIR}/firecracker.sock" \
-        "${CHROOT_DIR}/vm_logs.sock" \
         "${CHROOT_DIR}/control.sock" 2>/dev/null || true
   rm -f "${CHROOT_DIR}"/control.sock_* 2>/dev/null || true
 
   # unmount the logs bind (best-effort)
+  umount -l "${CHROOT_DIR}/logs" 2>/dev/null || true
   umount -l "${CHROOT_DIR}/run/inferno" 2>/dev/null || true
 
   local still=""
@@ -2027,6 +1950,7 @@ cmd_destroy() {
   fi
 
   # unmount logs bind before deleting chroot
+  umount -l "${CHROOT_DIR}/logs" 2>/dev/null || true
   umount -l "${CHROOT_DIR}/run/inferno" 2>/dev/null || true
 
   # Chroot cleanup

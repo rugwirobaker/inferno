@@ -79,7 +79,7 @@ func TestLoggerWriteToFile(t *testing.T) {
 	defer cancel()
 
 	// Initialize the logger with functional options
-	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogSink(ctx, factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 	defer logger.Close()
 
@@ -124,7 +124,7 @@ func TestLoggerWriteToMockWriter(t *testing.T) {
 	defer cancel()
 
 	// Initialize the logger with functional options
-	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogSink(ctx, factory, vm.WithQueueSize(100), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 	defer logger.Close()
 
@@ -167,7 +167,7 @@ func TestConcurrentLogging(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// Initialize the logger with functional options
-	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(1000), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogSink(ctx, factory, vm.WithQueueSize(1000), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 	defer logger.Close()
 
@@ -219,7 +219,7 @@ func TestLoggerCloseBehavior(t *testing.T) {
 	defer cancel()
 
 	// Initialize the logger with functional options
-	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogSink(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 
 	// Log a message
@@ -254,7 +254,7 @@ func TestLoggerContextCancellation(t *testing.T) {
 	// Initialize the logger with a context
 	ctx, cancel := context.WithCancel(context.Background())
 
-	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogSink(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err)
 
 	// Log a message before context cancellation
@@ -304,7 +304,7 @@ func TestLoggerWriterRenewal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	logger, err := vm.NewLogger(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
+	logger, err := vm.NewLogSink(ctx, factory, vm.WithQueueSize(10), vm.WithFlushTimeout(2*time.Second))
 	assert.NoError(err, "Failed to create logger")
 	defer logger.Close()
 

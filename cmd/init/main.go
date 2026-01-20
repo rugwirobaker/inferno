@@ -213,7 +213,7 @@ func main() {
 	supervisor := process.NewSupervisor(exitClient)
 
 	// Create and add primary process
-	primary := primary.New(config.Process, config.Env)
+	primary := primary.New(config.Process, config.Env, config.ID)
 	supervisor.Add(primary, stdoutConn)
 	supervisor.SetPrimary(primary)
 
@@ -286,34 +286,31 @@ func configureLoggerWithOutput(c *image.Config, output io.Writer) error {
 		LogLevel.Set(slog.LevelDebug)
 	}
 
-	opts := slog.HandlerOptions{Level: &LogLevel}
-
-	if !c.Log.Timestamp {
-		opts.ReplaceAttr = removeTime
+	opts := slog.HandlerOptions{
+		Level: &LogLevel,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			// Standardize field names to match our LogEntry format
+			if a.Key == slog.TimeKey {
+				if !c.Log.Timestamp {
+					return slog.Attr{} // Remove timestamp if disabled
+				}
+				a.Key = "timestamp"
+			}
+			if a.Key == slog.MessageKey {
+				a.Key = "message"
+			}
+			return a
+		},
 	}
 
-	var handler slog.Handler
-	switch format := c.Log.Format; format {
-	case "kernel":
-		handler = NewKernelStyleHandler(output, "init", opts)
-	case "text":
-		handler = slog.NewTextHandler(output, &opts)
-	case "json":
-		handler = slog.NewJSONHandler(output, &opts)
-	default:
-		return fmt.Errorf("invalid log format: %q", format)
-	}
+	// Always use JSON handler with source="init" and vm_id attributes
+	handler := slog.NewJSONHandler(output, &opts).WithAttrs([]slog.Attr{
+		slog.String("source", "init"),
+		slog.String("vm_id", c.ID),
+	})
 
 	slog.SetDefault(slog.New(handler))
 	return nil
-}
-
-// removeTime removes the "time" field from slog.
-func removeTime(groups []string, a slog.Attr) slog.Attr {
-	if a.Key == slog.TimeKey {
-		return slog.Attr{}
-	}
-	return a
 }
 
 func switchRoot() error {

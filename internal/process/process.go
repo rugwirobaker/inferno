@@ -4,12 +4,15 @@ package process
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
 	"sync"
 	"syscall"
+
+	"github.com/rugwirobaker/inferno/internal/logging"
 )
 
 // Process defines the interface for managed processes in the VM
@@ -34,16 +37,18 @@ type ExitStatus struct {
 type Base struct {
 	Name      string
 	IsPrimary bool
+	VMID      string // VM identifier for log tagging
 
 	cmd  *exec.Cmd
 	done chan error
 	wg   sync.WaitGroup
 }
 
-func NewBaseProcess(name string, isPrimary bool) *Base {
+func NewBaseProcess(name string, isPrimary bool, vmID string) *Base {
 	return &Base{
 		Name:      name,
 		IsPrimary: isPrimary,
+		VMID:      vmID,
 		done:      make(chan error, 1),
 	}
 }
@@ -105,9 +110,37 @@ func (p *Base) StartWithOutput(output io.WriteCloser) error {
 func (p *Base) streamLogs(src io.ReadCloser, dst io.WriteCloser) {
 	defer src.Close()
 
+	var pid int
+	if p.cmd != nil && p.cmd.Process != nil {
+		pid = p.cmd.Process.Pid
+	}
+
 	scanner := bufio.NewScanner(src)
 	for scanner.Scan() {
-		_, err := fmt.Fprintln(dst, scanner.Text())
+		message := scanner.Text()
+		if message == "" {
+			continue
+		}
+
+		// Wrap each log line in JSON format
+		entry := logging.LogEntry{
+			Timestamp: "",  // Will be set by NewLogEntry
+			Level:     "INFO",
+			Source:    "container",
+			VMID:      p.VMID,
+			Message:   message,
+			PID:       pid,
+		}
+		entry.Timestamp = logging.NewLogEntry("INFO", "container", p.VMID, message).Timestamp
+
+		jsonBytes, err := json.Marshal(entry)
+		if err != nil {
+			slog.Error("Failed to marshal log entry", "error", err)
+			continue
+		}
+
+		// Write JSON line with newline (NDJSON format)
+		_, err = fmt.Fprintf(dst, "%s\n", jsonBytes)
 		if err != nil {
 			slog.Error("Failed to write log line", "error", err)
 			return

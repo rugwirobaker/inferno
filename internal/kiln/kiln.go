@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +27,7 @@ import (
 	"github.com/rugwirobaker/inferno/internal/vsock"
 	"github.com/spf13/cobra"
 	"github.com/valyala/bytebufferpool"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // New sets up the kiln command structure
@@ -176,13 +178,9 @@ func run(ctx context.Context) error {
 	cmd.Stdout = stdoutWriter
 	cmd.Stderr = stderrWriter
 
-	// Create a multiplexer to log the output while also passing it to the appropriate destination
-	go func() {
-		io.Copy(os.Stdout, stdoutReader) // Log to kiln's stdout
-	}()
-	go func() {
-		io.Copy(os.Stderr, stderrReader) // Log to kiln's stderr
-	}()
+	// Stream Firecracker stdout/stderr as JSON logs to inferno.log
+	go streamFirecrackerLogs(stdoutReader, "stdout")
+	go streamFirecrackerLogs(stderrReader, "stderr")
 
 	// some clean tasks to run at the end
 	var finalizers []FinalizerFunc
@@ -241,15 +239,34 @@ func run(ctx context.Context) error {
 
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
-		factory := vm.SocketWriterFactory(ctx, config.VMLogsSocketPath)
-		logger, err := vm.NewLogger(ctx, factory)
+
+		// Create log file writer with rotation using lumberjack
+		// Use MachineID for filename if available, otherwise fall back to JailID
+		logFilename := config.MachineID
+		if logFilename == "" {
+			logFilename = config.JailID
+		}
+		vmLogFile := &lumberjack.Logger{
+			Filename:   filepath.Join(config.LogDir, "vm", logFilename+".log"),
+			MaxSize:    config.LogRotation.MaxSizeMB,
+			MaxBackups: config.LogRotation.MaxFiles,
+			MaxAge:     config.LogRotation.MaxAgeDays,
+			Compress:   config.LogRotation.Compress,
+		}
+
+		// Create WriterFactory that returns the lumberjack logger
+		factory := func(ctx context.Context) (io.WriteCloser, error) {
+			return vmLogFile, nil
+		}
+
+		logSink, err := vm.NewLogSink(ctx, factory)
 		if err != nil {
-			slog.Error("Failed to create logger", "error", err)
+			slog.Error("Failed to create log sink", "error", err)
 			return
 		}
-		// add a finalizer to close the logger
+		// add a finalizer to close the log sink
 		finalizers = append(finalizers, func() error {
-			logger.Close()
+			logSink.Close()
 			return nil
 		})
 
@@ -262,7 +279,7 @@ func run(ctx context.Context) error {
 			slog.Debug("Accepted connection", "conn", conn)
 
 			go func() {
-				handleVMLogs(conn, logger)
+				handleVMLogs(conn, logSink)
 			}()
 		}
 	}()
@@ -323,7 +340,7 @@ func run(ctx context.Context) error {
 	}
 }
 
-func handleVMLogs(src net.Conn, logger *vm.Logger) {
+func handleVMLogs(src net.Conn, logSink *vm.LogSink) {
 	defer src.Close()
 
 	writeLine := func(line []byte) {
@@ -331,7 +348,7 @@ func handleVMLogs(src net.Conn, logger *vm.Logger) {
 		if lineStr == "" {
 			return
 		}
-		logger.Log(lineStr)
+		logSink.Log(lineStr)
 	}
 
 	reader := bufio.NewReader(src)
@@ -368,6 +385,26 @@ func handleVMLogs(src net.Conn, logger *vm.Logger) {
 	}
 }
 
+// streamFirecrackerLogs reads from a Firecracker stdout/stderr pipe and logs each line
+// using slog with source="firecracker". Since slog is configured to write to inferno.log,
+// this effectively sends Firecracker logs to the infrastructure log file.
+func streamFirecrackerLogs(reader io.Reader, stream string) {
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		// Log with source="firecracker" and stream type
+		// The slog handler is already configured with source="kiln" and vm_id,
+		// but we want to override source for Firecracker logs
+		slog.Info(line, "source", "firecracker", "stream", stream)
+	}
+	if err := scanner.Err(); err != nil {
+		slog.Error("Error reading Firecracker output", "error", err, "stream", stream)
+	}
+}
+
 func configureLogger(c *Config) error {
 	if c.Log.Debug {
 		LogLevel.Set(slog.LevelDebug)
@@ -375,32 +412,40 @@ func configureLogger(c *Config) error {
 		LogLevel.Set(slog.LevelInfo)
 	}
 
-	opts := slog.HandlerOptions{Level: &LogLevel}
-
-	if !c.Log.Timestamp {
-		opts.ReplaceAttr = removeTime
+	opts := slog.HandlerOptions{
+		Level: &LogLevel,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			// Standardize field names to match our LogEntry format
+			if a.Key == slog.TimeKey {
+				if !c.Log.Timestamp {
+					return slog.Attr{} // Remove timestamp if disabled
+				}
+				a.Key = "timestamp"
+			}
+			if a.Key == slog.MessageKey {
+				a.Key = "message"
+			}
+			return a
+		},
 	}
 
-	var handler slog.Handler
-	switch format := c.Log.Format; format {
-	case "text":
-		handler = slog.NewTextHandler(os.Stderr, &opts)
-	case "json":
-		handler = slog.NewJSONHandler(os.Stderr, &opts)
-	default:
-		return fmt.Errorf("invalid log format: %q", format)
+	// Create infrastructure log file writer with rotation
+	infraLogFile := &lumberjack.Logger{
+		Filename:   filepath.Join(c.LogDir, "inferno.log"),
+		MaxSize:    c.LogRotation.MaxSizeMB,
+		MaxBackups: c.LogRotation.MaxFiles,
+		MaxAge:     c.LogRotation.MaxAgeDays,
+		Compress:   c.LogRotation.Compress,
 	}
+
+	// Always use JSON handler for infrastructure logs, with source and vm_id attributes
+	handler := slog.NewJSONHandler(infraLogFile, &opts).WithAttrs([]slog.Attr{
+		slog.String("source", "kiln"),
+		slog.String("vm_id", c.JailID),
+	})
 
 	slog.SetDefault(slog.New(handler))
 	return nil
-}
-
-// removeTime removes the "time" field from slog.
-func removeTime(groups []string, a slog.Attr) slog.Attr {
-	if a.Key == slog.TimeKey {
-		return slog.Attr{}
-	}
-	return a
 }
 
 func initConfig(ctx context.Context, configPath string) (err error) {

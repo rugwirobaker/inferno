@@ -189,7 +189,7 @@ else
   DATADIR="$DATADIR_DEFAULT"
 fi
 
-mkdir -p "$DATADIR" "$DATADIR"/{vms,images,logs,tmp,volumes}
+mkdir -p "$DATADIR" "$DATADIR"/{vms,images,logs,logs/vm,tmp,volumes}
 chown -R "$USER_TO_ADD:inferno" "$DATADIR"
 chmod 2775 "$DATADIR"
 chmod 2750 "$DATADIR/vms" || true

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 
 	"github.com/rugwirobaker/inferno/internal/command"
 	"github.com/rugwirobaker/inferno/internal/config"
@@ -13,7 +14,6 @@ import (
 	"github.com/rugwirobaker/inferno/internal/image"
 	"github.com/rugwirobaker/inferno/internal/server"
 	"github.com/spf13/cobra"
-	"golang.org/x/sys/unix"
 )
 
 const defaultConfigFile = "/etc/inferno/inferno.yaml"
@@ -74,9 +74,9 @@ func runDaemon(ctx context.Context) error {
 		return fmt.Errorf("failed to ensure directories: %w", err)
 	}
 
-	// create the vm logs socket
-	if err := unix.Mkfifo(cfg.VMLogsSocketPath, 0o666); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("could not create vm logs fifo: %w", err)
+	// create the vm logs directory
+	if err := os.MkdirAll(filepath.Join(cfg.LogDir, "vm"), 0o755); err != nil {
+		return fmt.Errorf("could not create vm logs directory: %w", err)
 	}
 
 	// Ensure necessary files exist

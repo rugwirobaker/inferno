@@ -20,7 +20,8 @@ type Resources struct {
 
 // Config defines the full configuration for the Kiln jailer.
 type Config struct {
-	JailID string `json:"jail_id"`
+	JailID    string `json:"jail_id"`
+	MachineID string `json:"machine_id"` // VM name (for log files)
 
 	UID int `json:"uid"`
 	GID int `json:"gid"`
@@ -33,10 +34,20 @@ type Config struct {
 	VsockStdoutPort int `json:"vsock_stdout_port"` // receive stdout/stderr send over by the init
 	VsockExitPort   int `json:"vsock_exit_port"`   // receive exit code info from the init
 
-	VMLogsSocketPath string `json:"vm_logs_socket_path"`
-	ExitStatusPath   string `json:"exit_status_path"`
+	ExitStatusPath string `json:"exit_status_path"`
+
+	LogDir      string      `json:"log_dir"`      // directory for log files
+	LogRotation LogRotation `json:"log_rotation"` // log rotation settings
 
 	Resources Resources `json:"resources"`
+}
+
+// LogRotation defines settings for log file rotation
+type LogRotation struct {
+	MaxSizeMB  int  `json:"max_size_mb"`  // maximum size in MB before rotating
+	MaxFiles   int  `json:"max_files"`    // maximum number of rotated files to keep
+	MaxAgeDays int  `json:"max_age_days"` // maximum age in days before deleting old files
+	Compress   bool `json:"compress"`     // whether to compress rotated files
 }
 
 type Log struct {
@@ -63,8 +74,16 @@ func Default() *Config {
 		VsockStdoutPort: vsock.VsockStdoutPort,
 		VsockExitPort:   vsock.VsockExitPort,
 
-		VMLogsSocketPath: "vm_logs.sock",
-		ExitStatusPath:   "exit_status.json",
+		ExitStatusPath: "exit_status.json",
+
+		LogDir: "/var/lib/inferno/logs", // default, will be overridden
+
+		LogRotation: LogRotation{
+			MaxSizeMB:  100,
+			MaxFiles:   5,
+			MaxAgeDays: 30,
+			Compress:   true,
+		},
 
 		Log: Log{
 			Format:    "text",

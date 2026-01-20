@@ -55,7 +55,7 @@ func NewServer(cfg *image.Config) (*Server, error) {
 	}
 
 	return &Server{
-		Base:   process.NewBaseProcess("ssh", false),
+		Base:   process.NewBaseProcess("ssh", false, cfg.ID),
 		server: sshServer,
 		done:   make(chan error, 1),
 	}, nil

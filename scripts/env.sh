@@ -65,6 +65,12 @@ SCRIPTS_DIR="$(_expand_tilde "$SCRIPTS_DIR")"
 : "${ROOTFS_POOL_NAME:=rootfs_pool}"
 : "${ROOTFS_SIZE_MB:=5120}"                # 5GB static size for all rootfs
 
+# Log rotation defaults (used by kiln for JSON log files)
+: "${INFERNO_LOG_MAX_SIZE_MB:=100}"    # Max log file size before rotation (MB)
+: "${INFERNO_LOG_MAX_FILES:=5}"        # Max number of rotated log files to keep
+: "${INFERNO_LOG_MAX_AGE_DAYS:=30}"    # Max age of rotated logs (days)
+: "${INFERNO_LOG_COMPRESS:=true}"      # Compress rotated log files
+
 # HAProxy defaults (used by haproxy.sh unless overridden)
 : "${HAPROXY_CFG:=/etc/haproxy/haproxy.cfg}"
 : "${HAPROXY_ENABLE:=1}"          # 1=managed by systemd reload/restart
@@ -87,6 +93,10 @@ export INFERNO_ROOTFS_LVM_ENABLED
 export ROOTFS_VG_NAME
 export ROOTFS_POOL_NAME
 export ROOTFS_SIZE_MB
+export INFERNO_LOG_MAX_SIZE_MB
+export INFERNO_LOG_MAX_FILES
+export INFERNO_LOG_MAX_AGE_DAYS
+export INFERNO_LOG_COMPRESS
 export HAPROXY_CFG
 export HAPROXY_ENABLE
 export HAPROXY_MODE

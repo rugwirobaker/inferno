@@ -12,8 +12,9 @@ import (
 	"github.com/jpillora/backoff"
 )
 
-// Logger handles logging with queued entries and a retriable writer.
-type Logger struct {
+// LogSink handles logging with queued entries and a retriable writer.
+// It acts as a sink for log messages, buffering and reliably writing them to the destination.
+type LogSink struct {
 	writer       io.WriteCloser
 	logChan      chan string
 	wg           sync.WaitGroup
@@ -44,11 +45,11 @@ func WithFlushTimeout(timeout time.Duration) Option {
 	}
 }
 
-// NewLogger initializes the Logger with a RetriableWriter.
+// NewLogSink initializes the LogSink with a RetriableWriter.
 // - factory: Function to create new WriterCloser instances.
 // - queueSize: Size of the log entry queue.
 // - flushTimeout: Maximum time to wait during flush.
-func NewLogger(ctx context.Context, factory WriterFactory, opts ...Option) (*Logger, error) {
+func NewLogSink(ctx context.Context, factory WriterFactory, opts ...Option) (*LogSink, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	var options = Options{
@@ -66,7 +67,7 @@ func NewLogger(ctx context.Context, factory WriterFactory, opts ...Option) (*Log
 		return nil, err
 	}
 
-	logger := &Logger{
+	logSink := &LogSink{
 		writer:       retriableWriter,
 		logChan:      make(chan string, options.QueueSize),
 		flushTimeout: options.FlushTimeout,
@@ -74,14 +75,14 @@ func NewLogger(ctx context.Context, factory WriterFactory, opts ...Option) (*Log
 		cancel:       cancel,
 	}
 
-	logger.wg.Add(1)
-	go logger.processLogs()
+	logSink.wg.Add(1)
+	go logSink.processLogs()
 
-	return logger, nil
+	return logSink, nil
 }
 
 // processLogs listens to logChan and writes logs using RetriableWriter.
-func (l *Logger) processLogs() {
+func (l *LogSink) processLogs() {
 	defer l.wg.Done()
 	for {
 		select {
@@ -100,7 +101,7 @@ func (l *Logger) processLogs() {
 }
 
 // writeLog formats the log entry and writes it using fmt.Fprintln.
-func (l *Logger) writeLog(logEntry string) {
+func (l *LogSink) writeLog(logEntry string) {
 	// Use fmt.Fprintln to format the log entry with a newline
 	_, err := fmt.Fprintln(l.writer, logEntry)
 	if err != nil {
@@ -110,7 +111,7 @@ func (l *Logger) writeLog(logEntry string) {
 
 // Log queues a log entry for processing.
 // Returns io.EOF if the logger has been closed.
-func (l *Logger) Log(entry string) error {
+func (l *LogSink) Log(entry string) error {
 	select {
 	case <-l.ctx.Done():
 		return io.EOF
@@ -135,7 +136,7 @@ func (l *Logger) Log(entry string) error {
 }
 
 // Close is an alias for Flush.
-func (l *Logger) Close() {
+func (l *LogSink) Close() {
 	l.once.Do(func() {
 		l.mu.Lock()
 		l.closed = true

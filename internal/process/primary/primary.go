@@ -16,9 +16,9 @@ type Primary struct {
 	env    map[string]string
 }
 
-func New(config image.Process, env map[string]string) *Primary {
+func New(config image.Process, env map[string]string, vmID string) *Primary {
 	return &Primary{
-		Base:   process.NewBaseProcess("primary", true),
+		Base:   process.NewBaseProcess("primary", true, vmID),
 		config: config,
 		env:    env,
 	}

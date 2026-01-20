@@ -171,7 +171,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		// create kiln config
-		kilnConfig, err := kilnConfig(id, filepath.Base(cfg.VMLogsSocketPath), kiln.Resources{
+		kilnConfig, err := kilnConfig(id, cfg.LogDir, kiln.Resources{
 			CPUKind:  req.CPUKind,
 			CPUCount: req.CPUCount,
 			MemoryMB: req.MemoryMB,
@@ -190,8 +190,7 @@ func Run(cfg *config.Config, images *image.Manager) http.HandlerFunc {
 		}
 
 		vm := vm.New(id, &vm.Config{
-			Chroot:      chroot,
-			LogPathSock: cfg.VMLogsSocketPath,
+			Chroot: chroot,
 		})
 
 		if err := vm.Start(ctx); err != nil {
@@ -299,7 +298,7 @@ func firecrackerConfig(id, chroot, initrdPath string) (*firecracker.Config, erro
 	return fcConfig, nil
 }
 
-func kilnConfig(id, logSocket string, resources kiln.Resources) (*kiln.Config, error) {
+func kilnConfig(id, logDir string, resources kiln.Resources) (*kiln.Config, error) {
 	return &kiln.Config{
 		JailID:                  id,
 		UID:                     firecracker.DefaultJailerUID,
@@ -311,9 +310,15 @@ func kilnConfig(id, logSocket string, resources kiln.Resources) (*kiln.Config, e
 		VsockStdoutPort: vsock.VsockStdoutPort,
 		VsockExitPort:   vsock.VsockExitPort,
 
-		VMLogsSocketPath: logSocket,
-		ExitStatusPath:   "exit-status.json",
-		Resources:        resources,
+		LogDir:      logDir,
+		LogRotation: kiln.LogRotation{
+			MaxSizeMB:  100,
+			MaxFiles:   5,
+			MaxAgeDays: 30,
+			Compress:   true,
+		},
+		ExitStatusPath: "exit-status.json",
+		Resources:      resources,
 	}, nil
 }
 
