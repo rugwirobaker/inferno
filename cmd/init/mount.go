@@ -101,15 +101,20 @@ func MountRootFS(device, fstype string, options []string) error {
 		return fmt.Errorf("failed to mount root filesystem: %w", err)
 	}
 
-	// Prepare /dev in new root
+	// Prepare /dev in new root (but don't move it yet - that happens after volume unlock)
 	if err := os.MkdirAll("/rootfs/dev", chmod0755); err != nil {
 		return fmt.Errorf("failed to create /rootfs/dev: %w", err)
 	}
 
+	return nil
+}
+
+// MoveDevToNewRoot moves /dev to the new root after volumes are unlocked
+// This must be called AFTER unlockEncryptedVolumes so that /dev/vdb and /dev/mapper/* are accessible
+func MoveDevToNewRoot() error {
 	if err := syscall.Mount("/dev", "/rootfs/dev", "", syscall.MS_MOVE, ""); err != nil {
 		return fmt.Errorf("failed to move /dev to new root: %w", err)
 	}
-
 	return nil
 }
 
