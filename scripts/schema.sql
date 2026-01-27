@@ -53,9 +53,34 @@ CREATE TABLE IF NOT EXISTS volumes (
     device_path TEXT UNIQUE NOT NULL,      -- e.g. /dev/inferno_vg/vol_3q80vd3xyxkrgzy6
     size_gb INTEGER NOT NULL,
     vm_id INTEGER,                         -- nullable for unattached volumes
+    encrypted BOOLEAN NOT NULL DEFAULT TRUE,  -- encryption enabled by default
+    state TEXT NOT NULL DEFAULT 'available' CHECK(state IN ('available', 'attaching', 'attached', 'detaching', 'error')),
+    active_source_checkpoint_id INTEGER,   -- which checkpoint is the volume currently based on
+    destination TEXT NOT NULL DEFAULT '/data',  -- mount point in guest
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (vm_id) REFERENCES vms(id)
+    FOREIGN KEY (vm_id) REFERENCES vms(id) ON DELETE SET NULL,
+    FOREIGN KEY (active_source_checkpoint_id) REFERENCES volume_checkpoints(id)
 );
+
+-- Volume checkpoints (snapshots)
+CREATE TABLE IF NOT EXISTS volume_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    volume_id INTEGER NOT NULL,
+    lv_name TEXT UNIQUE NOT NULL,          -- vol_xxx_cp_001, vol_xxx_cp_002, etc.
+    sequence_num INTEGER NOT NULL,         -- monotonic counter per volume
+    source_checkpoint_id INTEGER,          -- parent checkpoint for lineage tracking
+    type TEXT NOT NULL DEFAULT 'user' CHECK(type IN ('user', 'pre_restore', 'scheduled')),
+    comment TEXT,                          -- user-provided description
+    size_mb INTEGER,                       -- exclusive size if tracked
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_checkpoint_id) REFERENCES volume_checkpoints(id),
+    UNIQUE(volume_id, sequence_num)
+);
+
+-- Index for checkpoint queries
+CREATE INDEX IF NOT EXISTS idx_volume_checkpoints_volume ON volume_checkpoints(volume_id, sequence_num DESC);
+CREATE INDEX IF NOT EXISTS idx_volume_checkpoints_source ON volume_checkpoints(source_checkpoint_id);
 
 -- Add to vm_details view
 CREATE VIEW IF NOT EXISTS vm_details AS

@@ -242,6 +242,8 @@ delete_vm() {
     result=$(
         sqlite3 "$DB_PATH" <<EOF
 BEGIN TRANSACTION;
+-- Detach volumes before deleting VM
+UPDATE volumes SET vm_id = NULL, state = 'available' WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');
 -- Delete associated records first (due to foreign key constraints)
 DELETE FROM network_state WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');
 DELETE FROM routes WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');
@@ -286,10 +288,11 @@ vm_exists() {
     [[ $count -gt 0 ]]
 }
 
-# Volume management functions (unchanged)
+# Volume management functions
 create_volume() {
     local name="$1"
     local size_gb="$2"
+    local encrypted="${3:-1}"  # Default to encrypted (1=true, 0=false)
 
     local volume_id=$(generate_volume_id)
     local device_path="/dev/$VG_NAME/$volume_id"
@@ -299,21 +302,34 @@ create_volume() {
         return 1
     fi
 
-    # Format the volume
-    if ! format_volume "$device_path"; then
-        return 1
+    # Format the volume (encrypted or unencrypted)
+    if [[ "$encrypted" == "1" ]]; then
+        log "Creating encrypted volume..."
+        if ! setup_encrypted_volume "$volume_id" "$device_path"; then
+            error "Failed to setup encrypted volume"
+            delete_lv "$volume_id" 2>/dev/null || true
+            return 1
+        fi
+    else
+        log "Creating unencrypted volume..."
+        if ! format_volume "$device_path"; then
+            error "Failed to format volume"
+            delete_lv "$volume_id" 2>/dev/null || true
+            return 1
+        fi
     fi
 
     local result
     result=$(
         sqlite3 "$DB_PATH" <<EOF
-INSERT INTO volumes (volume_id, name, size_gb, device_path)
-VALUES ('$volume_id', '$name', $size_gb, '$device_path')
+INSERT INTO volumes (volume_id, name, size_gb, device_path, encrypted)
+VALUES ('$volume_id', '$name', $size_gb, '$device_path', $encrypted)
 RETURNING json_object(
     'volume_id', volume_id,
     'name', name,
     'size_gb', size_gb,
     'device_path', device_path,
+    'encrypted', encrypted,
     'created_at', created_at
 );
 EOF
