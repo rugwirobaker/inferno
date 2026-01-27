@@ -24,6 +24,7 @@ type Config struct {
 	VsockStdoutPort int `json:"vsock_stdout_port"` // send stdout/stderr to the host
 	VsockExitPort   int `json:"vsock_exit_port"`   // send exit code to the host
 	VsockAPIPort    int `json:"vsock_api_port"`    // serves a utility API in the guest init
+	VsockKeyPort    int `json:"vsock_key_port"`    // request encryption keys from the host
 
 }
 
@@ -75,6 +76,7 @@ type Volume struct {
 	Device     string   `json:"device"`      // e.g. /dev/vda
 	MountPoint string   `json:"mount_point"` // e.g. / for root, /data for others
 	FSType     string   `json:"fs_type"`     // e.g. ext4
+	Encrypted  bool     `json:"encrypted"`   // true if volume is LUKS-encrypted
 	Options    []string `json:"options,omitempty"`
 }
 

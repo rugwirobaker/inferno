@@ -107,9 +107,10 @@ generate_firecracker_config() {
   # Optional data volume as /dev/vdb (init will mount it via run.json)
   if [[ -n "$volume_id" ]]; then
     config="$(jq --arg vol_id "$volume_id" \
+                 --arg vg_name "$VG_NAME" \
       '.drives += [{
          "drive_id": $vol_id,
-         "path_on_host": ("/dev/inferno_vg/" + $vol_id),
+         "path_on_host": ("/dev/" + $vg_name + "/" + $vol_id),
          "is_root_device": false,
          "is_read_only": false
        }]' <<<"$config")"
@@ -151,11 +152,25 @@ generate_run_config() {
 
   # Optional /data volume
   if [[ -n "$volume_id" ]]; then
+    # Read mount point and encryption flag from database
+    local mount_point encrypted
+    mount_point="$(sqlite3 "$DB_PATH" "SELECT destination FROM volumes WHERE volume_id = '$volume_id';" 2>/dev/null)" || mount_point="/data"
+    [[ -z "$mount_point" ]] && mount_point="/data"
+    encrypted="$(sqlite3 "$DB_PATH" "SELECT encrypted FROM volumes WHERE volume_id = '$volume_id';" 2>/dev/null)" || encrypted="0"
+    [[ -z "$encrypted" ]] && encrypted="0"
+
+    # Convert 0/1 to false/true for JSON boolean
+    local encrypted_bool="false"
+    [[ "$encrypted" == "1" ]] && encrypted_bool="true"
+
     mounts_json="$(jq \
+      --arg mount_point "$mount_point" \
+      --argjson encrypted "$encrypted_bool" \
       '.volumes += [{
         "device": "/dev/vdb",
-        "mount_point": "/data",
+        "mount_point": $mount_point,
         "fs_type": "ext4",
+        "encrypted": $encrypted,
         "options": ["rw"]
       }]' <<<"$mounts_json")"
   fi
@@ -181,6 +196,7 @@ generate_run_config() {
       vsock_stdout_port: 10000,
       vsock_exit_port: 10001,
       vsock_api_port: 10002,
+      vsock_key_port: 10003,
       ips: [
         { ip: $guest_ip, gateway: $gateway_ip, mask: 30 }
       ]
