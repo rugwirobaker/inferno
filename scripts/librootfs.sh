@@ -105,7 +105,7 @@ rootfs_create_base() {
 
     local lv_name
     lv_name="$(rootfs_base_lv_name "$digest")"
-    local lv_path="/dev/mapper/${ROOTFS_VG_NAME}-${lv_name}"
+    local lv_path="/dev/${ROOTFS_VG_NAME}/${lv_name}"
 
     log "Creating base image LV: $lv_name (${size_mb}MB)"
 
@@ -225,7 +225,7 @@ rootfs_create_snapshot() {
     # Generate snapshot name
     local snap_lv
     snap_lv="$(rootfs_snapshot_lv_name "$vm_name" "$version")"
-    local snap_path="/dev/mapper/${ROOTFS_VG_NAME}-${snap_lv}"
+    local snap_path="/dev/${ROOTFS_VG_NAME}/${snap_lv}"
 
     # Check for existing snapshot (cleanup from crash)
     if lvs "$ROOTFS_VG_NAME/$snap_lv" >/dev/null 2>&1; then

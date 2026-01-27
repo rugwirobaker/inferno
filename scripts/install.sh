@@ -27,6 +27,7 @@ CREATE_GROUP="${CREATE_GROUP:-1}"
 HAPROXY_MODE="${HAPROXY_MODE:-}"            # "worker" | "edge"
 HAPROXY_BIND="${HAPROXY_BIND:-auto}"        # "auto" or IP
 ROOTFS_DISK="${ROOTFS_DISK:-}"              # Disk device for LVM rootfs VG (e.g., /dev/sdb)
+DATA_DISK="${DATA_DISK:-}"                  # Disk device for LVM data VG (e.g., /dev/sdc)
 
 # Release asset names (if you use prod mode)
 ASSET_INFERNO_AMD64="inferno_Linux_x86_64.tar.gz"
@@ -42,7 +43,7 @@ KERNEL_LIST_URL="http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/v1
 
 usage() {
   cat <<EOF
-Usage: sudo ./scripts/install.sh --mode dev|prod [--rootfs-disk /dev/sdX]
+Usage: sudo ./scripts/install.sh --mode dev|prod [--rootfs-disk /dev/sdX] [--data-disk /dev/sdY]
        [--prefix PATH] [--libdir PATH] [--scripts-dir PATH]
        [--sharedir PATH] [--etcdir PATH] [--data-dir PATH]
        [--repo ORG/REPO] [--release TAG] [--user USER] [--no-group]
@@ -50,12 +51,17 @@ Usage: sudo ./scripts/install.sh --mode dev|prod [--rootfs-disk /dev/sdX]
 
 Notes:
   - --mode controls defaults:
-      dev  -> INFERNO_ROOT=\$HOME/.local/share/inferno (for USER), auto-init DB as that USER
-      prod -> INFERNO_ROOT=/var/lib/inferno (unless --data-dir), do not auto-init DB
+      dev  -> INFERNO_ROOT=\$HOME/.local/share/inferno (for USER)
+      prod -> INFERNO_ROOT=/var/lib/inferno (unless --data-dir)
 
-  - --rootfs-disk is RECOMMENDED for LVM thin provisioning (5GB per base image with CoW):
+  - --rootfs-disk is OPTIONAL for VM rootfs LVM on dedicated disk:
       Example: --rootfs-disk /dev/sdb
-      Without it, Inferno falls back to file-based rootfs (1GB per VM, no deduplication)
+      Without it, 'infernoctl init' will auto-create loopback devices
+
+  - --data-disk is OPTIONAL for data volumes LVM on dedicated disk:
+      Example: --data-disk /dev/sdc
+      Can use same disk as rootfs or separate disk
+      Without it, 'infernoctl init' will auto-create loopback devices
 
 Compatibility:
   - Legacy env MODE=dev|prod is still honored if --mode is omitted.
@@ -87,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --haproxy) HAPROXY_MODE="$2"; shift 2;;
     --haproxy-bind) HAPROXY_BIND="$2"; shift 2;;
     --rootfs-disk) ROOTFS_DISK="$2"; shift 2;;
+    --data-disk) DATA_DISK="$2"; shift 2;;
     -h|--help) usage;;
     *) err "Unknown flag: $1";;
   esac
@@ -164,6 +171,15 @@ if [[ "$CREATE_GROUP" -eq 1 ]]; then
   else
     info "Group 'inferno' already exists"
   fi
+
+  # Create inferno system user for running services (like Anubis)
+  if ! id -u inferno >/dev/null 2>&1; then
+    info "Creating system user 'inferno'"
+    useradd --system --no-create-home --shell /usr/sbin/nologin --gid inferno inferno
+  else
+    info "User 'inferno' already exists"
+  fi
+
   if id -u "$USER_TO_ADD" >/dev/null 2>&1; then
     info "Adding $USER_TO_ADD to group 'inferno'"
     usermod -aG inferno "$USER_TO_ADD"
@@ -193,6 +209,11 @@ mkdir -p "$DATADIR" "$DATADIR"/{vms,images,logs,logs/vm,tmp,volumes}
 chown -R "$USER_TO_ADD:inferno" "$DATADIR"
 chmod 2775 "$DATADIR"
 chmod 2750 "$DATADIR/vms" || true
+
+# Create Anubis data directory (owned by inferno system user)
+mkdir -p /var/lib/anubis
+chown inferno:inferno /var/lib/anubis
+chmod 0750 /var/lib/anubis
 
 # ===== Helpers =====
 install_bin() { local src="$1" name="$2"; install -m 0755 -D "$src" "$PREFIX/bin/$name"; info "Installed $name -> $PREFIX/bin/$name"; }
@@ -236,8 +257,9 @@ if [[ "$MODE" == "dev" ]]; then
   [[ -x "$REPO_ROOT/firecracker"  ]] && install -m 0755 -D "$REPO_ROOT/firecracker" "$SHAREDIR/firecracker" || true
   [[ -x "$REPO_ROOT/bin/kiln"     ]] && install -m 0755 -D "$REPO_ROOT/bin/kiln" "$SHAREDIR/kiln" || true
   [[ -x "$REPO_ROOT/bin/init"     ]] && install -m 0755 -D "$REPO_ROOT/bin/init" "$SHAREDIR/init" || true
+  [[ -x "$REPO_ROOT/bin/anubis"   ]] && install -m 0755 -D "$REPO_ROOT/bin/anubis" "$SHAREDIR/anubis" || true
   [[ -x "$REPO_ROOT/jailer"      ]] && install -m 0755 -D "$REPO_ROOT/jailer" "$SHAREDIR/jailer" || true
-  info "Installed kiln & init -> $SHAREDIR/"
+  info "Installed kiln, init, anubis -> $SHAREDIR/"
 
   if [[ -x "$REPO_ROOT/bin/inferno" ]]; then
     install_bin "$REPO_ROOT/bin/inferno" inferno
@@ -282,7 +304,7 @@ normalize_scripts_dir
 if [[ ! -x "$SHAREDIR/firecracker" || ! -x "$SHAREDIR/jailer" ]]; then
   info "Installing Firecracker + Jailer"
   # --- Pin Firecracker/jailer version ---
-  FC_VERSION="v1.9.1"
+  FC_VERSION="v1.14.1"
   case "$ARCH" in
     x86_64|amd64) FC_ARCH="x86_64" ;;
     aarch64|arm64) FC_ARCH="aarch64" ;;
@@ -297,8 +319,14 @@ if [[ ! -x "$SHAREDIR/firecracker" || ! -x "$SHAREDIR/jailer" ]]; then
   [[ -n "$FC_BIN" ]] || err "Firecracker binary not found in $TAR"
   install -m 0755 -D "$FC_BIN" "$SHAREDIR/firecracker"
 
-  [[ -n "$JAIL_BIN" ]] || err "Firecracker binary not found in $TAR"
+  [[ -n "$JAIL_BIN" ]] || err "Jailer binary not found in download"
   install -m 0755 -D "$JAIL_BIN" /usr/local/bin/jailer
+
+  # Verify installed versions
+  FC_INSTALLED_VERSION="$("$SHAREDIR/firecracker" --version 2>&1 | head -n1 || echo 'unknown')"
+  JAILER_INSTALLED_VERSION="$(jailer --version 2>&1 | head -n1 || echo 'unknown')"
+  info "Firecracker installed: $FC_INSTALLED_VERSION"
+  info "Jailer installed: $JAILER_INSTALLED_VERSION"
 
   rm -rf "$TMPFC"
 fi
@@ -317,6 +345,61 @@ if [[ ! -f "$SHAREDIR/vmlinux" ]]; then
   [[ -n "$latest_kernel_rel" ]] || err "Could not resolve latest vmlinux for ${FC_ARCH}"
   curl -fL "https://s3.amazonaws.com/spec.ccfc.min/${latest_kernel_rel}" -o "$SHAREDIR/vmlinux"
   chmod 0644 "$SHAREDIR/vmlinux"
+fi
+
+# ===== cryptsetup for volume encryption =====
+if [[ ! -x "$SHAREDIR/cryptsetup" ]]; then
+  info "Installing cryptsetup binary for volume encryption"
+
+  # Prefer system cryptsetup - we'll bundle libraries into initramfs
+  if command -v cryptsetup >/dev/null 2>&1; then
+    SYSTEM_CRYPT="$(command -v cryptsetup)"
+
+    # Check if it's glibc-based (compatible with library bundling)
+    if ldd "$SYSTEM_CRYPT" 2>&1 | grep -q "not a dynamic executable"; then
+      info "Using static system cryptsetup"
+      install -m 0755 -D "$SYSTEM_CRYPT" "$SHAREDIR/cryptsetup"
+      CRYPT_VERSION="$("$SHAREDIR/cryptsetup" --version | head -n1 || echo 'unknown')"
+      info "Cryptsetup installed: $CRYPT_VERSION (static)"
+    elif ldd "$SYSTEM_CRYPT" 2>&1 | grep -q "libc.so.6"; then
+      # glibc-based binary (compatible with our library bundling)
+      info "Using system cryptsetup (glibc-based, libraries will be bundled)"
+      install -m 0755 -D "$SYSTEM_CRYPT" "$SHAREDIR/cryptsetup"
+      CRYPT_VERSION="$("$SYSTEM_CRYPT" --version | head -n1 || echo 'unknown')"
+      info "Cryptsetup installed: $CRYPT_VERSION (dynamic, ~10MB with libraries)"
+    else
+      warn "System cryptsetup uses incompatible libc (musl?), attempting package install"
+      # Try to install glibc-based package
+      if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y cryptsetup-bin >/dev/null 2>&1 || true
+        if command -v cryptsetup >/dev/null 2>&1; then
+          SYSTEM_CRYPT="$(command -v cryptsetup)"
+          install -m 0755 -D "$SYSTEM_CRYPT" "$SHAREDIR/cryptsetup"
+          info "Cryptsetup installed via package manager"
+        fi
+      else
+        warn "Could not find glibc-based cryptsetup"
+      fi
+    fi
+  else
+    # No system cryptsetup, try to install via package manager
+    info "Attempting to install cryptsetup from system package manager"
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get install -y cryptsetup-bin >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache cryptsetup >/dev/null 2>&1 || true
+    fi
+
+    if command -v cryptsetup >/dev/null 2>&1; then
+      SYSTEM_CRYPT="$(command -v cryptsetup)"
+      install -m 0755 -D "$SYSTEM_CRYPT" "$SHAREDIR/cryptsetup"
+      CRYPT_VERSION="$("$SHAREDIR/cryptsetup" --version | head -n1 || echo 'unknown')"
+      info "Cryptsetup installed: $CRYPT_VERSION"
+    else
+      warn "Could not install cryptsetup, volume encryption will not work"
+      warn "To enable encryption: sudo apt-get install cryptsetup-bin (Debian/Ubuntu)"
+    fi
+  fi
 fi
 
 # ===== CLI wrapper in PATH (sources /etc/inferno/env) =====
@@ -362,102 +445,69 @@ EOF
   info "Wrote $ENVFILE"
 fi
 
-# ===== Dev-mode DB init happens automatically as target user =====
+# ===== Install Anubis config and systemd service =====
 if [[ "$MODE" == "dev" ]]; then
-  DB="$DATADIR/inferno.db"
-  if [[ -f "$DB" ]]; then
-    info "DB already exists at $DB; skipping init"
+  # Install Anubis config (independent service, not under ETCDIR)
+  if [[ -f "$REPO_ROOT/etc/anubis/config.toml" ]]; then
+    mkdir -p /etc/anubis
+    install -m 0640 -D "$REPO_ROOT/etc/anubis/config.toml" /etc/anubis/config.toml
+    chown root:inferno /etc/anubis/config.toml
+    info "Installed Anubis config -> /etc/anubis/config.toml"
   else
-    if command -v runuser >/dev/null 2>&1; then
-      info "Initializing DB as $USER_TO_ADD"
-      runuser -u "$USER_TO_ADD" -- infernoctl init || warn "infernoctl init failed for $USER_TO_ADD"
-    else
-      warn "runuser not available; please run 'infernoctl init' as $USER_TO_ADD"
-    fi
+    warn "Anubis config not found at $REPO_ROOT/etc/anubis/config.toml; skipping"
+  fi
+
+  # Install Anubis systemd service
+  if [[ -f "$REPO_ROOT/etc/anubis/anubis.service" ]]; then
+    install -m 0644 -D "$REPO_ROOT/etc/anubis/anubis.service" /etc/systemd/system/anubis.service
+    systemctl daemon-reload || true
+    info "Installed Anubis systemd service -> /etc/systemd/system/anubis.service"
+    info "To start Anubis: sudo systemctl enable anubis && sudo systemctl start anubis"
+  else
+    warn "Anubis service file not found at $REPO_ROOT/etc/anubis/anubis.service; skipping"
   fi
 fi
 
-# ===== Setup LVM rootfs VG =====
+# ===== Save LVM disk configuration for infernoctl init =====
+LVM_CONF="${ETCDIR}/lvm.conf"
+
+# Validate disks if specified
+if [[ -n "$ROOTFS_DISK" ]] && [[ ! -b "$ROOTFS_DISK" ]]; then
+  err "Rootfs disk not found: $ROOTFS_DISK (must be a block device)"
+fi
+
+if [[ -n "$DATA_DISK" ]] && [[ ! -b "$DATA_DISK" ]]; then
+  err "Data disk not found: $DATA_DISK (must be a block device)"
+fi
+
+# Save configuration
+cat > "$LVM_CONF" <<EOF
+# Inferno LVM Configuration
+# This file is read by 'infernoctl init' to set up LVM storage
+# Generated by install.sh on $(date)
+
+# Rootfs VG configuration
 ROOTFS_VG_NAME="${ROOTFS_VG_NAME:-inferno_rootfs_vg}"
 ROOTFS_POOL_NAME="${ROOTFS_POOL_NAME:-rootfs_pool}"
 ROOTFS_POOL_SIZE="${ROOTFS_POOL_SIZE:-20G}"
+ROOTFS_DISK="${ROOTFS_DISK:-}"
 
-if [[ -n "$ROOTFS_DISK" ]]; then
-  info "Setting up LVM rootfs on disk: $ROOTFS_DISK"
+# Data VG configuration
+DATA_VG_NAME="${VG_NAME:-inferno_vg}"
+DATA_POOL_NAME="${DATA_POOL_NAME:-vm_pool}"
+DATA_POOL_SIZE="${DATA_POOL_SIZE:-40G}"
+DATA_DISK="${DATA_DISK:-}"
+EOF
 
-  # Validate disk exists
-  if [[ ! -b "$ROOTFS_DISK" ]]; then
-    err "Disk not found: $ROOTFS_DISK (must be a block device)"
-  fi
+chmod 0644 "$LVM_CONF"
+info "Saved LVM configuration -> $LVM_CONF"
 
-  # Check if disk is mounted
-  if mount | grep -q "^${ROOTFS_DISK}"; then
-    err "Disk $ROOTFS_DISK is currently mounted. Unmount it first."
-  fi
-
-  # Warn if disk has partitions
-  if lsblk -n "$ROOTFS_DISK" | grep -q "part"; then
-    warn "Disk $ROOTFS_DISK has partitions. This will use the entire disk."
-    read -p "Continue? [y/N] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-      err "Aborted by user"
-    fi
-  fi
-
-  # Create physical volume if needed
-  if ! pvs "$ROOTFS_DISK" >/dev/null 2>&1; then
-    info "Creating physical volume on $ROOTFS_DISK..."
-    pvcreate "$ROOTFS_DISK" || err "Failed to create physical volume"
-  else
-    info "Physical volume already exists on $ROOTFS_DISK"
-  fi
-
-  # Create volume group if needed
-  if ! vgs "$ROOTFS_VG_NAME" >/dev/null 2>&1; then
-    info "Creating volume group: $ROOTFS_VG_NAME"
-    vgcreate "$ROOTFS_VG_NAME" "$ROOTFS_DISK" || err "Failed to create volume group"
-  else
-    info "Volume group already exists: $ROOTFS_VG_NAME"
-  fi
-
-  # Create thin pool if needed
-  if ! lvs "$ROOTFS_VG_NAME/$ROOTFS_POOL_NAME" >/dev/null 2>&1; then
-    info "Creating thin pool: $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME ($ROOTFS_POOL_SIZE)"
-    lvcreate -L "$ROOTFS_POOL_SIZE" -T "$ROOTFS_VG_NAME/$ROOTFS_POOL_NAME" \
-      || err "Failed to create thin pool"
-  else
-    info "Thin pool already exists: $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME"
-  fi
-
-  info "LVM rootfs setup complete!"
-  info "  Volume group: $ROOTFS_VG_NAME"
-  info "  Thin pool: $ROOTFS_POOL_NAME"
-  info "  Pool size: $ROOTFS_POOL_SIZE"
-
-elif vgs "$ROOTFS_VG_NAME" >/dev/null 2>&1; then
-  # VG exists but no disk was specified
-  info "LVM rootfs volume group detected: $ROOTFS_VG_NAME"
-
-  if lvs "$ROOTFS_VG_NAME/$ROOTFS_POOL_NAME" >/dev/null 2>&1; then
-    info "LVM rootfs available (thin pool: $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME)"
-  else
-    warn "Thin pool not found: $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME"
-    warn "  To create it manually:"
-    warn "    sudo lvcreate -L 20G -T $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME"
-  fi
-
+if [[ -n "$ROOTFS_DISK" ]] || [[ -n "$DATA_DISK" ]]; then
+  info "  Dedicated disks will be used by 'infernoctl init':"
+  [[ -n "$ROOTFS_DISK" ]] && info "    Rootfs: $ROOTFS_DISK"
+  [[ -n "$DATA_DISK" ]] && info "    Data: $DATA_DISK"
 else
-  # No VG and no disk specified
-  warn "LVM rootfs not configured!"
-  warn "  Inferno will fall back to file-based rootfs (1GB per VM, no deduplication)"
-  warn "  To enable LVM rootfs, re-run install with:"
-  warn "    sudo ./scripts/install.sh --mode $MODE --rootfs-disk /dev/sdX"
-  warn ""
-  warn "  Or create manually:"
-  warn "    sudo pvcreate /dev/sdX"
-  warn "    sudo vgcreate $ROOTFS_VG_NAME /dev/sdX"
-  warn "    sudo lvcreate -L 20G -T $ROOTFS_VG_NAME/$ROOTFS_POOL_NAME"
+  info "  No dedicated disks specified - loopback devices will be auto-created"
 fi
 
 # ===== Optional: seed HAProxy base (markers only) if requested =====
@@ -485,6 +535,21 @@ HACFG
     chmod 0644 "$cfg"
     info "Installed HAProxy base config -> $cfg"
   fi
+fi
+
+# ===== Verify installed versions =====
+if [[ -x "$SHAREDIR/firecracker" ]]; then
+  FC_VERSION_CHECK="$("$SHAREDIR/firecracker" --version 2>&1 | head -n1 || echo 'unknown')"
+  info "Firecracker version: $FC_VERSION_CHECK"
+else
+  warn "Firecracker not found at $SHAREDIR/firecracker"
+fi
+
+if [[ -x /usr/local/bin/jailer ]]; then
+  JAILER_VERSION_CHECK="$(jailer --version 2>&1 | head -n1 || echo 'unknown')"
+  info "Jailer version: $JAILER_VERSION_CHECK"
+else
+  warn "Jailer not found at /usr/local/bin/jailer"
 fi
 
 # ===== Final permissions (group-based sharing) =====
@@ -519,10 +584,10 @@ HAProxy:
   On an "edge" node, HAProxy will bind public :80 and forward to WORKER_TS_IP:80.
 
 Usage:
-  # Initialize DB/dirs as your user (non-root) [dev auto-runs this]:
-  infernoctl init
+  # Initialize data directory and LVM storage (requires root for LVM):
+  sudo infernoctl init
 
-  # Root-required actions (env exported by wrapper):
+  # Then create and manage VMs:
   sudo infernoctl create web1 --image nginx:latest
 EOM
 
