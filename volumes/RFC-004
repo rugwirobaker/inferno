@@ -1,0 +1,874 @@
+## RFC 004: Volume Encryption & Key Management
+
+**Authors:** Rugwiro Valentin · Platform Team
+
+**Date:** 2025-01-15
+
+**Status:** Draft
+
+**Depends On:** RFC-002 (Volumes), RFC-003 (Volume Identity & Location)
+
+---
+
+### 1. Abstract
+
+RFC-002 introduced Volumes as persistent block storage and deferred encryption to a future RFC. This document specifies **per-volume LUKS encryption** with keys managed by **HashiCorp Vault**. The design provides cryptographic tenant isolation: each volume has a unique encryption key that the host can only retrieve at VM boot time, and a separate backup key for S3 uploads. Hosts authenticate to Vault via AppRole, with policies managed by the control plane to ensure a host can only access keys for volumes it physically hosts.
+
+---
+
+### 2. Motivation
+
+#### 2.1 Threat Model
+
+| Threat | Mitigation |
+|--------|------------|
+| Physical disk theft | Data encrypted at rest with LUKS |
+| Decommissioned drive data recovery | Encrypted blocks unreadable without key |
+| Host compromise (volume detached) | Key not present on host |
+| Cross-tenant data access | Each volume has unique key; policies enforce isolation |
+| Backup exposure in S3 | Separate backup key; Vault policy separation |
+
+#### 2.2 Non-Goals
+
+This design does **not** protect against:
+
+| Threat | Reason |
+|--------|--------|
+| Compromised host reading attached volumes | Key must be in kernel memory while volume is open |
+| Malicious hypervisor with guest memory access | Requires guest-side encryption (different architecture) |
+| Control plane compromise | Can modify policies; mitigated by audit logging |
+
+These are inherent limitations of host-side encryption. True protection against a compromised hypervisor would require the guest to hold encryption keys, which is out of scope.
+
+#### 2.3 Design Principles
+
+1. **Just-in-time key access** — Keys retrieved only when a VM is about to boot
+2. **Key eviction on detach** — Keys removed from kernel when volume detaches
+3. **Control plane out of hot path** — Hosts authenticate directly to Vault
+4. **Separate backup keys** — Backup encryption independent of volume encryption
+5. **Policy-based authorization** — Vault enforces which hosts can access which keys
+
+---
+
+### 3. Scope
+
+| In Scope | Out of Scope |
+|----------|--------------|
+| LUKS encryption per thin volume | Full-disk encryption (Pattern 1) |
+| Vault AppRole authentication for hosts | mTLS / certificate-based auth |
+| Per-volume encryption and backup keys | Key rotation |
+| Vault Agent for token management | Guest-side encryption |
+| Policy management by control plane | Hardware Security Modules (HSM) |
+| Integration with attach/detach flows | Encryption for root disks |
+
+---
+
+### 4. Background Concepts
+
+This section provides context for team members less familiar with LUKS, Vault, or the device-mapper stack.
+
+#### 4.1 LUKS and the Storage Stack
+
+**LUKS** (Linux Unified Key Setup) is the standard for disk encryption on Linux. It provides a standardized header format for encrypted volumes, supports multiple passphrases/keys via "key slots," and uses the kernel's **dm-crypt** subsystem for transparent encryption.
+
+LUKS operates at the block device layer via **device-mapper**, the same kernel subsystem that powers LVM. When you "open" a LUKS container, dm-crypt creates a virtual block device (`/dev/mapper/name`) that encrypts writes and decrypts reads transparently.
+
+**Our storage stack with per-volume LUKS:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Thin Pool (vg_storage/thinpool)                  │
+│                                                                      │
+│   ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐     │
+│   │ vol-abc-active  │  │ vol-def-active  │  │ vol-ghi-active  │     │
+│   │    (thin LV)    │  │    (thin LV)    │  │    (thin LV)    │     │
+│   │   ┌─────────┐   │  │   ┌─────────┐   │  │   ┌─────────┐   │     │
+│   │   │  LUKS   │   │  │   │  LUKS   │   │  │   │  LUKS   │   │     │
+│   │   │container│   │  │   │container│   │  │   │container│   │     │
+│   │   └────┬────┘   │  │   └────┬────┘   │  │   └─────────┘   │     │
+│   └────────┼────────┘  └────────┼────────┘  └─────────────────┘     │
+│            │                    │                   │                │
+│            ▼                    ▼                   │                │
+│   /dev/mapper/vol-abc-crypt    vol-def-crypt     [locked]           │
+│        (unlocked)              (unlocked)                           │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│                        LVM Volume Group (vg_storage)                 │
+├──────────────────────────────────────────────────────────────────────┤
+│                      mdadm RAID 10 (/dev/md0)                        │
+├──────────────────────────────────────────────────────────────────────┤
+│        NVMe 0      │      NVMe 1      │     NVMe 2     │    NVMe 3   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Each thin LV is independently encrypted. When a volume is "locked," only encrypted blocks exist on disk. When "unlocked," dm-crypt holds the key in kernel memory and exposes a decrypted virtual device.
+
+**Alternative approach (not used):** LUKS below LVM encrypts the entire RAID device with a single key. Simpler operationally, but all tenants share one encryption boundary—insufficient for our isolation requirements.
+
+#### 4.2 Vault Policies
+
+A **policy** in Vault is a declarative rule that grants or denies access to specific paths in the secrets hierarchy. Policies follow a default-deny model: if no policy grants access, the request is denied.
+
+```hcl
+# Example: grant read access to a specific volume's encryption key
+path "secret/data/sparkd/volumes/vol_abc123/encryption-key" {
+  capabilities = ["read"]
+}
+```
+
+**Capabilities:**
+
+| Capability | Meaning |
+|------------|---------|
+| `read` | Retrieve secret data |
+| `create` | Create new secrets |
+| `update` | Modify existing secrets |
+| `delete` | Remove secrets |
+| `list` | Enumerate paths (not contents) |
+
+Policies are attached to **identities** (users, machines, applications). When a client authenticates, Vault determines which policies apply and evaluates every request against them.
+
+In our design, each volume gets two policies (`vol_xxx_encryption`, `vol_xxx_backup`), and the control plane attaches/detaches these policies to host identities as volumes are placed or migrated.
+
+#### 4.3 AppRole Authentication
+
+Vault supports many **auth methods**—ways for clients to prove their identity. Common options:
+
+| Auth Method | Use Case | How It Works |
+|-------------|----------|--------------|
+| **AppRole** | Machines, services | Role ID + Secret ID (like username + password for apps) |
+| **TLS Certificates** | High-security environments | Client presents X.509 cert; Vault validates against CA |
+| **AWS/GCP/Azure** | Cloud workloads | Instance metadata proves identity via cloud provider |
+| **Kubernetes** | K8s pods | Service account JWT tokens |
+| **Token** | Bootstrapping, automation | Direct token (must be provisioned out-of-band) |
+
+**AppRole** is designed for machine authentication. It uses two credentials:
+
+- **Role ID** — Stable identifier for the role (like a username). Can be baked into configuration.
+- **Secret ID** — Sensitive credential (like a password). Should be delivered securely and can be single-use or time-limited.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       AppRole Authentication                         │
+│                                                                      │
+│   ┌──────────────┐                         ┌──────────────┐         │
+│   │  Provisioner │                         │    Vault     │         │
+│   │ (control     │                         │              │         │
+│   │  plane)      │                         │              │         │
+│   └──────┬───────┘                         └──────▲───────┘         │
+│          │                                        │                  │
+│          │ 1. Create role, get                    │                  │
+│          │    role_id + secret_id                 │                  │
+│          │                                        │                  │
+│          ▼                                        │                  │
+│   ┌──────────────┐                               │                  │
+│   │     Host     │                               │                  │
+│   │              │  2. Login with                │                  │
+│   │  role_id     │     role_id + secret_id       │                  │
+│   │  secret_id   │───────────────────────────────┘                  │
+│   │              │                                                   │
+│   │              │  3. Receives token                               │
+│   │  ──────────▶ │     with attached policies                       │
+│   │    token     │                                                   │
+│   └──────────────┘                                                   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why AppRole for us:**
+
+- Our hosts are on an isolated WireGuard network—we don't need the overhead of PKI (TLS certs)
+- AppRole credentials can be delivered during host provisioning via cloud-init or similar
+- Secret IDs can be configured as single-use or with TTLs for tighter security if needed
+
+**Reference:** [How and Why to Use AppRole Correctly in HashiCorp Vault](https://www.hashicorp.com/en/blog/how-and-why-to-use-approle-correctly-in-hashicorp-vault)
+
+#### 4.4 Vault Agent vs Vault Cluster
+
+**Vault Cluster** is the central secrets management service—one or more Vault servers (typically 3-5 for HA) that store encrypted secrets, enforce policies, and handle authentication. The cluster runs off-host, shared by all infrastructure.
+
+**Vault Agent** is a lightweight daemon that runs locally on each host. It is *not* a Vault server—it's a client-side helper that:
+
+| Function | Benefit |
+|----------|---------|
+| **Auto-auth** | Authenticates to Vault on startup, no manual token management |
+| **Token renewal** | Keeps the token fresh, handles TTL automatically |
+| **Caching** | Reduces round-trips to Vault cluster for repeated requests |
+| **Templating** | Can render secrets into config files (not used in our design) |
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                      │
+│   Host A                        Host B                        ...    │
+│   ┌───────────────┐            ┌───────────────┐                    │
+│   │  Vault Agent  │            │  Vault Agent  │                    │
+│   │  (local)      │            │  (local)      │                    │
+│   └───────┬───────┘            └───────┬───────┘                    │
+│           │                            │                             │
+│           └──────────┬─────────────────┘                            │
+│                      │                                               │
+│                      ▼                                               │
+│           ┌─────────────────────┐                                   │
+│           │    Vault Cluster    │                                   │
+│           │    (centralized)    │                                   │
+│           │                     │                                   │
+│           │  ┌─────┐ ┌─────┐   │                                   │
+│           │  │node1│ │node2│   │                                   │
+│           │  └─────┘ └─────┘   │                                   │
+│           │       ┌─────┐      │                                   │
+│           │       │node3│      │                                   │
+│           │       └─────┘      │                                   │
+│           └─────────────────────┘                                   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+In our design:
+
+- **Vault Cluster** — Stores volume keys, enforces policies, runs centrally (managed service or self-hosted)
+- **Vault Agent** — Runs on each host, handles authentication and caching, exposes a local unix socket for sparkd/backupd
+
+sparkd never talks to the Vault cluster directly; it talks to the local Agent, which proxies requests and manages tokens.
+
+---
+
+### 5. Design
+
+#### 5.1 Encryption Architecture
+
+Each thin volume is a LUKS container. Checkpoints (LVM snapshots) inherit encryption since they snapshot the encrypted blocks.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Vault (off-host)                            │
+│                                                                      │
+│   vol_abc → key_abc    vol_def → key_def    vol_ghi → key_ghi       │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        │ fetch key at VM boot (AppRole auth)
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                              Host                                    │
+│                                                                      │
+│   ┌───────────────────┐   ┌───────────────────┐                     │
+│   │ vol-abc-active    │   │ vol-def-active    │                     │
+│   │ (LUKS encrypted)  │   │ (LUKS encrypted)  │                     │
+│   │  ├─ vol-abc-cp-1  │   │                   │                     │
+│   │  └─ vol-abc-cp-2  │   │                   │                     │
+│   └───────────────────┘   └───────────────────┘                     │
+│           │                       │                                  │
+│       [locked]               [unlocked]                              │
+│                                   │                                  │
+│                                   ▼                                  │
+│                       /dev/mapper/vol-def-crypt                      │
+│                                   │                                  │
+│                                   ▼                                  │
+│                           ┌─────────────┐                            │
+│                           │ Firecracker │                            │
+│                           │     VM      │                            │
+│                           └─────────────┘                            │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key properties:**
+
+- Volume locked at rest (key only in Vault)
+- Key fetched and volume unlocked only during attach
+- Key evicted from kernel on detach
+- Checkpoints share the volume's encryption key (same LUKS container)
+
+#### 5.2 Vault Secrets Layout
+
+```
+secret/
+└── sparkd/
+    └── volumes/
+        ├── vol_abc123/
+        │   ├── encryption-key    # LUKS key material
+        │   └── backup-key        # S3 backup encryption key
+        ├── vol_def456/
+        │   ├── encryption-key
+        │   └── backup-key
+        └── ...
+```
+
+**Key schema:**
+
+```json
+// secret/sparkd/volumes/vol_abc123/encryption-key
+{
+  "key": "base64-encoded-32-byte-key",
+  "algorithm": "aes-xts-plain64",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+
+// secret/sparkd/volumes/vol_abc123/backup-key
+{
+  "key": "base64-encoded-32-byte-key",
+  "algorithm": "aes-256-gcm",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+#### 5.3 Host Authentication: AppRole
+
+Hosts authenticate to Vault using AppRole. The WireGuard network boundary provides transport security; AppRole binds Vault identity to hosts without PKI overhead.
+
+**Provisioning flow:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Host Provisioning                               │
+│                                                                      │
+│  1. Control plane creates AppRole for new host                       │
+│                                                                      │
+│     vault write auth/approle/role/host_abc123 \                     │
+│         token_policies="host_abc123" \                              │
+│         token_ttl=1h \                                              │
+│         token_max_ttl=24h \                                         │
+│         secret_id_num_uses=0                                        │
+│                                                                      │
+│  2. Retrieve role_id (stable, baked into host config)               │
+│                                                                      │
+│     vault read auth/approle/role/host_abc123/role-id                │
+│     → role_id: 1234-5678-abcd                                       │
+│                                                                      │
+│  3. Generate secret_id (delivered securely at provision time)       │
+│                                                                      │
+│     vault write -f auth/approle/role/host_abc123/secret-id          │
+│     → secret_id: efgh-9012-ijkl                                     │
+│                                                                      │
+│  4. Deliver credentials to host via provisioning system             │
+│     (cloud-init, secure channel over WireGuard, etc.)               │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Runtime authentication:**
+
+```bash
+# Host authenticates with role_id + secret_id
+vault write auth/approle/login \
+    role_id="1234-5678-abcd" \
+    secret_id="efgh-9012-ijkl"
+
+# Returns token scoped to host's policies
+{
+  "auth": {
+    "client_token": "hvs.CAESIG...",
+    "policies": ["default", "host_abc123"],
+    "token_ttl": 3600
+  }
+}
+```
+
+#### 5.4 Policy Model
+
+Authorization is enforced by Vault policies. The control plane manages policy attachments; hosts retrieve keys directly from Vault.
+
+```
+         Policy Updates
+         (on placement/migration)
+                 │
+                 ▼
+┌──────────────────┐           ┌─────────────┐
+│   Control Plane  │──────────▶│    Vault    │
+└──────────────────┘           └─────────────┘
+                                      ▲
+                                      │ Key Retrieval
+                                      │ (at VM boot)
+                               ┌──────┴──────┐
+                               │    Host     │
+                               └─────────────┘
+```
+
+**Per-volume policies (created at volume creation):**
+
+```hcl
+# policy: vol_abc123_encryption
+path "secret/data/sparkd/volumes/vol_abc123/encryption-key" {
+  capabilities = ["read"]
+}
+
+# policy: vol_abc123_backup
+path "secret/data/sparkd/volumes/vol_abc123/backup-key" {
+  capabilities = ["read"]
+}
+```
+
+**Policy attachment (on volume placement):**
+
+```bash
+# When vol_abc123 is placed on host_abc123
+vault write auth/approle/role/host_abc123 \
+    token_policies="host_abc123,vol_abc123_encryption,vol_abc123_backup"
+```
+
+**Policy update (on volume migration):**
+
+```bash
+# vol_abc123 migrates from host_abc to host_xyz
+
+# 1. Increment location_epoch (per RFC-003)
+
+# 2. Revoke from old host
+vault write auth/approle/role/host_abc123 \
+    token_policies="host_abc123,vol_def456_encryption,vol_def456_backup"
+
+# 3. Grant to new host
+vault write auth/approle/role/host_xyz789 \
+    token_policies="host_xyz789,vol_abc123_encryption,vol_abc123_backup"
+```
+
+**Ordering:** Revoke from old host before granting to new host. This ensures no window where both hosts can access the key.
+
+#### 5.5 Vault Agent
+
+Each host runs Vault Agent as a sidecar. It handles authentication, token renewal, and caching.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                              Host                                    │
+│                                                                      │
+│   ┌─────────────┐         ┌─────────────────────┐                   │
+│   │   sparkd    │────────▶│    Vault Agent      │──────▶ Vault      │
+│   └─────────────┘   unix  │                     │                   │
+│                    socket │  • auto-auth        │                   │
+│   ┌─────────────┐         │  • token renewal    │                   │
+│   │   backupd   │────────▶│  • request caching  │                   │
+│   └─────────────┘         │  • metrics (:9090)  │                   │
+│                           └─────────────────────┘                   │
+│                                    │                                 │
+│                                    ▼                                 │
+│                          /var/run/vault-agent.sock                   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Agent configuration:**
+
+```hcl
+# /etc/vault-agent.d/config.hcl
+
+vault {
+  address = "https://vault.internal.andasy.io:8200"
+}
+
+auto_auth {
+  method "approle" {
+    config = {
+      role_id_file_path                 = "/etc/vault-agent.d/role_id"
+      secret_id_file_path               = "/etc/vault-agent.d/secret_id"
+      remove_secret_id_file_after_reading = false
+    }
+  }
+
+  sink "file" {
+    config = {
+      path = "/var/run/vault-agent-token"
+      mode = 0640
+    }
+  }
+}
+
+cache {
+  use_auto_auth_token = true
+}
+
+listener "unix" {
+  address     = "/var/run/vault-agent.sock"
+  tls_disable = true
+}
+
+telemetry {
+  prometheus_retention_time = "60s"
+  disable_hostname          = true
+}
+```
+
+---
+
+### 6. Volume Lifecycle Changes
+
+#### 6.1 Volume Creation
+
+```bash
+# 1. Create thin LV
+lvcreate --thin --name vol-abc123-active \
+         --virtualsize 100G vg_storage/thinpool
+
+# 2. Generate keys (control plane)
+encryption_key=$(head -c 32 /dev/urandom | base64)
+backup_key=$(head -c 32 /dev/urandom | base64)
+
+# 3. Store keys in Vault
+vault kv put secret/sparkd/volumes/vol_abc123/encryption-key \
+    key="$encryption_key" \
+    algorithm="aes-xts-plain64" \
+    created_at="$(date -Iseconds)"
+
+vault kv put secret/sparkd/volumes/vol_abc123/backup-key \
+    key="$backup_key" \
+    algorithm="aes-256-gcm" \
+    created_at="$(date -Iseconds)"
+
+# 4. Create Vault policies
+vault policy write vol_abc123_encryption - <<EOF
+path "secret/data/sparkd/volumes/vol_abc123/encryption-key" {
+  capabilities = ["read"]
+}
+EOF
+
+vault policy write vol_abc123_backup - <<EOF
+path "secret/data/sparkd/volumes/vol_abc123/backup-key" {
+  capabilities = ["read"]
+}
+EOF
+
+# 5. Attach policies to host's AppRole
+vault write auth/approle/role/host_abc123 \
+    token_policies="host_abc123,vol_abc123_encryption,vol_abc123_backup,..."
+
+# 6. Format with LUKS (on host, via sparkd)
+echo -n "$encryption_key" | base64 -d | \
+    cryptsetup luksFormat --key-file=- /dev/vg_storage/vol-abc123-active
+
+# 7. Open, format filesystem, close
+echo -n "$encryption_key" | base64 -d | \
+    cryptsetup open --key-file=- \
+        /dev/vg_storage/vol-abc123-active vol-abc123-crypt
+mkfs.ext4 /dev/mapper/vol-abc123-crypt
+cryptsetup close vol-abc123-crypt
+
+# Volume now sits encrypted at rest
+```
+
+#### 6.2 Attach Flow (Updated from RFC-002 § 8)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           sparkd                                     │
+│                                                                      │
+│  1. Validate volume is available, machine exists                     │
+│  2. Update volume state → attaching                                  │
+│                                                                      │
+│  3. Fetch encryption key from Vault                                  │
+│     GET /v1/secret/data/sparkd/volumes/vol_abc123/encryption-key    │
+│     (via Vault Agent unix socket)                                   │
+│                                                                      │
+│  4. Open LUKS container                                              │
+│     echo "$key" | cryptsetup open --key-file=- \                    │
+│         /dev/vg_storage/vol-abc123-active vol-abc123-crypt          │
+│                                                                      │
+│  5. Attach to Firecracker                                            │
+│     PUT /drives/data                                                 │
+│     {                                                                │
+│       "drive_id": "data",                                           │
+│       "path_on_host": "/dev/mapper/vol-abc123-crypt",               │
+│       "is_root_device": false,                                      │
+│       "is_read_only": false                                         │
+│     }                                                                │
+│                                                                      │
+│  6. Update volume state → attached                                   │
+│  7. Clear key from sparkd memory                                     │
+│     (key remains in kernel dm-crypt layer)                          │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 6.3 Detach Flow (Updated from RFC-002 § 8)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           sparkd                                     │
+│                                                                      │
+│  1. Update volume state → detaching                                  │
+│  2. Signal guest to unmount (via vsock)                              │
+│  3. Update Firecracker drive config                                  │
+│                                                                      │
+│  4. Close LUKS container                                             │
+│     cryptsetup close vol-abc123-crypt                               │
+│     (evicts key from kernel)                                        │
+│                                                                      │
+│  5. Update volume state → available                                  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 6.4 Checkpoint Operations
+
+Checkpoints are LVM snapshots of the encrypted thin LV. They inherit encryption transparently:
+
+```
+vol-abc123-active      →  LUKS encrypted with key_abc123
+    │
+    ├── vol-abc123-cp-1   →  snapshot of encrypted blocks
+    └── vol-abc123-cp-2   →  snapshot of encrypted blocks
+```
+
+The same key decrypts all checkpoints of a volume. No changes to checkpoint operations from RFC-002.
+
+#### 6.5 Restore Operations
+
+Restore works unchanged—operating on encrypted LVs:
+
+```bash
+# Restore to checkpoint (volume must be detached)
+lvremove -f vg_storage/vol-abc123-active
+lvcreate --snapshot --name vol-abc123-active vg_storage/vol-abc123-cp-1
+
+# Same key still works (LUKS header preserved in snapshot)
+```
+
+---
+
+### 7. Backup Service
+
+The backup daemon (backupd) runs alongside sparkd and shares the same AppRole identity. It accesses the backup-key path, not the encryption-key path.
+
+#### 7.1 Backup Flow
+
+Two options depending on whether backups should be re-encrypted:
+
+**Option A: Backup encrypted blocks (simpler)**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          backupd                                     │
+│                                                                      │
+│  1. Read encrypted blocks directly from LV                           │
+│     (no LUKS key needed—copying ciphertext)                         │
+│                                                                      │
+│  2. Fetch backup-key from Vault                                      │
+│     GET /v1/secret/data/sparkd/volumes/vol_abc123/backup-key        │
+│                                                                      │
+│  3. Add encryption layer with backup-key                             │
+│     (double encryption: LUKS + backup-key)                          │
+│                                                                      │
+│  4. Upload to S3                                                     │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Restore requires both keys: backup-key to decrypt outer layer, encryption-key to use the volume.
+
+**Option B: Decrypt and re-encrypt (enables deduplication)**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          backupd                                     │
+│                                                                      │
+│  1. Fetch encryption-key from Vault                                  │
+│  2. Open LUKS container (read-only)                                  │
+│  3. Read plaintext blocks                                            │
+│                                                                      │
+│  4. Fetch backup-key from Vault                                      │
+│  5. Encrypt with backup-key                                          │
+│  6. Upload to S3                                                     │
+│                                                                      │
+│  7. Close LUKS container                                             │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Restore only requires backup-key; restored volume gets a new encryption-key.
+
+**Recommendation:** Option A for simplicity. The backup-key provides isolation from the encryption-key; double encryption is acceptable overhead.
+
+#### 7.2 Restore from Backup
+
+When restoring to a new volume (cross-host migration or DR):
+
+```bash
+# 1. Download and decrypt with backup-key
+# 2. Generate new encryption-key for restored volume
+# 3. Format new LUKS container with new key
+# 4. Write decrypted data
+# 5. Store new encryption-key in Vault
+```
+
+The restored volume has a new identity (new volume ID, new encryption key).
+
+---
+
+### 8. Failure Handling
+
+#### 8.1 Vault Unreachable
+
+If Vault is unreachable during attach:
+
+1. Retry with exponential backoff (initial: 1s, max: 30s)
+2. VM boot is delayed until key is retrieved
+3. After max retries (configurable, default 10), fail the attach operation
+4. Volume remains in `attaching` state; control plane can retry or alert
+
+#### 8.2 Policy Denied (403)
+
+If Vault returns 403 Forbidden:
+
+1. Do not retry (policy issue, not transient)
+2. Fail the attach operation immediately
+3. Log the denial with volume ID and host ID
+4. Alert: indicates policy misconfiguration or stale placement data
+
+#### 8.3 Volume Migration Race
+
+If a host tries to attach a volume that's migrating away:
+
+1. Host fetches key (may succeed if policy not yet updated)
+2. LUKS open succeeds
+3. Firecracker attach uses stale device
+4. **Mitigation:** Epoch check (RFC-003) catches this—host validates epoch before attach
+
+---
+
+### 9. Monitoring & Alerting
+
+#### 9.1 Vault Agent Metrics
+
+Vault Agent exposes Prometheus metrics at `/v1/agent/metrics`:
+
+| Metric | Description |
+|--------|-------------|
+| `vault_agent_auth_success_total` | Successful authentications |
+| `vault_agent_auth_failure_total` | Failed authentications |
+| `vault_agent_token_ttl_seconds` | Current token TTL |
+| `vault_agent_cache_hit_total` | Cache hits |
+| `vault_agent_cache_miss_total` | Cache misses |
+
+#### 9.2 sparkd Metrics
+
+sparkd should expose:
+
+| Metric | Description |
+|--------|-------------|
+| `sparkd_volume_key_retrieval_total{status,volume_id}` | Key retrieval attempts |
+| `sparkd_volume_key_retrieval_duration_seconds{volume_id}` | Key retrieval latency |
+| `sparkd_volume_luks_open_total{status,volume_id}` | LUKS open attempts |
+| `sparkd_volume_luks_close_total{status,volume_id}` | LUKS close attempts |
+
+#### 9.3 Alerts
+
+| Condition | Severity | Action |
+|-----------|----------|--------|
+| `vault_agent_auth_failure_total` increasing | Critical | Check AppRole credentials |
+| `vault_agent_token_ttl_seconds` < 300 | Warning | Token renewal failing |
+| Key retrieval 403 | Critical | Policy misconfiguration |
+| Key retrieval timeout after retries | Critical | Vault availability issue |
+| LUKS open failure | Critical | Key mismatch or corrupt header |
+
+---
+
+### 10. Security Considerations
+
+#### 10.1 Key Exposure Window
+
+| State | Key Location |
+|-------|--------------|
+| Volume detached | Vault only |
+| Volume attaching | Vault → sparkd memory → kernel (briefly in sparkd) |
+| Volume attached | Kernel dm-crypt only |
+| Volume detaching | Kernel (evicted on close) |
+
+The key is in sparkd memory only during the attach operation (milliseconds).
+
+#### 10.2 Audit Logging
+
+Vault audit logs capture:
+
+- Every key retrieval (who, when, which volume)
+- Policy changes (which host gained/lost access)
+- Authentication events (host logins)
+
+Enable Vault audit backend:
+
+```bash
+vault audit enable file file_path=/var/log/vault/audit.log
+```
+
+#### 10.3 Secret ID Rotation
+
+While key rotation is out of scope, secret_id rotation is recommended:
+
+- Rotate secret_id periodically (e.g., monthly)
+- Rotation requires coordination with host provisioning
+- Consider `secret_id_ttl` for automatic expiration
+
+#### 10.4 Network Security
+
+All Vault traffic stays within the WireGuard network. The trust boundary is the WireGuard perimeter, not individual host authentication.
+
+---
+
+### 11. Implementation Notes
+
+#### 11.1 LUKS Configuration
+
+```bash
+# Use LUKS2 with argon2id (default in cryptsetup 2.4+)
+cryptsetup luksFormat --type luks2 \
+    --cipher aes-xts-plain64 \
+    --key-size 512 \
+    --hash sha256 \
+    --key-file=- \
+    /dev/vg_storage/vol-abc123-active
+```
+
+**LUKS header size:** ~16 MB. This is included in the thin volume's virtual size.
+
+#### 11.2 Key File Handling
+
+Never write keys to disk. Use pipes and stdin:
+
+```bash
+# Good: key never touches disk
+vault kv get -field=key secret/sparkd/volumes/vol_abc123/encryption-key | \
+    base64 -d | \
+    cryptsetup open --key-file=- /dev/vg_storage/vol-abc123-active vol-abc123-crypt
+
+# Bad: key written to temp file
+vault kv get -field=key ... > /tmp/key  # DON'T DO THIS
+cryptsetup open --key-file=/tmp/key ...
+```
+
+#### 11.3 Vault Agent Systemd Unit
+
+```ini
+# /etc/systemd/system/vault-agent.service
+[Unit]
+Description=Vault Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/vault agent -config=/etc/vault-agent.d/config.hcl
+Restart=on-failure
+RestartSec=5
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+### 12. Future Work
+
+- **Key Rotation** — LUKS supports multiple key slots; implement rotation without re-encryption
+- **HSM Integration** — Store master keys in HSM, derive volume keys
+- **Guest-Side Encryption** — For workloads requiring protection from hypervisor
+- **Seal/Unseal Automation** — Vault auto-unseal with cloud KMS
+- **Cross-Region Key Replication** — For multi-region DR scenarios
+
+---
+
+### 13. References
+
+- [LUKS2 On-Disk Format](https://gitlab.com/cryptsetup/cryptsetup/-/wikis/LUKS2-On-Disk-Format)
+- [HashiCorp Vault AppRole Auth](https://developer.hashicorp.com/vault/docs/auth/approle)
+- [Vault Agent](https://developer.hashicorp.com/vault/docs/agent-and-proxy/agent)
+- [dm-crypt Documentation](https://gitlab.com/cryptsetup/cryptsetup/-/wikis/DMCrypt)
+- RFC-002: Volumes — Persistent Block Storage for Firecracker MicroVMs
+- RFC-003: Volume Identity & Location Management

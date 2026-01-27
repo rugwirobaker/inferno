@@ -1,0 +1,493 @@
+## RFC 003: Volume Identity & Location Management
+
+**Authors:** Rugwiro Valentin · Platform Team
+
+**Date:** 2025-01-14
+
+**Status:** Draft
+
+**Depends On:** RFC-002 (Volumes — Persistent Block Storage)
+
+---
+
+### 1. Abstract
+
+RFC-002 introduced Volumes as persistent block storage for Firecracker MicroVMs. This RFC addresses a critical design decision: how to identify volumes and track their physical location across the fleet. We propose **opaque volume IDs** (no encoded location) combined with **epoch-based location tracking** to enable future volume migration while maintaining O(1) lookup performance. This design separates identity (stable) from location (mutable), avoiding the technical debt of host-encoded identifiers.
+
+---
+
+### 2. Motivation
+
+#### 2.1 The Host-Encoded ID Anti-Pattern
+
+A common approach in distributed storage systems is to encode the host location directly in the volume ID:
+
+```
+vol-host17-abc123
+    │       │
+    │       └── unique suffix
+    └── physical host identifier
+```
+
+**Initial benefits:**
+
+- O(1) routing — parse the ID, call the host directly
+- No central lookup required for common operations
+- Simple implementation
+
+**Long-term costs:**
+
+| Scenario | Problem |
+|----------|---------|
+| Host decommissioning | Volume IDs must change or require permanent forwarding pointers |
+| Rebalancing | Moving volumes between hosts breaks ID stability |
+| Host renaming/re-IP | Encoded information becomes stale |
+| User scripts | Users parse IDs, creating implicit API contracts |
+| Forwarding chains | A→B→C migrations create latency and GC complexity |
+
+#### 2.2 Real-World Precedent
+
+This pattern has caused migration pain at multiple infrastructure companies. Once volume IDs leak into user space (CLI output, Terraform state, monitoring dashboards), changing the format requires coordinated migration across the entire user base.
+
+#### 2.3 Design Goals
+
+1. **Stable identity** — Volume IDs never change, regardless of physical location
+2. **Efficient lookup** — O(1) average case via caching
+3. **Migration support** — Volumes can move between hosts without user impact
+4. **Consistency detection** — Stale cache entries detected without distributed locks
+5. **Operational visibility** — IDs support debugging without encoding physical details
+
+---
+
+### 3. Scope
+
+| In Scope | Out of Scope |
+|----------|--------------|
+| Volume ID format specification | Live migration implementation (future RFC) |
+| Location tracking schema | Distributed consensus protocols |
+| Epoch-based consistency model | Cross-region volume movement |
+| Control plane caching strategy | Volume replication |
+| Host-side epoch validation | Automatic rebalancing policies |
+| API changes for location headers | |
+
+---
+
+### 4. Design
+
+#### 4.1 Volume ID Format
+
+Volume IDs are opaque, location-agnostic identifiers:
+
+```
+vol_3k8f9xhq2m4n
+│   │
+│   └── 12-character nanoid (alphanumeric)
+└── prefix for type identification
+```
+
+**Properties:**
+
+- **No encoded location** — Host information is never part of the ID
+- **URL-safe** — Alphanumeric only, no special characters
+- **Collision-resistant** — 12 characters from 36-char alphabet ≈ 62 bits of entropy
+- **Human-distinguishable** — Prefix aids visual identification in logs
+
+**Generation:** 12-character nanoid using alphanumeric alphabet (`0-9a-z`), prefixed with `vol_`.
+
+#### 4.2 Hierarchical IDs (Optional Enhancement)
+
+For operational convenience without encoding physical location, IDs may include logical metadata:
+
+```
+vol_{region}_{app_prefix}_{random}
+
+vol_iad_app3k8_xq2m4n7f
+    │    │      │
+    │    │      └── unique within app (8 chars)
+    │    └── first 6 chars of app ID
+    └── region code (logical, not physical)
+```
+
+**Benefits:**
+
+- Log filtering by region without joins
+- App correlation for debugging
+- No physical location encoded
+
+**Trade-off:** Longer IDs, slightly more complex generation.
+
+#### 4.3 Location Tracking
+
+Location tracking is added to the existing `volumes` table, not a separate table. The control plane generates volume IDs and maintains authoritative location mapping.
+
+**New columns:**
+
+| Column | Description |
+|--------|-------------|
+| `host_id` | Physical host where volume resides |
+| `location_epoch` | Monotonically increasing version, incremented on every location change |
+
+**Relationship clarification:**
+
+- `host_id` — Where the volume physically lives (storage location)
+- `machine_id` — What VM the volume is attached to (attachment state)
+
+These can differ: a volume may be detached (`machine_id = NULL`) but still reside on a host, or during migration the host changes while attachment remains.
+
+**State representation:**
+
+Rather than a separate `state` column, derive state from existing columns:
+
+| State | Condition |
+|-------|-----------|
+| Available | `host_id IS NOT NULL AND machine_id IS NULL AND deleted_at IS NULL` |
+| Attached | `host_id IS NOT NULL AND machine_id IS NOT NULL AND deleted_at IS NULL` |
+| Orphaned | `host_id IS NULL AND deleted_at IS NULL` |
+| Deleted | `deleted_at IS NOT NULL` |
+
+#### 4.4 Epoch-Based Consistency Model
+
+The `location_epoch` enables lightweight consistency checking without distributed locks.
+
+**Invariants:**
+
+1. Epoch only increases, never decreases
+2. Any location change increments epoch
+3. Control plane DB is authoritative for "where should this be"
+4. Host is authoritative for "what's actually here"
+
+**Consistency check flow:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Control Plane                               │
+│                                                                  │
+│  1. Lookup volume location (cache or DB)                        │
+│  2. Send request to host with expected epoch                    │
+│                                                                  │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           │  GET /volumes/{id}
+                           │  X-Expected-Epoch: 7
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         Host                                     │
+│                                                                  │
+│  Compare request epoch with local epoch:                        │
+│                                                                  │
+│  ┌─────────────────┬────────────────────────────────────────┐   │
+│  │ Condition       │ Response                                │   │
+│  ├─────────────────┼────────────────────────────────────────┤   │
+│  │ Match           │ 200 OK + volume data                    │   │
+│  │ Volume missing  │ 404 Not Found                           │   │
+│  │ Host ahead      │ 409 Conflict (my_epoch > expected)      │   │
+│  │ Host behind     │ 410 Gone (my_epoch < expected)          │   │
+│  └─────────────────┴────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Response scenarios:**
+
+| Response | Meaning | Action |
+|----------|---------|--------|
+| 200 OK | Epochs match, volume present | Use response |
+| 404 Not Found | Volume never existed on this host | Check DB, possibly user error |
+| 409 Conflict | Host knows something control plane doesn't | Alert, reconcile state |
+| 410 Gone | Volume moved, host has stale data | Invalidate cache, retry with fresh lookup |
+
+#### 4.5 Location Lookup
+
+The control plane maintains an in-memory cache of volume locations backed by the authoritative database. Cache entries expire after a configurable TTL and are invalidated immediately on epoch mismatch.
+
+```
+Request flow:
+
+1. Check cache → hit: return location
+                 miss: query database, populate cache, return
+2. Call host with expected epoch
+3. On epoch mismatch → invalidate cache, retry from step 1
+```
+
+---
+
+### 5. Migration Protocol
+
+Volume migration updates location while preserving identity.
+
+#### 5.1 Migration State Machine
+
+```
+                    ┌─────────────┐
+                    │   placed    │
+                    │  (host A)   │
+                    └──────┬──────┘
+                           │
+                           │ initiate migration
+                           ▼
+                    ┌─────────────┐
+              ┌─────│  migrating  │─────┐
+              │     └─────────────┘     │
+              │                         │
+              │ success                 │ failure
+              ▼                         ▼
+       ┌─────────────┐           ┌─────────────┐
+       │   placed    │           │   placed    │
+       │  (host B)   │           │  (host A)   │
+       │  epoch + 1  │           │  (rollback) │
+       └─────────────┘           └─────────────┘
+```
+
+#### 5.2 Migration Sequence
+
+```
+Control Plane              Host A (source)         Host B (dest)
+      │                         │                       │
+      │  1. BEGIN MIGRATION     │                       │
+      │  Increment epoch, record migration intent      │
+      │                         │                       │
+      │  2. PREPARE DESTINATION │                       │
+      │─────────────────────────┼──────────────────────►│
+      │                         │    POST /volumes/prepare
+      │                         │    { volume_id, size }│
+      │                         │                       │
+      │  3. TRANSFER DATA       │                       │
+      │                         │──────────────────────►│
+      │                         │   (block copy)        │
+      │                         │                       │
+      │  4. CONFIRM TRANSFER    │                       │
+      │◄────────────────────────┼───────────────────────│
+      │                         │   POST /volumes/ready │
+      │                         │   { volume_id, epoch }│
+      │                         │                       │
+      │  5. FINALIZE            │                       │
+      │  UPDATE host_id to B                           │
+      │                         │                       │
+      │  6. CLEANUP SOURCE      │                       │
+      │────────────────────────►│                       │
+      │  DELETE /volumes/{id}   │                       │
+      │                         │                       │
+      │  7. INVALIDATE CACHE    │                       │
+      │  (broadcast or lazy)    │                       │
+      │                         │                       │
+```
+
+#### 5.3 Failure Handling
+
+| Failure Point | Recovery Action |
+|---------------|-----------------|
+| Before data transfer starts | Rollback: decrement epoch, clear migration intent |
+| During data transfer | Rollback: cleanup partial data on dest |
+| After transfer, before finalize | Manual decision: verify data integrity, choose winner |
+| After finalize | Forward: source cleanup may retry |
+
+#### 5.4 Epoch During Migration
+
+The epoch increments at migration **start**, not completion. This ensures any cached entries become immediately stale. Requests during migration receive 410 Gone from the source host, triggering a fresh lookup.
+
+The epoch does **not** increment again at completion—the single increment at start is sufficient to invalidate all stale caches.
+
+---
+
+### 6. API Changes
+
+#### 6.1 Host API Headers
+
+All volume operations include epoch headers:
+
+**Request headers:**
+
+| Header | Description |
+|--------|-------------|
+| `X-Expected-Epoch` | Epoch value from control plane cache/DB |
+
+**Response headers:**
+
+| Header | Description |
+|--------|-------------|
+| `X-Location-Epoch` | Current epoch known by this host |
+| `X-Volume-State` | Volume state on this host |
+
+#### 6.2 Host API Responses
+
+**Success (epochs match):**
+
+```json
+HTTP/1.1 200 OK
+X-Location-Epoch: 7
+X-Volume-State: attached
+
+{
+  "volume_id": "vol_3k8f9xhq2m4n",
+  "state": "attached",
+  "size_gb": 100,
+  "location_epoch": 7
+}
+```
+
+**Volume moved (stale cache):**
+
+```json
+HTTP/1.1 410 Gone
+X-Location-Epoch: 5
+
+{
+  "error": "volume_relocated",
+  "message": "Volume no longer on this host",
+  "last_known_epoch": 5,
+  "hint": "Query control plane for current location"
+}
+```
+
+**Epoch conflict (split-brain):**
+
+```json
+HTTP/1.1 409 Conflict
+X-Location-Epoch: 9
+
+{
+  "error": "epoch_mismatch",
+  "message": "Host epoch ahead of expected",
+  "expected_epoch": 7,
+  "actual_epoch": 9,
+  "hint": "Reconciliation required"
+}
+```
+
+#### 6.3 Control Plane API
+
+Volume creation returns location metadata:
+
+```json
+POST /v1/apps/{app}/volumes
+
+{
+  "name": "my-database",
+  "size_gb": 100,
+  "region": "iad"
+}
+```
+
+Response:
+
+```json
+{
+  "id": "vol_3k8f9xhq2m4n",
+  "name": "my-database",
+  "size_gb": 100,
+  "region": "iad",
+  "host_id": "host_abc123",
+  "location_epoch": 1,
+  "state": "available",
+  "created_at": "2025-01-14T10:30:00Z"
+}
+```
+
+---
+
+### 7. Implementation
+
+#### 7.1 Schema Changes
+
+Extend the existing `volumes` table to add location tracking:
+
+```sql
+ALTER TABLE volumes
+    ADD COLUMN host_id UUID REFERENCES hosts(id),
+    ADD COLUMN location_epoch INTEGER NOT NULL DEFAULT 1;
+
+CREATE INDEX idx_volumes_host ON volumes(host_id) WHERE deleted_at IS NULL;
+```
+
+**Breaking change:** The existing `machine_id` foreign key uses `ON DELETE CASCADE`, which deletes volumes when their attached machine is deleted. This contradicts RFC-002's requirement that volumes and machines have independent lifecycles.
+
+Fix by replacing the constraint:
+
+```sql
+ALTER TABLE volumes
+    DROP CONSTRAINT volumes_machine_id_fkey,
+    ADD CONSTRAINT volumes_machine_id_fkey 
+        FOREIGN KEY (machine_id) 
+        REFERENCES machines(id) 
+        ON DELETE SET NULL;
+```
+
+After this change, deleting a machine sets `machine_id` to NULL (detached) rather than deleting the volume.
+
+#### 7.2 Location Store Behavior
+
+The location store must:
+
+1. Return cached location if present and not expired (TTL configurable, default 5 minutes)
+2. Query database on cache miss
+3. Invalidate specific entry when epoch mismatch occurs
+4. Invalidate all entries for a host on host failure
+5. Automatically invalidate after any write operation
+
+#### 7.3 Epoch Validation Behavior
+
+When the control plane calls a host:
+
+1. Include expected epoch in request header
+2. On success (200), use response
+3. On 410 Gone (volume relocated), invalidate cache and retry once
+4. On 409 Conflict (host ahead), log alert and return error—do not retry
+
+---
+
+### 8. Operational Considerations
+
+#### 8.1 Monitoring & Alerting
+
+| Metric | Alert Threshold | Description |
+|--------|-----------------|-------------|
+| `location_cache_hit_rate` | < 90% | Cache effectiveness |
+| `location_cache_stale_rate` | > 5% | Frequent migrations or clock skew |
+| `epoch_conflict_total` | > 0 | Split-brain detection |
+| `migration_duration_seconds` | > 300 | Slow migrations |
+| `orphaned_volumes_total` | > 0 | Volumes without valid host |
+
+#### 8.2 Debugging
+
+Volume ID format supports straightforward log analysis:
+
+- **Single volume:** Filter logs by the full ID (`vol_3k8f9xhq2m4n`) to trace all operations
+- **Regional filtering:** With hierarchical IDs, filter by prefix (`vol_iad_`) to isolate region-specific issues
+- **App correlation:** The embedded app prefix enables cross-referencing volume and application logs without joins
+
+#### 8.3 Reconciliation
+
+When epoch conflicts occur:
+
+1. Alert on-call engineer
+2. Log both epochs and states
+3. Query both control plane DB and host
+4. Determine ground truth (usually host wins for "what exists")
+5. Update control plane to match reality
+6. Investigate root cause (likely bug in migration or recovery code)
+
+---
+
+### 9. Security Considerations
+
+- **ID enumeration** — Opaque IDs prevent guessing other volumes
+- **Epoch forgery** — Hosts must validate epoch comes from authenticated control plane
+- **Cache poisoning** — Cache updates only from trusted sources (DB or verified host responses)
+
+---
+
+### 10. Future Work
+
+- **Predictive caching** — Pre-warm cache based on VM scheduling hints
+- **Epoch compression** — Periodic epoch reset with tombstone cleanup
+- **Multi-region location** — Extend schema for cross-region placement
+- **Location history** — Audit trail of volume movements
+
+---
+
+### 11. References
+
+- RFC-002: Volumes — Persistent Block Storage for Firecracker MicroVMs
+- [Google Spanner: TrueTime and External Consistency](https://research.google/pubs/pub39966/)
+- [Amazon EBS Architecture](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-volumes.html)
+- [Fly.io Volumes Documentation](https://fly.io/docs/reference/volumes/)

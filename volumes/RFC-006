@@ -1,0 +1,1430 @@
+## RFC 006: Key Management Service Design & Implementation
+
+**Authors:** Rugwiro Valentin · Inferno Project
+
+**Date:** 2026-01-23
+
+**Status:** Draft
+
+**Depends On:** RFC-005 (Guest-Side Volume Encryption)
+
+---
+
+### 1. Abstract
+
+This RFC specifies the design and implementation of **infernokms**, a lightweight Key Management Service for Inferno that provides Vault-compatible APIs over unix sockets. The service manages encryption keys for volumes, supports pluggable storage backends, and is designed for easy migration to production KMS solutions (HashiCorp Vault, AWS KMS, Azure Key Vault) without requiring changes to client code.
+
+**Key principles:**
+- **Vault-compatible API** — Same paths and response formats as Vault KV v2
+- **Pluggable backends** — SQLite for demos, Vault/AWS KMS for production
+- **Simple deployment** — Single Go binary, systemd service, unix socket only
+- **Observable** — Structured logging (slog), Prometheus metrics, audit trail
+- **Context-aware** — All backend operations accept context.Context for cancellation/timeout
+
+---
+
+### 2. Motivation
+
+#### 2.1 Why Not Use Vault Directly?
+
+HashiCorp Vault is excellent for production, but introduces complexity for Inferno:
+
+| Aspect | Vault | infernokms |
+|--------|-------|------------|
+| **Deployment** | Cluster (HA), unsealing, networking | Single binary, systemd service |
+| **Dependencies** | Consul/etcd for HA, TLS certs | SQLite file |
+| **Learning curve** | Policies, auth methods, secret engines | Simple HTTP API |
+| **Suitable for** | Production, multi-tenant, compliance | Development, single-host, experiments |
+
+**Goal:** Start simple with infernokms, maintain Vault compatibility for seamless migration.
+
+#### 2.2 Design Goals
+
+1. **Vault API compatibility** — Same request/response format as Vault KV v2
+2. **Swappable backends** — Change storage without changing API
+3. **Zero network exposure** — Unix socket only, no TCP/TLS complexity
+4. **Audit-ready** — Log every key access with structured data
+5. **Production path** — Easy to replace with real Vault when ready
+6. **Context propagation** — Support cancellation, timeouts, tracing
+
+---
+
+### 3. Scope
+
+| In Scope | Out of Scope |
+|----------|--------------|
+| Vault KV v2 compatible API | Full Vault feature parity |
+| SQLite backend (demo) | Multi-node HA clustering |
+| Vault backend (proxy mode) | Dynamic secrets, PKI, SSH |
+| AWS KMS backend (future) | Seal/unseal ceremony |
+| Unix socket transport | TCP, TLS, mTLS |
+| Simple token auth | Complex auth methods (LDAP, OIDC) |
+| Structured logging (slog) | Secret rotation, leasing |
+| Prometheus metrics | Replication, disaster recovery |
+| Context-aware operations | Distributed tracing (OpenTelemetry) |
+
+---
+
+### 4. API Design
+
+### 4.1 Vault KV v2 Compatibility
+
+Vault's KV (Key-Value) v2 engine uses a specific path structure:
+
+```
+secret/
+├── data/              # Read/write secret data
+│   └── <path>
+└── metadata/          # Read/write secret metadata
+    └── <path>
+```
+
+**Key distinction:**
+- `secret/data/<path>` — Returns actual secret values
+- `secret/metadata/<path>` — Returns when created, version, etc. (no secret values)
+
+This separation allows querying metadata without exposing keys.
+
+#### 4.2 Path Structure for Inferno
+
+```
+secret/
+└── data/
+    └── inferno/
+        └── volumes/
+            ├── vol_kf454eyxrwtf884k/
+            │   └── encryption-key
+            ├── vol_abc123/
+            │   └── encryption-key
+            └── vol_xyz789/
+                └── encryption-key
+```
+
+**Why `inferno/volumes/...`?**
+
+In production with real Vault, you might have:
+```
+secret/data/
+├── inferno/          # Our namespace
+│   └── volumes/
+├── app1/             # Other applications
+│   └── db-password
+└── app2/
+    └── api-key
+```
+
+Namespacing prevents collisions and enables fine-grained access control.
+
+#### 4.3 API Endpoints
+
+**Read encryption key:**
+```http
+GET /v1/secret/data/inferno/volumes/{volume_id}/encryption-key
+```
+
+**Response (Vault KV v2 format):**
+```json
+{
+  "request_id": "01HQJ8X9Y2Z3A4B5C6D7E8F9G0",
+  "lease_id": "",
+  "renewable": false,
+  "lease_duration": 0,
+  "data": {
+    "data": {
+      "key": "dGhpc2lzYTMyYnl0ZWtleWZvcmRlbW9vbmx5ISEh",
+      "algorithm": "aes-xts-plain64",
+      "key_size": 512
+    },
+    "metadata": {
+      "created_time": "2026-01-23T18:05:00.000000Z",
+      "custom_metadata": null,
+      "deletion_time": "",
+      "destroyed": false,
+      "version": 1
+    }
+  },
+  "wrap_info": null,
+  "warnings": null,
+  "auth": null
+}
+```
+
+**Note the nested structure:** `response.data.data.key` — this matches Vault exactly.
+
+**Write encryption key:**
+```http
+POST /v1/secret/data/inferno/volumes/{volume_id}/encryption-key
+Content-Type: application/json
+
+{
+  "data": {
+    "key": "dGhpc2lzYTMyYnl0ZWtleWZvcmRlbW9vbmx5ISEh",
+    "algorithm": "aes-xts-plain64",
+    "key_size": 512
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "request_id": "01HQJ...",
+  "data": {
+    "created_time": "2026-01-23T18:05:00.000000Z",
+    "custom_metadata": null,
+    "deletion_time": "",
+    "destroyed": false,
+    "version": 1
+  }
+}
+```
+
+**Delete encryption key:**
+```http
+DELETE /v1/secret/data/inferno/volumes/{volume_id}/encryption-key
+```
+
+**Response:**
+```json
+{
+  "request_id": "01HQJ...",
+  "data": null
+}
+```
+
+**Get metadata (without key value):**
+```http
+GET /v1/secret/metadata/inferno/volumes/{volume_id}/encryption-key
+```
+
+**Response:**
+```json
+{
+  "request_id": "01HQJ...",
+  "data": {
+    "created_time": "2026-01-23T18:05:00.000000Z",
+    "current_version": 1,
+    "custom_metadata": null,
+    "delete_version_after": "0s",
+    "max_versions": 0,
+    "oldest_version": 0,
+    "updated_time": "2026-01-23T18:05:00.000000Z",
+    "versions": {
+      "1": {
+        "created_time": "2026-01-23T18:05:00.000000Z",
+        "deletion_time": "",
+        "destroyed": false
+      }
+    }
+  }
+}
+```
+
+**List keys:**
+```http
+LIST /v1/secret/metadata/inferno/volumes/
+```
+
+**Response:**
+```json
+{
+  "request_id": "01HQJ...",
+  "data": {
+    "keys": [
+      "vol_kf454eyxrwtf884k/",
+      "vol_abc123/",
+      "vol_xyz789/"
+    ]
+  }
+}
+```
+
+#### 4.4 System Endpoints
+
+**Health check:**
+```http
+GET /v1/sys/health
+```
+
+**Response:**
+```json
+{
+  "initialized": true,
+  "sealed": false,
+  "standby": false,
+  "performance_standby": false,
+  "replication_performance_mode": "disabled",
+  "replication_dr_mode": "disabled",
+  "server_time_utc": 1706025600,
+  "version": "infernokms-0.1.0",
+  "cluster_name": "inferno",
+  "cluster_id": ""
+}
+```
+
+**Seal status (simplified for infernokms):**
+```http
+GET /v1/sys/seal-status
+```
+
+**Response:**
+```json
+{
+  "type": "sqlite",
+  "initialized": true,
+  "sealed": false,
+  "t": 0,
+  "n": 0,
+  "progress": 0,
+  "nonce": "",
+  "version": "infernokms-0.1.0",
+  "migration": false,
+  "recovery_seal": false,
+  "storage_type": "sqlite"
+}
+```
+
+**Metrics (Prometheus format):**
+```http
+GET /v1/sys/metrics
+```
+
+**Response:**
+```
+# HELP infernokms_request_total Total HTTP requests
+# TYPE infernokms_request_total counter
+infernokms_request_total{method="GET",path="/v1/secret/data",status="200"} 42
+infernokms_request_total{method="POST",path="/v1/secret/data",status="200"} 12
+
+# HELP infernokms_request_duration_seconds Request duration
+# TYPE infernokms_request_duration_seconds histogram
+infernokms_request_duration_seconds_bucket{method="GET",le="0.001"} 38
+infernokms_request_duration_seconds_bucket{method="GET",le="0.01"} 42
+infernokms_request_duration_seconds_bucket{method="GET",le="+Inf"} 42
+infernokms_request_duration_seconds_sum 0.156
+infernokms_request_duration_seconds_count 42
+
+# HELP infernokms_backend_operation_total Backend operations
+# TYPE infernokms_backend_operation_total counter
+infernokms_backend_operation_total{backend="sqlite",operation="get",status="success"} 42
+infernokms_backend_operation_total{backend="sqlite",operation="put",status="success"} 12
+```
+
+---
+
+### 5. Architecture
+
+#### 5.1 Component Overview
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ infernokms (Go binary)                                  │
+│                                                          │
+│  ┌────────────────────────────────────────────────┐     │
+│  │ HTTP Server (unix socket)                      │     │
+│  │                                                 │     │
+│  │  • Vault KV v2 compatible endpoints            │     │
+│  │  • Request ID generation (ULID)                │     │
+│  │  • Context extraction from requests            │     │
+│  │  • Response formatting (Vault JSON)            │     │
+│  │  • Error handling                              │     │
+│  │  • Metrics collection (Prometheus)             │     │
+│  │  • Structured logging (slog)                   │     │
+│  └────────────┬───────────────────────────────────┘     │
+│               │                                          │
+│               ▼                                          │
+│  ┌────────────────────────────────────────────────┐     │
+│  │ Backend Interface (context-aware)              │     │
+│  │                                                 │     │
+│  │  type Backend interface {                      │     │
+│  │    Get(ctx, path) (Secret, error)              │     │
+│  │    Put(ctx, path, data) (Metadata, error)      │     │
+│  │    Delete(ctx, path) error                     │     │
+│  │    List(ctx, path) ([]string, error)           │     │
+│  │    GetMetadata(ctx, path) (Metadata, error)    │     │
+│  │  }                                              │     │
+│  └────────────┬───────────────────────────────────┘     │
+│               │                                          │
+│       ┌───────┴───────┬──────────────┬──────────────┐   │
+│       ▼               ▼              ▼              ▼   │
+│  ┌─────────┐   ┌──────────┐   ┌─────────┐   ┌────────┐│
+│  │ SQLite  │   │  Vault   │   │ AWS KMS │   │ Custom ││
+│  │ Backend │   │ Backend  │   │ Backend │   │Backend ││
+│  │ (demo)  │   │ (proxy)  │   │(future) │   │        ││
+│  └─────────┘   └──────────┘   └─────────┘   └────────┘│
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 5.2 Backend Interface
+
+**Core abstraction with context support:**
+```go
+// internal/kms/backend.go
+
+package kms
+
+import (
+    "context"
+    "errors"
+    "time"
+)
+
+var (
+    ErrNotFound = errors.New("secret not found")
+    ErrExists   = errors.New("secret already exists")
+)
+
+// Secret represents a stored secret with metadata
+type Secret struct {
+    Data     map[string]interface{} // Actual secret data
+    Metadata SecretMetadata
+}
+
+// SecretMetadata matches Vault's metadata structure
+type SecretMetadata struct {
+    CreatedTime     time.Time              `json:"created_time"`
+    CustomMetadata  map[string]interface{} `json:"custom_metadata"`
+    DeletionTime    string                 `json:"deletion_time"`
+    Destroyed       bool                   `json:"destroyed"`
+    Version         int                    `json:"version"`
+}
+
+// Backend is the storage interface
+// All methods accept context.Context for cancellation, timeouts, and tracing
+type Backend interface {
+    // Get retrieves a secret by path
+    Get(ctx context.Context, path string) (*Secret, error)
+
+    // Put stores a secret at path
+    Put(ctx context.Context, path string, data map[string]interface{}) (*SecretMetadata, error)
+
+    // Delete removes a secret
+    Delete(ctx context.Context, path string) error
+
+    // List returns keys at path (directory-like)
+    List(ctx context.Context, path string) ([]string, error)
+
+    // GetMetadata retrieves metadata without secret data
+    GetMetadata(ctx context.Context, path string) (*SecretMetadata, error)
+
+    // Close cleans up backend resources
+    Close() error
+}
+```
+
+**Why this interface?**
+
+1. **Matches Vault operations** — Get, Put, Delete, List are Vault's core ops
+2. **Context-aware** — Supports cancellation, timeouts, request tracing
+3. **Swappable backends** — Change storage without touching HTTP layer
+4. **Testable** — Easy to mock for unit tests
+5. **Extensible** — Add new backends (etcd, Redis, etc.) easily
+
+#### 5.3 SQLite Backend Implementation
+
+**Schema:**
+```sql
+-- internal/kms/sqlite/schema.sql
+
+CREATE TABLE IF NOT EXISTS secrets (
+    path TEXT PRIMARY KEY,
+    data TEXT NOT NULL,              -- JSON-encoded secret data
+    created_time TEXT NOT NULL,      -- ISO 8601 timestamp
+    version INTEGER NOT NULL DEFAULT 1,
+    destroyed INTEGER NOT NULL DEFAULT 0,
+    deletion_time TEXT DEFAULT '',
+    custom_metadata TEXT DEFAULT '{}'
+);
+
+CREATE INDEX idx_secrets_path ON secrets(path);
+CREATE INDEX idx_secrets_created ON secrets(created_time);
+```
+
+**Implementation:**
+```go
+// internal/kms/sqlite/backend.go
+
+package sqlite
+
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "log/slog"
+    "time"
+
+    "inferno/internal/kms"
+    _ "github.com/mattn/go-sqlite3"
+)
+
+type Backend struct {
+    db     *sql.DB
+    logger *slog.Logger
+}
+
+func New(dbPath string, logger *slog.Logger) (*Backend, error) {
+    db, err := sql.Open("sqlite3", dbPath)
+    if err != nil {
+        return nil, err
+    }
+
+    // Initialize schema
+    if err := initSchema(db); err != nil {
+        return nil, err
+    }
+
+    return &Backend{
+        db:     db,
+        logger: logger,
+    }, nil
+}
+
+func (b *Backend) Get(ctx context.Context, path string) (*kms.Secret, error) {
+    b.logger.Debug("Backend get", "path", path)
+
+    var dataJSON string
+    var metadata kms.SecretMetadata
+
+    err := b.db.QueryRowContext(ctx, `
+        SELECT data, created_time, version, destroyed, deletion_time, custom_metadata
+        FROM secrets WHERE path = ?
+    `, path).Scan(&dataJSON, &metadata.CreatedTime, &metadata.Version,
+        &metadata.Destroyed, &metadata.DeletionTime, &metadata.CustomMetadata)
+
+    if err == sql.ErrNoRows {
+        b.logger.Debug("Secret not found", "path", path)
+        return nil, kms.ErrNotFound
+    }
+    if err != nil {
+        b.logger.Error("Database error", "error", err, "path", path)
+        return nil, err
+    }
+
+    // Check context cancellation
+    if ctx.Err() != nil {
+        return nil, ctx.Err()
+    }
+
+    // Parse JSON data
+    var data map[string]interface{}
+    if err := json.Unmarshal([]byte(dataJSON), &data); err != nil {
+        b.logger.Error("Failed to unmarshal secret data", "error", err, "path", path)
+        return nil, err
+    }
+
+    b.logger.Debug("Secret retrieved", "path", path, "version", metadata.Version)
+
+    return &kms.Secret{
+        Data:     data,
+        Metadata: metadata,
+    }, nil
+}
+
+func (b *Backend) Put(ctx context.Context, path string, data map[string]interface{}) (*kms.SecretMetadata, error) {
+    b.logger.Debug("Backend put", "path", path)
+
+    dataJSON, err := json.Marshal(data)
+    if err != nil {
+        return nil, err
+    }
+
+    now := time.Now().UTC().Format(time.RFC3339Nano)
+
+    // Upsert with context
+    _, err = b.db.ExecContext(ctx, `
+        INSERT INTO secrets (path, data, created_time, version)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(path) DO UPDATE SET
+            data = excluded.data,
+            version = version + 1
+    `, path, dataJSON, now)
+
+    if err != nil {
+        b.logger.Error("Database error", "error", err, "path", path)
+        return nil, err
+    }
+
+    // Check context cancellation
+    if ctx.Err() != nil {
+        return nil, ctx.Err()
+    }
+
+    metadata := &kms.SecretMetadata{
+        CreatedTime: time.Now().UTC(),
+        Version:     1, // Simplified: always version 1 for demo
+        Destroyed:   false,
+    }
+
+    b.logger.Info("Secret stored", "path", path, "version", metadata.Version)
+
+    return metadata, nil
+}
+
+func (b *Backend) Delete(ctx context.Context, path string) error {
+    b.logger.Debug("Backend delete", "path", path)
+
+    _, err := b.db.ExecContext(ctx, "DELETE FROM secrets WHERE path = ?", path)
+    if err != nil {
+        b.logger.Error("Database error", "error", err, "path", path)
+        return err
+    }
+
+    // Check context cancellation
+    if ctx.Err() != nil {
+        return ctx.Err()
+    }
+
+    b.logger.Info("Secret deleted", "path", path)
+    return nil
+}
+
+func (b *Backend) List(ctx context.Context, path string) ([]string, error) {
+    b.logger.Debug("Backend list", "path", path)
+
+    // List paths that start with path prefix
+    rows, err := b.db.QueryContext(ctx, `
+        SELECT DISTINCT substr(path, length(?) + 1) as subpath
+        FROM secrets
+        WHERE path LIKE ? || '%'
+    `, path, path)
+
+    if err != nil {
+        b.logger.Error("Database error", "error", err, "path", path)
+        return nil, err
+    }
+    defer rows.Close()
+
+    var keys []string
+    for rows.Next() {
+        // Check context cancellation
+        if ctx.Err() != nil {
+            return nil, ctx.Err()
+        }
+
+        var key string
+        if err := rows.Scan(&key); err != nil {
+            b.logger.Error("Failed to scan row", "error", err)
+            return nil, err
+        }
+        keys = append(keys, key)
+    }
+
+    b.logger.Debug("Listed secrets", "path", path, "count", len(keys))
+    return keys, nil
+}
+
+func (b *Backend) GetMetadata(ctx context.Context, path string) (*kms.SecretMetadata, error) {
+    b.logger.Debug("Backend get metadata", "path", path)
+
+    var metadata kms.SecretMetadata
+
+    err := b.db.QueryRowContext(ctx, `
+        SELECT created_time, version, destroyed, deletion_time
+        FROM secrets WHERE path = ?
+    `, path).Scan(&metadata.CreatedTime, &metadata.Version,
+        &metadata.Destroyed, &metadata.DeletionTime)
+
+    if err == sql.ErrNoRows {
+        b.logger.Debug("Secret not found", "path", path)
+        return nil, kms.ErrNotFound
+    }
+    if err != nil {
+        b.logger.Error("Database error", "error", err, "path", path)
+        return nil, err
+    }
+
+    // Check context cancellation
+    if ctx.Err() != nil {
+        return nil, ctx.Err()
+    }
+
+    b.logger.Debug("Metadata retrieved", "path", path)
+    return &metadata, nil
+}
+
+func (b *Backend) Close() error {
+    b.logger.Info("Closing SQLite backend")
+    return b.db.Close()
+}
+```
+
+#### 5.4 Vault Backend (Proxy Mode)
+
+For production, infernokms can proxy requests to real Vault:
+
+```go
+// internal/kms/vault/backend.go
+
+package vault
+
+import (
+    "context"
+    "log/slog"
+
+    vault "github.com/hashicorp/vault/api"
+    "inferno/internal/kms"
+)
+
+type Backend struct {
+    client *vault.Client
+    logger *slog.Logger
+}
+
+func New(address, token string, logger *slog.Logger) (*Backend, error) {
+    config := vault.DefaultConfig()
+    config.Address = address
+
+    client, err := vault.NewClient(config)
+    if err != nil {
+        return nil, err
+    }
+
+    client.SetToken(token)
+
+    return &Backend{
+        client: client,
+        logger: logger,
+    }, nil
+}
+
+func (b *Backend) Get(ctx context.Context, path string) (*kms.Secret, error) {
+    b.logger.Debug("Vault backend get", "path", path)
+
+    // Add "secret/data/" prefix for Vault KV v2
+    vaultPath := "secret/data/" + path
+
+    // Use context for Vault request
+    secret, err := b.client.Logical().ReadWithContext(ctx, vaultPath)
+    if err != nil {
+        b.logger.Error("Vault error", "error", err, "path", vaultPath)
+        return nil, err
+    }
+    if secret == nil {
+        b.logger.Debug("Secret not found in Vault", "path", vaultPath)
+        return nil, kms.ErrNotFound
+    }
+
+    // Parse Vault response (nested data.data structure)
+    data := secret.Data["data"].(map[string]interface{})
+    metadata := secret.Data["metadata"].(map[string]interface{})
+
+    b.logger.Debug("Secret retrieved from Vault", "path", path)
+
+    return &kms.Secret{
+        Data:     data,
+        Metadata: parseVaultMetadata(metadata),
+    }, nil
+}
+
+func (b *Backend) Put(ctx context.Context, path string, data map[string]interface{}) (*kms.SecretMetadata, error) {
+    b.logger.Debug("Vault backend put", "path", path)
+
+    vaultPath := "secret/data/" + path
+
+    payload := map[string]interface{}{
+        "data": data,
+    }
+
+    secret, err := b.client.Logical().WriteWithContext(ctx, vaultPath, payload)
+    if err != nil {
+        b.logger.Error("Vault error", "error", err, "path", vaultPath)
+        return nil, err
+    }
+
+    b.logger.Info("Secret stored in Vault", "path", path)
+    return parseVaultMetadata(secret.Data), nil
+}
+
+func (b *Backend) Close() error {
+    b.logger.Info("Closing Vault backend")
+    // Vault client doesn't need explicit closing
+    return nil
+}
+
+// Helper to parse Vault metadata format
+func parseVaultMetadata(data map[string]interface{}) *kms.SecretMetadata {
+    // Implementation details...
+    return &kms.SecretMetadata{}
+}
+```
+
+**Key insight:** The HTTP layer doesn't know or care if it's talking to SQLite or Vault. Same API, swappable backend.
+
+---
+
+### 6. HTTP Server Implementation
+
+#### 6.1 Server Structure
+
+```go
+// cmd/infernokms/main.go
+
+package main
+
+import (
+    "context"
+    "log/slog"
+    "net"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "inferno/internal/kms"
+    "inferno/internal/kms/sqlite"
+)
+
+type Server struct {
+    backend  kms.Backend
+    listener net.Listener
+    logger   *slog.Logger
+    metrics  *Metrics
+}
+
+func main() {
+    // Setup structured logging
+    logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+        Level: slog.LevelInfo,
+    }))
+
+    // Load config
+    cfg := loadConfig()
+
+    // Initialize backend
+    backend, err := sqlite.New(cfg.DBPath, logger)
+    if err != nil {
+        logger.Error("Failed to initialize backend", "error", err)
+        os.Exit(1)
+    }
+    defer backend.Close()
+
+    // Create server
+    srv := &Server{
+        backend: backend,
+        logger:  logger,
+        metrics: NewMetrics(),
+    }
+
+    // Setup unix socket
+    os.Remove(cfg.SocketPath)
+    listener, err := net.Listen("unix", cfg.SocketPath)
+    if err != nil {
+        logger.Error("Failed to create socket", "error", err)
+        os.Exit(1)
+    }
+    defer listener.Close()
+
+    // Set permissions
+    os.Chmod(cfg.SocketPath, 0660)
+    srv.listener = listener
+
+    // Setup HTTP router
+    mux := http.NewServeMux()
+    mux.HandleFunc("/v1/secret/data/", srv.handleSecretData)
+    mux.HandleFunc("/v1/secret/metadata/", srv.handleSecretMetadata)
+    mux.HandleFunc("/v1/sys/health", srv.handleHealth)
+    mux.HandleFunc("/v1/sys/seal-status", srv.handleSealStatus)
+    mux.HandleFunc("/v1/sys/metrics", srv.handleMetrics)
+
+    // Add middleware
+    handler := srv.loggingMiddleware(srv.metricsMiddleware(mux))
+
+    // Start server
+    httpServer := &http.Server{Handler: handler}
+
+    go func() {
+        logger.Info("KMS service started", "socket", cfg.SocketPath)
+        if err := httpServer.Serve(listener); err != http.ErrServerClosed {
+            logger.Error("Server error", "error", err)
+            os.Exit(1)
+        }
+    }()
+
+    // Graceful shutdown
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+    <-sigChan
+
+    logger.Info("Shutting down...")
+    httpServer.Shutdown(context.Background())
+}
+```
+
+#### 6.2 Secret Data Handler
+
+```go
+// cmd/infernokms/handlers.go
+
+func (s *Server) handleSecretData(w http.ResponseWriter, r *http.Request) {
+    // Extract path: /v1/secret/data/inferno/volumes/vol_xxx/encryption-key
+    // → path = inferno/volumes/vol_xxx/encryption-key
+    path := strings.TrimPrefix(r.URL.Path, "/v1/secret/data/")
+
+    // Extract context from request
+    ctx := r.Context()
+
+    switch r.Method {
+    case http.MethodGet:
+        s.handleGet(w, r, ctx, path)
+    case http.MethodPost, http.MethodPut:
+        s.handlePut(w, r, ctx, path)
+    case http.MethodDelete:
+        s.handleDelete(w, r, ctx, path)
+    default:
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+    }
+}
+
+func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, ctx context.Context, path string) {
+    requestID := generateRequestID()
+
+    s.logger.Info("Get secret request",
+        "path", path,
+        "request_id", requestID,
+    )
+
+    // Pass context to backend
+    secret, err := s.backend.Get(ctx, path)
+    if err == kms.ErrNotFound {
+        s.logger.Debug("Secret not found", "path", path, "request_id", requestID)
+        s.respondError(w, http.StatusNotFound, "Secret not found")
+        return
+    }
+    if err != nil {
+        s.logger.Error("Backend error", "error", err, "path", path, "request_id", requestID)
+        s.respondError(w, http.StatusInternalServerError, "Internal error")
+        return
+    }
+
+    // Format Vault-compatible response
+    resp := map[string]interface{}{
+        "request_id":     requestID,
+        "lease_id":       "",
+        "renewable":      false,
+        "lease_duration": 0,
+        "data": map[string]interface{}{
+            "data":     secret.Data,
+            "metadata": secret.Metadata,
+        },
+        "wrap_info": nil,
+        "warnings":  nil,
+        "auth":      nil,
+    }
+
+    s.logger.Info("Secret retrieved",
+        "path", path,
+        "request_id", requestID,
+        "version", secret.Metadata.Version,
+    )
+
+    s.respondJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, ctx context.Context, path string) {
+    requestID := generateRequestID()
+
+    s.logger.Info("Put secret request", "path", path, "request_id", requestID)
+
+    // Parse request body
+    var req struct {
+        Data map[string]interface{} `json:"data"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        s.logger.Warn("Invalid JSON", "error", err, "request_id", requestID)
+        s.respondError(w, http.StatusBadRequest, "Invalid JSON")
+        return
+    }
+
+    // Store in backend with context
+    metadata, err := s.backend.Put(ctx, path, req.Data)
+    if err != nil {
+        s.logger.Error("Backend error", "error", err, "path", path, "request_id", requestID)
+        s.respondError(w, http.StatusInternalServerError, "Failed to store secret")
+        return
+    }
+
+    // Format response
+    resp := map[string]interface{}{
+        "request_id": requestID,
+        "data":       metadata,
+    }
+
+    s.logger.Info("Secret stored",
+        "path", path,
+        "request_id", requestID,
+        "version", metadata.Version,
+    )
+
+    s.respondJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, ctx context.Context, path string) {
+    requestID := generateRequestID()
+
+    s.logger.Info("Delete secret request", "path", path, "request_id", requestID)
+
+    // Delete from backend with context
+    if err := s.backend.Delete(ctx, path); err != nil {
+        s.logger.Error("Backend error", "error", err, "path", path, "request_id", requestID)
+        s.respondError(w, http.StatusInternalServerError, "Failed to delete secret")
+        return
+    }
+
+    resp := map[string]interface{}{
+        "request_id": requestID,
+        "data":       nil,
+    }
+
+    s.logger.Info("Secret deleted", "path", path, "request_id", requestID)
+    s.respondJSON(w, http.StatusNoContent, resp)
+}
+```
+
+#### 6.3 Middleware
+
+```go
+// cmd/infernokms/middleware.go
+
+func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+
+        // Wrap response writer to capture status code
+        wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+        next.ServeHTTP(wrapped, r)
+
+        s.logger.Info("HTTP request",
+            "method", r.Method,
+            "path", r.URL.Path,
+            "status", wrapped.statusCode,
+            "duration_ms", time.Since(start).Milliseconds(),
+        )
+    })
+}
+
+func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+        next.ServeHTTP(wrapped, r)
+
+        // Record metrics
+        s.metrics.requestsTotal.WithLabelValues(
+            r.Method,
+            r.URL.Path,
+            fmt.Sprintf("%d", wrapped.statusCode),
+        ).Inc()
+
+        s.metrics.requestDuration.WithLabelValues(
+            r.Method,
+            r.URL.Path,
+        ).Observe(time.Since(start).Seconds())
+    })
+}
+
+type responseWriter struct {
+    http.ResponseWriter
+    statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    rw.statusCode = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+```
+
+#### 6.4 Helper Functions
+
+```go
+// Request ID generation (ULID for sortable, unique IDs)
+func generateRequestID() string {
+    return ulid.Make().String()
+}
+
+// JSON response helper
+func (s *Server) respondJSON(w http.ResponseWriter, status int, data interface{}) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(status)
+    json.NewEncoder(w).Encode(data)
+}
+
+// Error response (Vault format)
+func (s *Server) respondError(w http.ResponseWriter, status int, message string) {
+    resp := map[string]interface{}{
+        "errors": []string{message},
+    }
+    s.respondJSON(w, status, resp)
+}
+```
+
+---
+
+### 7. Deployment
+
+#### 7.1 Systemd Service Unit
+
+```ini
+# /etc/systemd/system/infernokms.service
+
+[Unit]
+Description=Inferno Key Management Service
+Documentation=https://github.com/your-org/inferno
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=inferno
+Group=inferno
+
+# Environment
+Environment="INFERNO_ROOT=/var/lib/inferno"
+Environment="KMS_DB_PATH=/var/lib/inferno/kms.db"
+Environment="KMS_SOCKET_PATH=/var/lib/inferno/kms.sock"
+Environment="KMS_LOG_LEVEL=info"
+
+# Execution
+ExecStart=/usr/share/inferno/infernokms
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/inferno
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### 7.2 Configuration File
+
+```yaml
+# /etc/infernokms/config.yaml
+
+# Backend configuration
+backend:
+  type: sqlite  # or "vault", "aws-kms"
+
+  # SQLite backend options
+  sqlite:
+    db_path: /var/lib/inferno/kms.db
+
+  # Vault backend options (for proxy mode)
+  vault:
+    address: https://vault.internal:8200
+    token_file: /etc/infernokms/vault-token
+    namespace: inferno
+
+# Server configuration
+server:
+  socket_path: /var/lib/inferno/kms.sock
+  socket_mode: "0660"
+  socket_user: inferno
+  socket_group: inferno
+
+# Logging
+logging:
+  level: info  # debug, info, warn, error
+  format: json # json or text
+  output: stdout
+
+# Metrics
+metrics:
+  enabled: true
+  include_hostname: false
+```
+
+---
+
+### 8. Monitoring & Observability
+
+#### 8.1 Structured Logging with slog
+
+All logging uses Go's standard `log/slog` package:
+
+```go
+// Info level
+s.logger.Info("Secret retrieved",
+    "path", path,
+    "request_id", requestID,
+    "duration_ms", elapsed.Milliseconds(),
+)
+
+// Error level
+s.logger.Error("Backend error",
+    "path", path,
+    "error", err,
+    "request_id", requestID,
+)
+
+// Debug level (only if log level is debug)
+s.logger.Debug("Cache hit", "path", path, "ttl_remaining", ttl)
+```
+
+**Output (JSON format):**
+```json
+{
+  "time": "2026-01-23T18:05:00.123456789Z",
+  "level": "INFO",
+  "msg": "Secret retrieved",
+  "path": "inferno/volumes/vol_xxx/encryption-key",
+  "request_id": "01HQJ8X9Y2Z3A4B5C6D7E8F9G0",
+  "duration_ms": 1.23
+}
+```
+
+#### 8.2 Audit Logging
+
+Separate audit trail for compliance:
+
+```go
+// cmd/infernokms/audit.go
+
+type AuditLogger struct {
+    logger *slog.Logger
+}
+
+func (a *AuditLogger) LogAccess(ctx context.Context, path string, operation string, status int) {
+    requestID := ctx.Value("request_id")
+
+    a.logger.Info("audit",
+        "type", "access",
+        "path", path,
+        "operation", operation,
+        "status", status,
+        "request_id", requestID,
+        "timestamp", time.Now().UTC().Format(time.RFC3339Nano),
+    )
+}
+```
+
+**Audit log file:** `/var/log/infernokms/audit.log`
+
+#### 8.3 Prometheus Metrics
+
+```go
+// cmd/infernokms/metrics.go
+
+import "github.com/prometheus/client_golang/prometheus"
+
+type Metrics struct {
+    requestsTotal   *prometheus.CounterVec
+    requestDuration *prometheus.HistogramVec
+    backendOps      *prometheus.CounterVec
+}
+
+func NewMetrics() *Metrics {
+    m := &Metrics{
+        requestsTotal: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "infernokms_requests_total",
+                Help: "Total HTTP requests",
+            },
+            []string{"method", "path", "status"},
+        ),
+        requestDuration: prometheus.NewHistogramVec(
+            prometheus.HistogramOpts{
+                Name:    "infernokms_request_duration_seconds",
+                Help:    "Request duration in seconds",
+                Buckets: prometheus.DefBuckets,
+            },
+            []string{"method", "path"},
+        ),
+        backendOps: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "infernokms_backend_operations_total",
+                Help: "Backend operations",
+            },
+            []string{"backend", "operation", "status"},
+        ),
+    }
+
+    prometheus.MustRegister(m.requestsTotal, m.requestDuration, m.backendOps)
+    return m
+}
+```
+
+---
+
+### 9. Client Usage Examples
+
+#### 9.1 Bash (volume creation)
+
+```bash
+# scripts/libvol.sh
+
+volume_create() {
+    local volume_id="vol_$(ulid_generate)"
+    local encryption_key="$(head -c 32 /dev/urandom | base64 -w0)"
+
+    # Format LUKS volume...
+
+    # Store key in KMS
+    curl -X POST --unix-socket "$INFERNO_ROOT/kms.sock" \
+        "http://unix/v1/secret/data/inferno/volumes/$volume_id/encryption-key" \
+        -H "Content-Type: application/json" \
+        -d "{\"data\": {\"key\": \"$encryption_key\", \"algorithm\": \"aes-xts-plain64\", \"key_size\": 512}}" \
+        --silent --show-error
+}
+```
+
+#### 9.2 Go (kiln proxy)
+
+```go
+// cmd/kiln/keyproxy.go
+
+func requestKeyFromKMS(ctx context.Context, volumeID string) (*KeyResponse, error) {
+    // Construct Vault-compatible path
+    path := fmt.Sprintf("/v1/secret/data/inferno/volumes/%s/encryption-key", volumeID)
+
+    // HTTP client with unix socket transport
+    client := &http.Client{
+        Transport: &http.Transport{
+            DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+                return net.Dial("unix", "./kms.sock")
+            },
+        },
+    }
+
+    req, _ := http.NewRequestWithContext(ctx, "GET", "http://unix"+path, nil)
+
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != 200 {
+        return nil, fmt.Errorf("KMS returned %d", resp.StatusCode)
+    }
+
+    // Parse Vault-format response
+    var vaultResp struct {
+        Data struct {
+            Data struct {
+                Key       string `json:"key"`
+                Algorithm string `json:"algorithm"`
+                KeySize   int    `json:"key_size"`
+            } `json:"data"`
+        } `json:"data"`
+    }
+
+    if err := json.NewDecoder(resp.Body).Decode(&vaultResp); err != nil {
+        return nil, err
+    }
+
+    return &KeyResponse{
+        EncryptionKey: vaultResp.Data.Data.Key,
+        Algorithm:     vaultResp.Data.Data.Algorithm,
+        KeySize:       vaultResp.Data.Data.KeySize,
+    }, nil
+}
+```
+
+---
+
+### 10. Testing
+
+#### 10.1 Unit Tests (Backend)
+
+```go
+// internal/kms/sqlite/backend_test.go
+
+func TestSQLiteBackend_GetPut(t *testing.T) {
+    logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+    // Create temp db
+    backend, err := New(":memory:", logger)
+    require.NoError(t, err)
+    defer backend.Close()
+
+    ctx := context.Background()
+
+    // Put secret
+    data := map[string]interface{}{
+        "key":       "test-key-value",
+        "algorithm": "aes-xts-plain64",
+    }
+
+    metadata, err := backend.Put(ctx, "test/path", data)
+    require.NoError(t, err)
+    assert.Equal(t, 1, metadata.Version)
+
+    // Get secret
+    secret, err := backend.Get(ctx, "test/path")
+    require.NoError(t, err)
+    assert.Equal(t, "test-key-value", secret.Data["key"])
+}
+
+func TestSQLiteBackend_ContextCancellation(t *testing.T) {
+    logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+    backend, _ := New(":memory:", logger)
+    defer backend.Close()
+
+    // Create cancelled context
+    ctx, cancel := context.WithCancel(context.Background())
+    cancel()
+
+    // Should return context error
+    _, err := backend.Get(ctx, "test/path")
+    assert.Error(t, err)
+    assert.True(t, errors.Is(err, context.Canceled))
+}
+```
+
+---
+
+### 11. Future Enhancements
+
+- **Key versioning:** Support multiple versions per path (Vault KV v2 feature)
+- **Key rotation:** Automated rotation with grace periods
+- **Replication:** Multi-node setup for HA
+- **Policies:** Fine-grained access control per path
+- **Dynamic secrets:** Generate short-lived secrets on demand
+- **Audit streaming:** Send audit logs to external systems (Splunk, etc.)
+- **Web UI:** Simple web interface for key management
+- **CLI tool:** `infernokms` CLI for admin operations
+- **Distributed tracing:** OpenTelemetry integration via context propagation
+
+---
+
+### 12. References
+
+- [HashiCorp Vault KV v2 API](https://developer.hashicorp.com/vault/api-docs/secret/kv/kv-v2)
+- [Vault Architecture](https://developer.hashicorp.com/vault/docs/internals/architecture)
+- [Go slog Package](https://pkg.go.dev/log/slog)
+- [Context Package](https://pkg.go.dev/context)
+- [SQLite](https://www.sqlite.org/)
+- [ULID Specification](https://github.com/ulid/spec)
+- RFC-005: Guest-Side Volume Encryption with Vsock Key Delivery
+
+---
+
+**Document Version:** 1.0
+
+**Last Updated:** 2026-01-23
+
+**Status:** Draft - Ready for implementation
+
+**Implementation Priority:**
+1. Core backend interface with context support
+2. SQLite implementation with slog
+3. HTTP server with context extraction
+4. Systemd service integration
+5. Basic testing (unit + integration)
+6. Audit logging
+7. Vault backend (future)

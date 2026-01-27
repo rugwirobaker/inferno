@@ -1,0 +1,1376 @@
+## RFC 002: Volumes — Persistent Block Storage for Firecracker MicroVMs
+
+**Authors:** Rugwiro Valentin · Platform Team
+
+**Date:** 2025-01-14
+
+**Status:** Draft
+
+---
+
+### 1. Abstract
+
+andasy.io runs stateless applications on Firecracker MicroVMs with ephemeral root disks that reset on each reboot. This RFC introduces **Volumes**, a persistent block storage primitive built on local NVMe, LVM thin provisioning, and RAID 10. Volumes provide durable storage for databases and stateful workloads, with **checkpoints** for point-in-time snapshots and **backups** for off-site disaster recovery to S3-compatible storage (Tigris). The design prioritises low-latency NVMe performance—critical for database workloads—over the flexibility of network-attached storage.
+
+---
+
+### 2. Motivation
+
+* **Stateful workloads** — Most paying customers need databases; ephemeral root disks are insufficient.
+* **NVMe performance** — Database queries must be fast; network storage adds latency. See [PlanetScale Metal](https://planetscale.com/blog/announcing-metal).
+* **Disaster recovery** — Local disks fail; off-site backups to Tigris provide durability beyond a single host.
+* **Operational simplicity** — Build on LVM, a well-understood primitive, rather than introducing distributed storage complexity.
+* **Versioned storage** — Users and applications should be able to create point-in-time snapshots and restore to any of them when things go wrong.
+
+---
+
+### 3. Scope & Goals
+
+| In Scope (v1)                                           | Out of Scope (v1)                              |
+| ------------------------------------------------------- | ---------------------------------------------- |
+| Local NVMe-backed volumes with LVM thin provisioning    | Network-attached / distributed storage         |
+| RAID 10 for disk fault tolerance                        | Live migration of volumes between hosts        |
+| One volume per machine (1:1 attachment)                 | Shared volumes across multiple machines        |
+| Checkpoints with restore to any point                   | Hot-swap restore (reboot is acceptable)        |
+| Daily incremental backups to Tigris (S3)                | Continuous replication / synchronous DR        |
+| Fork: create copy of volume (same or different host)    | Hot migration with block-level replication     |
+| Volume resize (grow only)                               | Volume shrink                                  |
+| Lease-based concurrency control                         | Distributed locking across hosts               |
+| init coordination for consistent checkpoints             | Automatic application-level quiesce hooks      |
+| ext4 filesystem (formatted on creation)                 | Filesystem choice (XFS, btrfs, etc.)           |
+
+---
+
+### 4. Key Concepts & Constraints
+
+#### 4.1 Resource Relationships
+
+```
+App
+ ├── Machine (VM)
+ │     └── attached to one Volume (or none)
+ │
+ └── Volume
+       ├── exists on one Host (one Pool)
+       ├── attached to one Machine (or none)
+       └── has many Checkpoints
+             └── may have Backups in S3
+```
+
+**Constraints:**
+
+* A **Volume** belongs to exactly one **App**.
+* A **Volume** exists on exactly one **Host** in a single region (not network storage).
+* A **Volume** can attach to at most one **Machine** at a time.
+* A **Machine** can mount at most one **Volume** at a time.
+* An **App** with N machines needing persistent storage requires N volumes.
+* Volumes and Machines have **independent lifecycles** — destroying a Machine does not destroy its Volume; future Machines in the same App can inherit orphaned Volumes.
+
+#### 4.2 Checkpoints, Backups, and Forks
+
+| Feature | Description | Creates New Volume? |
+|---------|-------------|---------------------|
+| **Checkpoint** | Snapshot current state, immutable | No — adds snapshot to this volume |
+| **Restore** | Reset volume to a checkpoint's state | No — same volume, in-place, requires reboot |
+| **Backup** | Upload checkpoint to S3 | No — off-site copy for DR |
+| **Fork** | Create independent copy of volume | **Yes** — new volume, possibly different host |
+| **Restore from Backup** | Download from S3 to new volume | **Yes** — new volume (migration/DR) |
+
+---
+
+### 5. Design & Specification
+
+#### 5.1 Storage Stack
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Thin Pool (vg_storage/thinpool)                  │
+│                                                                      │
+│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
+│   │ vol-a       │  │ vol-b       │  │ vol-c       │   ...           │
+│   │ + checkpoints│ │ + checkpoints│ │             │                 │
+│   └─────────────┘  └─────────────┘  └─────────────┘                 │
+│                                                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│                        LVM Volume Group (vg_storage)                 │
+├──────────────────────────────────────────────────────────────────────┤
+│                      mdadm RAID 10 (/dev/md0)                        │
+├──────────────────────────────────────────────────────────────────────┤
+│        NVMe 0      │      NVMe 1      │     NVMe 2     │    NVMe 3   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Rationale for RAID 10:**
+
+* **Fault tolerance** — One NVMe failure does not cause data loss; array rebuilds transparently.
+* **Write performance** — No parity calculation; mirrors only. Critical for database write latency.
+* **Rebuild safety** — Faster rebuilds than RAID 5/6; lower risk of URE during recovery.
+* **Operational simplicity** — Single thin pool to manage vs. per-disk pools with fragmented capacity.
+
+The 50% capacity overhead is acceptable given thin provisioning with overcommit.
+
+**Thin Provisioning Benefits:**
+
+* Volumes and checkpoints share a common pool; space allocated on demand.
+* Checkpoints are instantaneous (metadata operation only).
+* Multiple checkpoints share unchanged blocks via copy-on-write.
+
+#### 5.2 Thin Pool Capacity Management
+
+**Monitoring:**
+
+* Alert at 70% data usage (warning) and 85% (critical).
+* Alert at 75% metadata usage (critical) — metadata exhaustion corrupts the pool.
+* Expose metrics via node_exporter textfile collector (see § 5.12).
+
+**Overcommit Strategy:**
+
+* Track provisioned vs. actual usage per host.
+* Scheduler degrades host score as actual usage approaches threshold.
+* Hard block new volume creation when pool exceeds safe threshold.
+
+**Exhaustion Handling:**
+
+* If thin pool fills, writes fail with I/O errors.
+* VMs see disk errors; workloads degrade.
+* Recovery: extend pool (if space available), delete old checkpoints, or migrate volumes off-host.
+
+#### 5.3 Volume Lifecycle
+
+```
+                              ┌─────────────────┐
+                              │    creating     │
+                              └────────┬────────┘
+                                       │
+                       success         │         failed
+                 ┌─────────────────────┼─────────────────────┐
+                 ▼                                           ▼
+        ┌─────────────────┐                         ┌─────────────┐
+   ┌───►│   available     │◄────────────┐          │   error     │
+   │    └────────┬────────┘             │          └─────────────┘
+   │             │                      │
+   │             │ attach               │ detach
+   │             ▼                      │
+   │    ┌─────────────────┐             │
+   │    │   attaching     │             │
+   │    └────────┬────────┘             │
+   │             │                      │
+   │             │ success              │
+   │             ▼                      │
+   │    ┌─────────────────┐             │
+   │    │    attached     │─────────────┤
+   │    └────────┬────────┘             │
+   │             │                      │
+   │             │ detach               │
+   │             ▼                      │
+   │    ┌─────────────────┐             │
+   └────│   detaching     │─────────────┘
+        └─────────────────┘
+
+        (from available or attached with force)
+                 │
+                 │ delete
+                 ▼
+        ┌─────────────────┐
+        │    deleting     │
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ deleted (tomb)  │
+        └─────────────────┘
+```
+
+**Checkpoint and backup operations** may occur in `available` or `attached` states.
+
+#### 5.4 Checkpoint Semantics: Copy-on-Write Model
+
+**Physical Reality:**
+
+A thin LV is a mapping from logical blocks to physical blocks in the pool. When you snapshot a thin LV, you create a new thin LV that **shares the same block mappings**. Both point to the same physical blocks initially.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Thin Pool                                │
+│                                                                  │
+│   Physical blocks: [A] [B] [C] [D] [E] [F] [G] ...              │
+│                     ▲   ▲   ▲                                   │
+└─────────────────────┼───┼───┼───────────────────────────────────┘
+                      │   │   │
+        ┌─────────────┴───┴───┴─────────────┐
+        │                                   │
+   ┌────┴────┐                         ┌────┴────┐
+   │ active  │                         │   c1    │
+   │         │                         │ (snap)  │
+   │ blk0→A  │                         │ blk0→A  │  ← shared
+   │ blk1→B  │                         │ blk1→B  │  ← shared
+   │ blk2→C  │                         │ blk2→C  │  ← shared
+   └─────────┘                         └─────────┘
+```
+
+When **active** writes to blk1, it allocates a new physical block. The checkpoint still points to the original:
+
+```
+After write to active:
+
+   ┌─────────┐                         ┌─────────┐
+   │ active  │                         │   c1    │
+   │         │                         │ (frozen)│
+   │ blk0→A  │                         │ blk0→A  │  ← still shared
+   │ blk1→D  │  ← new block            │ blk1→B  │  ← original block
+   │ blk2→C  │                         │ blk2→C  │  ← still shared
+   └─────────┘                         └─────────┘
+```
+
+**Checkpoints are immutable.** They always reflect the exact state at snapshot time.
+
+**Building up checkpoints:**
+
+```
+After creating c1, c2, c3 over time:
+
+   ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+   │ active  │    │   c1    │    │   c2    │    │   c3    │
+   │ [A,D,E] │    │ [A,B,C] │    │ [A,D,C] │    │ [A,D,E] │
+   └─────────┘    └─────────┘    └─────────┘    └─────────┘
+                       │              │              │
+                       └──────────────┴──────────────┘
+                          All coexist, sharing blocks via CoW
+```
+
+There is no "linear chain" in the storage layer. Checkpoints are **independent frozen snapshots** that share physical blocks where data hasn't changed.
+
+**Lineage Tracking:**
+
+For user understanding, we track `source_checkpoint_id` — which checkpoint was the volume based on when this checkpoint was created. This forms a conceptual tree:
+
+```
+User's view:
+
+    c1 ────► c2 ────► c3
+    │
+    └────► c4 ────► c5    (created after restoring to c1)
+```
+
+**Restore Operation:**
+
+Restore resets the active LV to a checkpoint's state. All checkpoints remain.
+
+```
+Restore to c1:
+
+Before:
+   active → [A,D,E]     c1 → [A,B,C]     c2 → [A,D,C]     c3 → [A,D,E]
+
+After:
+   active → [A,B,C]     c1 → [A,B,C]     c2 → [A,D,C]     c3 → [A,D,E]
+                 │           │
+                 └───────────┘  (shares all blocks, for now)
+
+After new writes:
+   active → [A,B,F]     c1 → [A,B,C]     c2 → [A,D,C]     c3 → [A,D,E]
+                             │
+                             └── c1 unchanged, still [A,B,C]
+```
+
+**Key behaviors:**
+
+| Action | Result |
+|--------|--------|
+| Create checkpoint | Snapshot current active → new immutable checkpoint |
+| Restore to c1 | Active resets to c1's state; c1, c2, c3 **all remain** |
+| Write after restore | Active diverges from c1; all checkpoints unchanged |
+| Create c4 after restore | c4.source_checkpoint_id = c1 |
+| Restore to c3 later | Active resets to c3; c1, c2, c4 all remain |
+| Delete c2 | Only c2 removed; others unaffected |
+
+#### 5.5 Restore Operation
+
+Restore requires a **VM reboot**. Firecracker boots in ~125ms; total restore time is sub-second at the infrastructure layer.
+
+**Flow:**
+
+```
+restore(volume, target_checkpoint):
+    1. Acquire lease on volume
+    2. Stop VM (instant Firecracker shutdown)
+    3. Optionally: create pre_restore checkpoint of current state
+    4. Swap active LV:
+       a. lvremove vg_storage/vol-123-active
+       b. lvcreate --snapshot --name vol-123-active vg_storage/vol-123-c1
+    5. Update volume.active_source_checkpoint_id = target_checkpoint.id
+    6. Start VM (Firecracker boot ~125ms)
+    7. Release lease
+```
+
+**Total infrastructure time:** < 500ms
+
+Application startup time is the user's concern, but they expect restart semantics when restoring to a prior state.
+
+**Why reboot is acceptable:**
+
+* Firecracker boots extremely fast
+* Application state should reinitialize to match checkpoint anyway
+* Avoids complexity of filesystem cache invalidation
+* Clean failure mode — either works or doesn't
+
+#### 5.6 Volume Operations
+
+**Create Volume:**
+
+```
+create_volume(volume_id, name, size_bytes, destination?):
+    1. Validate:
+       - Volume ID doesn't already exist
+       - Size is within allowed bounds (e.g., 1GB - 2TB)
+       - Pool has sufficient space (considering overcommit policy)
+    2. Determine LV path:
+       lv_path = /dev/vg_storage/vol-{id}-active
+    3. Create thin LV:
+       lvcreate --thin --name vol-{id}-active \
+                --virtualsize {size_bytes}B vg_storage/thinpool
+    4. Format with ext4:
+       mkfs.ext4 -L {name} /dev/vg_storage/vol-{id}-active
+    5. Insert volume record:
+       - id = volume_id (from control plane)
+       - pool_id = 'default'
+       - lv_path = computed path
+       - destination = provided or '/data'
+       - state = 'available'
+       - active_source_checkpoint_id = NULL
+    6. Return volume object
+```
+
+The `volume_id` is generated by the control plane, which tracks the app→volume relationship. sparkd only manages local resources.
+
+ext4 is the only supported filesystem. It is well-suited for database workloads, supports online resize via `resize2fs`, and has reliable `fsfreeze` support for consistent checkpoints.
+
+**Get Volume:**
+
+```
+get_volume(volume_id):
+    1. Query volume by ID
+    2. If not found, return 404
+    3. Enrich with:
+       - Checkpoint count
+       - Latest checkpoint info
+       - Attached machine info (if any)
+       - Last backup timestamp
+    4. Return volume object
+```
+
+**List Volumes:**
+
+```
+list_volumes(state?, attached?):
+    1. Query volumes with optional filters:
+       - Filter by state if provided
+       - Filter by attached (true = has machine, false = orphaned)
+    2. For each volume, include summary:
+       - Checkpoint count
+       - Attached machine ID
+       - Last backup timestamp
+    3. Return array of volume objects
+```
+
+**Resize Volume (grow only):**
+
+```
+resize_volume(volume_id, new_size_bytes):
+    1. Acquire lease
+    2. Validate:
+       - new_size_bytes > current size_bytes
+       - Pool has space for growth
+    3. Extend thin LV:
+       lvextend -L {new_size_bytes}B vg_storage/vol-{id}-active
+    4. If volume is attached:
+       a. init.resize(device, new_size_bytes)   # via vsock
+          - Rescans block device
+          - Runs resize2fs to grow ext4 filesystem
+    5. Update volume.size_bytes
+    6. Release lease
+    7. Return updated volume object
+```
+
+**Destroy Volume:**
+
+```
+destroy_volume(volume_id):
+    1. Acquire lease
+    2. Validate:
+       - Volume exists
+       - Volume is in 'available' state (not attached)
+       - Or force=true was specified
+    3. If attached and force=true:
+       a. Stop VM
+       b. Update volume state → 'detaching' → 'available'
+    4. Update volume state → 'deleting'
+    5. Delete all checkpoints:
+       for checkpoint in volume.checkpoints:
+           lvremove -f vg_storage/{checkpoint.lv_name}
+           delete checkpoint record
+    6. Delete active LV:
+       lvremove -f vg_storage/vol-{id}-active
+    7. Delete backup records (S3 data retained per retention policy)
+    8. Delete volume record (or mark as deleted tombstone)
+    9. Release lease
+```
+
+#### 5.7 Checkpoint Operations
+
+**Create Checkpoint:**
+
+```
+create_checkpoint(volume_id, comment?):
+    1. Acquire lease
+    2. Validate:
+       - Volume exists
+       - Volume is in 'available' or 'attached' state
+       - Checkpoint limit not exceeded (based on tier)
+    3. Generate checkpoint ID and sequence_num
+    4. If volume is attached:
+       a. init.freeze()   # sync + fsfreeze --freeze (via vsock)
+       b. lvcreate --snapshot --name vol-{id}-c{seq} vg_storage/vol-{id}-active
+       c. init.thaw()     # fsfreeze --unfreeze (via vsock)
+    5. Else:
+       a. lvcreate --snapshot --name vol-{id}-c{seq} vg_storage/vol-{id}-active
+    6. Insert checkpoint record:
+       - source_checkpoint_id = volume.active_source_checkpoint_id
+       - type = 'user'
+       - comment = provided comment
+    7. Update volume.active_source_checkpoint_id = new checkpoint ID
+    8. Release lease
+    9. Return checkpoint object
+```
+
+**Get Checkpoint:**
+
+```
+get_checkpoint(volume_id, checkpoint_id):
+    1. Query checkpoint by ID
+    2. Validate checkpoint belongs to volume
+    3. If not found, return 404
+    4. Enrich with:
+       - Source checkpoint info (parent)
+       - Backup status (has this been backed up?)
+       - Size on disk (exclusive bytes, if tracked)
+    5. Return checkpoint object
+```
+
+**List Checkpoints:**
+
+```
+list_checkpoints(volume_id):
+    1. Validate volume exists
+    2. Query all checkpoints for volume
+    3. Order by sequence_num (or created_at)
+    4. For each checkpoint, include:
+       - ID, sequence_num, type, comment
+       - source_checkpoint_id (parent)
+       - created_at
+       - Whether it's the active source (current base)
+    5. Return array of checkpoint objects
+```
+
+**Delete Checkpoint:**
+
+```
+delete_checkpoint(volume_id, checkpoint_id):
+    1. Acquire lease
+    2. Validate:
+       - Checkpoint exists and belongs to volume
+       - Checkpoint is not the active_source_checkpoint_id
+         (can't delete what current state is based on)
+       - Checkpoint is not referenced by a pending/in_progress backup
+    3. Remove thin snapshot:
+       lvremove -f vg_storage/{checkpoint.lv_name}
+    4. Update any child checkpoints:
+       - If other checkpoints have source_checkpoint_id = this checkpoint,
+         update them to point to this checkpoint's source (grandparent)
+    5. Delete checkpoint record
+    6. Release lease
+```
+
+**Restore Checkpoint:**
+
+```
+restore_checkpoint(volume_id, checkpoint_id):
+    1. Acquire lease
+    2. Validate:
+       - Volume exists
+       - Checkpoint exists and belongs to volume
+    3. If volume is attached:
+       a. Stop VM (instant Firecracker shutdown)
+    4. Optionally create pre_restore checkpoint:
+       lvcreate --snapshot --name vol-{id}-prerestore-{timestamp} \
+                vg_storage/vol-{id}-active
+       Insert checkpoint record with type = 'pre_restore'
+    5. Swap active LV to checkpoint's state:
+       lvremove -f vg_storage/vol-{id}-active
+       lvcreate --snapshot --name vol-{id}-active vg_storage/{checkpoint.lv_name}
+    6. Update volume.active_source_checkpoint_id = checkpoint_id
+    7. If volume was attached:
+       a. Start VM (Firecracker boot ~125ms)
+    8. Release lease
+    9. Return success with timing info
+```
+
+#### 5.8 Backup Operations
+
+**Backup Schedule:**
+
+* All volumes receive daily backups on a UTC timeline.
+* Backup window: 02:00–06:00 UTC.
+* Volume placement within window is deterministic (hash of volume ID) to spread load.
+
+```python
+def get_backup_slot(volume_id: str) -> tuple[int, int]:
+    hash_val = int(sha256(volume_id.encode()).hexdigest()[:8], 16)
+    minute_offset = hash_val % 240  # 4-hour window
+    hour = 2 + (minute_offset // 60)
+    minute = minute_offset % 60
+    return (hour, minute)
+```
+
+**Backup Types:**
+
+* **Full** — All blocks streamed to S3. Required for first backup.
+* **Incremental** — Only blocks changed since last backup. Uses `thin_delta` to identify changed block ranges.
+
+**Create Backup (trigger immediate):**
+
+```
+create_backup(volume_id):
+    1. Acquire lease
+    2. Validate:
+       - Volume exists
+       - No backup already in progress for this volume
+    3. Create pre_backup checkpoint:
+       (same flow as create_checkpoint with type = 'pre_backup')
+    4. Determine backup type:
+       - If no previous completed backup → 'full'
+       - Else → 'incremental'
+    5. Insert backup record:
+       - state = 'pending'
+       - source_checkpoint_id = new checkpoint ID
+       - parent_backup_id = last completed backup (if incremental)
+    6. Release lease (backup worker will acquire its own lease)
+    7. Enqueue backup job for async processing
+    8. Return backup object (state: pending)
+```
+
+**Get Backup:**
+
+```
+get_backup(volume_id, backup_id):
+    1. Query backup by ID
+    2. Validate backup belongs to volume
+    3. If not found, return 404
+    4. Return backup object with:
+       - State, type, size, chunk_count
+       - Source checkpoint info
+       - Parent backup (if incremental)
+       - S3 location (bucket, manifest_key)
+       - Timing info (started_at, completed_at)
+       - Error message (if failed)
+```
+
+**List Backups:**
+
+```
+list_backups(volume_id):
+    1. Validate volume exists
+    2. Query all backups for volume
+    3. Order by created_at descending
+    4. Return array of backup objects with summary info
+```
+
+**Backup Worker Process:**
+
+```
+process_backup(backup_id):
+    1. Acquire lease on volume (long TTL, renewable)
+    2. Start lease renewal goroutine
+    3. Update backup state → 'in_progress', started_at = now
+    4. Get already-uploaded chunks (for resume):
+       uploaded_chunks = query backup_chunks where backup_id = this backup
+    5. If incremental:
+       a. Reserve thin pool metadata snapshot:
+          dmsetup message vg_storage-thinpool-tpool 0 reserve_metadata_snap
+       b. Compute changed blocks:
+          thin_delta --thin1 {parent_cp_lv} --thin2 {source_cp_lv} ...
+       c. Release metadata snapshot:
+          dmsetup message vg_storage-thinpool-tpool 0 release_metadata_snap
+    6. Else (full):
+       a. changed_blocks = all blocks in volume
+    7. Split into chunks (4-8 MB each)
+    8. For each chunk (parallel upload):
+       a. Skip if chunk already uploaded (resume case)
+       b. Read blocks from checkpoint LV
+       c. Compress with zstd
+       d. Upload to S3: {bucket}/backups/{volume_id}/{backup_id}/chunks/{N}
+       e. Insert backup_chunk record
+    9. Build and upload manifest:
+       manifest = { backup_id, volume_id, type, chunks: [...], ... }
+       Upload to S3: {bucket}/backups/{volume_id}/{backup_id}/manifest.json
+    10. Update backup:
+        - state = 'completed'
+        - completed_at = now
+        - size_bytes = sum of chunk sizes
+        - chunk_count = number of chunks
+        - manifest_key = S3 key
+    11. Update volume.last_backup_at = now
+    12. Cleanup: delete previous backup's pre_backup checkpoint (no longer needed)
+    13. Release lease
+```
+
+**Resume on Failure:**
+
+If backup fails mid-upload, the next attempt queries `backup_chunks` table for already-uploaded chunks and resumes from the last incomplete chunk.
+
+**Backup Chain Depth:**
+
+Force a full backup after N incrementals (e.g., 7) or weekly, whichever comes first. Deep chains slow restore.
+
+**Manifest Format:**
+
+```json
+{
+  "backup_id": "backup-456",
+  "volume_id": "vol-123",
+  "type": "incremental",
+  "parent_backup_id": "backup-400",
+  "source_checkpoint_id": "cp-789",
+  "created_at": "2025-01-15T03:00:00Z",
+  "volume_size_bytes": 107374182400,
+  "chunk_size_bytes": 4194304,
+  "chunks": [
+    { "index": 0, "sha256": "abc...", "size": 4190000, "block_range": [0, 1023] },
+    { "index": 1, "sha256": "def...", "size": 4185000, "block_range": [1024, 2047] }
+  ],
+  "changed_block_ranges": [[0, 512], [2000, 2100]]
+}
+```
+
+#### 5.9 Fork Operation
+
+Fork creates a **new independent volume** from a checkpoint. The new volume can be on the same host or a different host. The control plane orchestrates cross-host forks.
+
+**Same-host fork (instant):**
+
+```
+fork_local(new_volume_id, source_checkpoint_id, new_name, destination?):
+    1. Validate source checkpoint exists
+    2. Create new LV as snapshot of checkpoint:
+       lvcreate --snapshot --name vol-{new_volume_id}-active \
+                vg_storage/{source_cp_lv}
+    3. Insert new volume record:
+       - id = new_volume_id (from control plane)
+       - state = 'available'
+       - active_source_checkpoint_id = NULL (fresh start)
+    4. Return new volume
+```
+
+The new volume shares blocks with the source via CoW but is completely independent. Writes to either volume don't affect the other.
+
+**Cross-host fork:**
+
+Orchestrated by control plane:
+
+```
+Control plane:
+    1. Call sparkd on source host: create backup of checkpoint
+    2. Call sparkd on target host: restore_from_backup(...)
+    3. Record new volume in control plane database
+```
+
+#### 5.10 Restore from Backup
+
+Restore from S3 creates a **new volume** by downloading and reassembling chunks.
+
+**Flow:**
+
+```
+restore_from_backup(new_volume_id, name, bucket, manifest_key, destination?):
+    1. Download manifest from S3
+    2. Create new thin volume of appropriate size:
+       lvcreate --thin --name vol-{new_volume_id}-active \
+                --virtualsize {manifest.volume_size_bytes}B vg_storage/thinpool
+    3. For incremental restore, resolve chain: full → incr → incr → ...
+    4. Download chunks (in parallel)
+    5. Decompress and write blocks to new volume
+    6. Format is preserved (ext4 from source)
+    7. Insert volume record:
+       - id = new_volume_id
+       - state = 'available'
+    8. Return new volume
+```
+
+**Cross-Host Migration (Cold):**
+
+1. Detach volume from Machine on Host A (or destroy Machine).
+2. Trigger final backup on Host A.
+3. Control plane instructs Host B to restore from that backup.
+4. New volume on Host B enters `available` state.
+5. User attaches Machine on Host B.
+
+#### 5.11 Lease-Based Concurrency Control
+
+Operations that modify a volume must hold an exclusive lease. Leases prevent races and auto-expire to prevent deadlocks.
+
+**Lease Properties:**
+
+* Exclusive — only one holder per resource at a time.
+* Bounded TTL — expires if not renewed (e.g., 5 minutes).
+* Renewable — holder can extend TTL while operation is in progress.
+
+**Schema:**
+
+```sql
+CREATE TABLE leases (
+    resource_type TEXT NOT NULL,    -- 'volume'
+    resource_id   TEXT NOT NULL,
+    holder_id     TEXT NOT NULL,    -- operation ID
+    operation     TEXT NOT NULL,    -- 'checkpoint', 'backup', 'attach', 'restore', etc.
+    acquired_at   TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    PRIMARY KEY (resource_type, resource_id)
+);
+```
+
+**Operations Requiring Lease:**
+
+| Operation   | Lease TTL | Renewable |
+| ----------- | --------- | --------- |
+| attach      | 2 min     | No        |
+| detach      | 2 min     | No        |
+| checkpoint  | 2 min     | No        |
+| restore     | 2 min     | No        |
+| backup      | 5 min     | Yes       |
+| resize      | 2 min     | No        |
+
+#### 5.12 Init vsock API
+
+The VM runs a custom **init** process that supervises the main application, collects metrics and logs, and exposes an HTTP API over virtio-vsock. On the host side, **kiln** sits between Firecracker and sparkd, decoupling sparkd's lifecycle from customer workloads and relaying metrics/logs from the guest.
+
+For volume operations, sparkd communicates with init via kiln over the vsock channel.
+
+**New endpoints for volumes:**
+
+```
+POST /volume/freeze
+     Actions: sync, fsfreeze --freeze /mnt/data
+     Response: { "frozen": true }
+     Safety: Auto-thaw after 30s
+
+POST /volume/thaw
+     Actions: fsfreeze --unfreeze /mnt/data
+     Response: { "frozen": false }
+
+POST /volume/resize
+     Body: { "device": "/dev/vdb", "new_size_bytes": N }
+     Actions:
+       - echo 1 > /sys/class/block/vdb/device/rescan
+       - resize2fs /dev/vdb
+     Response: { "filesystem_size_bytes": N }
+
+GET  /volume/status
+     Response: {
+       "device": "/dev/vdb",
+       "mount_point": "/mnt/data",
+       "filesystem": "ext4",    // always ext4 in v1
+       "total_bytes": N,
+       "used_bytes": M,
+       "frozen": false
+     }
+```
+
+All volumes use ext4. This simplifies init's implementation and covers the needs of typical database workloads.
+
+#### 5.13 Monitoring & Metrics
+
+Metrics are exported via a **separate process** (node_exporter with textfile collector) to ensure visibility even if sparkd is down.
+
+**Key Metrics:**
+
+| Metric                             | Type  | Alert Threshold        |
+| ---------------------------------- | ----- | ---------------------- |
+| `sparkd_thinpool_data_percent`     | gauge | warn > 70%, crit > 85% |
+| `sparkd_thinpool_metadata_percent` | gauge | crit > 75%             |
+| `sparkd_raid_healthy`              | gauge | crit = 0               |
+| `sparkd_raid_degraded_devices`     | gauge | warn > 0               |
+| `sparkd_volumes_total{state}`      | gauge | —                      |
+| `sparkd_checkpoints_total`         | gauge | —                      |
+| `sparkd_backups_pending`           | gauge | warn > 10 (per host)   |
+| `sparkd_backup_last_success_time`  | gauge | crit if > 48h stale    |
+
+---
+
+### 6. Data Model
+
+#### 6.1 Schema Evolution
+
+This schema evolves the existing sparkd schema. Key changes from the current schema:
+
+* **Volume-Machine lifecycle decoupled** — Volumes now survive machine deletion (`ON DELETE SET NULL` instead of `ON DELETE CASCADE`)
+* **New tables** — `pools`, `checkpoints`, `backups`, `backup_chunks`, `leases`
+* **Volume state machine** — New `state` column tracks lifecycle
+* **Removed `disk_image`** — Obsolete with ext4-only policy
+* **Removed `app_id`** — Control plane owns app→volume mapping; sparkd only tracks local resources
+
+#### 6.2 SQLite Schema
+
+```sql
+-- ============================================================================
+-- EXISTING TABLES (minimal changes)
+-- ============================================================================
+
+CREATE TABLE machines (
+    id VARCHAR(255) PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    image TEXT NOT NULL,
+    socket VARCHAR(255),
+    state VARCHAR(32) NOT NULL DEFAULT 'CREATED' 
+        CHECK(state IN ('CREATED', 'RUNNING', 'STARTED', 'FAILED', 'STOPPED')),
+    vm_index INTEGER NOT NULL DEFAULT 4 CHECK(vm_index > 0),
+    rootfs VARCHAR(255),
+    has_volume BOOLEAN NOT NULL DEFAULT false,
+    config JSONB DEFAULT '{}' NOT NULL,
+    resource JSONB DEFAULT '{"cpu":1,"memory":512}' NOT NULL,
+    org_id INTEGER DEFAULT 0 NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at DATETIME
+);
+
+CREATE TABLE ips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tap_ip VARCHAR(32),
+    vm_ip VARCHAR(32),
+    gwt_ip VARCHAR(32),
+    subnet VARCHAR(32),
+    mask VARCHAR(16),
+    subnet_mask VARCHAR(32),
+    vm_id VARCHAR(255) REFERENCES machines(id) ON DELETE CASCADE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at DATETIME DEFAULT NULL
+);
+
+-- ============================================================================
+-- POOLS: thin pool tracking
+-- ============================================================================
+
+CREATE TABLE pools (
+    id VARCHAR(255) PRIMARY KEY,
+    raid_device VARCHAR(255) NOT NULL,          -- /dev/md0
+    vg_name VARCHAR(255) NOT NULL,              -- vg_storage
+    thinpool_lv VARCHAR(255) NOT NULL,          -- thinpool
+    
+    total_bytes INTEGER NOT NULL,
+    data_used_bytes INTEGER NOT NULL,
+    metadata_used_bytes INTEGER NOT NULL,
+    
+    state VARCHAR(32) NOT NULL DEFAULT 'healthy'
+        CHECK(state IN ('healthy', 'degraded', 'rebuilding', 'failed')),
+    raid_state TEXT,                            -- mdadm status details
+    
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================================
+-- VOLUMES: evolved from existing table
+-- ============================================================================
+
+CREATE TABLE volumes (
+    -- Identity
+    id VARCHAR(255) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    
+    -- Storage location (typically one pool per host)
+    pool_id VARCHAR(255) NOT NULL,
+    lv_path VARCHAR(255) NOT NULL,              -- /dev/vg_storage/vol-{id}-active
+    
+    -- Size in bytes (convert to MB for control plane/user display)
+    size_bytes INTEGER NOT NULL,
+    
+    -- Guest mount configuration (extracted from machine config)
+    destination VARCHAR(50) DEFAULT '/data' NOT NULL,
+    
+    -- Checkpoint lineage: which checkpoint is active LV currently based on
+    active_source_checkpoint_id VARCHAR(255),
+    
+    -- Lifecycle state (independent of machine)
+    state VARCHAR(32) NOT NULL DEFAULT 'available'
+        CHECK(state IN ('creating', 'available', 'attaching', 'attached', 
+                        'detaching', 'deleting', 'deleted', 'error')),
+    
+    -- Machine attachment (nullable — volume can exist unattached)
+    -- ON DELETE SET NULL: volume survives machine deletion
+    attached_machine_id VARCHAR(255) REFERENCES machines(id) ON DELETE SET NULL,
+    
+    -- Backup configuration
+    backup_enabled BOOLEAN NOT NULL DEFAULT true,
+    backup_retention_days INTEGER DEFAULT 7,
+    last_backup_at DATETIME,
+    
+    -- Timestamps
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at DATETIME
+);
+
+CREATE INDEX idx_volumes_state ON volumes(state);
+CREATE INDEX idx_volumes_machine ON volumes(attached_machine_id);
+CREATE UNIQUE INDEX idx_volumes_lv ON volumes(lv_path);
+
+-- ============================================================================
+-- CHECKPOINTS: immutable snapshots
+-- ============================================================================
+
+CREATE TABLE checkpoints (
+    id VARCHAR(255) PRIMARY KEY,
+    volume_id VARCHAR(255) NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+    
+    lv_name VARCHAR(255) NOT NULL,              -- vol-{id}-c{seq}
+    
+    -- Lineage: which checkpoint was active when this was created
+    source_checkpoint_id VARCHAR(255),
+    
+    -- Ordering within volume
+    sequence_num INTEGER NOT NULL,
+    
+    -- Metadata
+    type VARCHAR(32) NOT NULL DEFAULT 'user'
+        CHECK(type IN ('user', 'scheduled', 'pre_backup', 'pre_restore')),
+    comment TEXT,
+    
+    -- Timestamps
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME,
+    
+    UNIQUE(volume_id, sequence_num)
+);
+
+CREATE INDEX idx_checkpoints_volume ON checkpoints(volume_id);
+CREATE INDEX idx_checkpoints_source ON checkpoints(source_checkpoint_id);
+
+-- ============================================================================
+-- BACKUPS: off-site copies in S3
+-- ============================================================================
+
+CREATE TABLE backups (
+    id VARCHAR(255) PRIMARY KEY,
+    volume_id VARCHAR(255) NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+    source_checkpoint_id VARCHAR(255) NOT NULL,
+    
+    -- Backup chain
+    type VARCHAR(32) NOT NULL CHECK(type IN ('full', 'incremental')),
+    parent_backup_id VARCHAR(255),
+    
+    -- S3 location
+    bucket VARCHAR(255) NOT NULL,
+    key_prefix VARCHAR(255) NOT NULL,
+    manifest_key VARCHAR(255),
+    
+    -- Stats
+    size_bytes INTEGER,
+    chunk_count INTEGER,
+    
+    -- State
+    state VARCHAR(32) NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending', 'in_progress', 'completed', 'failed')),
+    started_at DATETIME,
+    completed_at DATETIME,
+    error_message TEXT,
+    
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_backups_volume ON backups(volume_id);
+CREATE INDEX idx_backups_state ON backups(state);
+
+-- ============================================================================
+-- BACKUP_CHUNKS: for resume capability
+-- ============================================================================
+
+CREATE TABLE backup_chunks (
+    id VARCHAR(255) PRIMARY KEY,
+    backup_id VARCHAR(255) NOT NULL REFERENCES backups(id) ON DELETE CASCADE,
+    
+    chunk_index INTEGER NOT NULL,
+    block_start INTEGER NOT NULL,
+    block_end INTEGER NOT NULL,
+    
+    s3_key VARCHAR(255) NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 VARCHAR(64) NOT NULL,
+    
+    uploaded_at DATETIME NOT NULL,
+    
+    UNIQUE(backup_id, chunk_index)
+);
+
+CREATE INDEX idx_backup_chunks_backup ON backup_chunks(backup_id);
+
+-- ============================================================================
+-- LEASES: concurrency control
+-- ============================================================================
+
+CREATE TABLE leases (
+    resource_type VARCHAR(32) NOT NULL,         -- 'volume', 'pool'
+    resource_id VARCHAR(255) NOT NULL,
+    
+    holder_id VARCHAR(255) NOT NULL,            -- operation ID
+    operation VARCHAR(32) NOT NULL,             -- 'checkpoint', 'backup', etc.
+    
+    acquired_at DATETIME NOT NULL,
+    expires_at DATETIME NOT NULL,
+    
+    PRIMARY KEY (resource_type, resource_id)
+);
+
+CREATE INDEX idx_leases_expiry ON leases(expires_at);
+```
+
+#### 6.3 Migration Notes
+
+For existing sparkd deployments:
+
+```sql
+-- 1. Create pools table and insert default pool
+CREATE TABLE pools (...);
+INSERT INTO pools (id, raid_device, vg_name, thinpool_lv, total_bytes, 
+                   data_used_bytes, metadata_used_bytes, state)
+VALUES ('default', '/dev/md0', 'vg_storage', 'thinpool', 0, 0, 0, 'healthy');
+
+-- 2. Migrate volumes table
+--    SQLite requires table recreation for complex alterations
+CREATE TABLE volumes_new (...);
+INSERT INTO volumes_new (id, name, pool_id, lv_path, size_bytes, destination,
+                         state, attached_machine_id, created_at, updated_at)
+SELECT id, name, 'default', path, size * 1048576, destination,
+       CASE WHEN vm_id IS NOT NULL THEN 'attached' ELSE 'available' END,
+       vm_id, created_at, updated_at
+FROM volumes WHERE deleted_at IS NULL;
+DROP TABLE volumes;
+ALTER TABLE volumes_new RENAME TO volumes;
+
+-- 3. Create new tables
+CREATE TABLE checkpoints (...);
+CREATE TABLE backups (...);
+CREATE TABLE backup_chunks (...);
+CREATE TABLE leases (...);
+
+-- 4. Update machines.has_volume based on new relationship
+-- (may need application-level logic)
+```
+
+#### 6.4 Control Plane Coordination
+
+sparkd does **not** track `app_id`. The control plane maintains the authoritative mapping:
+
+```
+Control Plane                          sparkd (per host)
+─────────────────                      ─────────────────
+apps                                   machines
+├── app_id                             ├── id
+├── org_id                             ├── org_id (denormalized for queries)
+└── ...                                └── ...
+
+volumes (control plane view)           volumes (sparkd view)
+├── id                                 ├── id
+├── app_id  ←── NOT in sparkd          ├── pool_id
+├── host_id                            ├── lv_path
+├── name                               ├── size_bytes
+└── ...                                ├── attached_machine_id
+                                       └── ...
+```
+
+When the control plane creates a volume:
+1. Control plane records `(volume_id, app_id, host_id)` in its database
+2. Control plane calls `POST /volumes` on the target host's sparkd
+3. sparkd creates the volume locally, unaware of `app_id`
+
+This separation ensures sparkd remains a simple host-level resource manager.
+
+---
+
+### 7. sparkd API
+
+#### 7.1 Volume Operations
+
+```
+POST   /volumes
+       Create a new volume.
+       Body: { 
+         "id": "vol-...",           // from control plane
+         "name": "my-db",
+         "size_bytes": 10737418240,
+         "destination": "/data"     // optional, default "/data"
+       }
+       Returns: Volume object
+
+GET    /volumes
+       List volumes on this host.
+       Query: ?state=available&attached=false
+
+GET    /volumes/{id}
+       Get volume details including checkpoint list.
+
+DELETE /volumes/{id}
+       Delete volume and all its checkpoints. Must be detached.
+       Query: ?force=true to stop VM and delete anyway
+
+PATCH  /volumes/{id}
+       Resize volume.
+       Body: { "size_bytes": N }  // must be > current size
+```
+
+#### 7.2 Attachment Operations
+
+```
+POST   /volumes/{id}/attach
+       Attach volume to a machine.
+       Body: { "machine_id": "..." }
+       Returns: { "device_path": "/dev/vdb" }
+
+POST   /volumes/{id}/detach
+       Detach volume from its current machine.
+```
+
+#### 7.3 Checkpoint Operations
+
+```
+POST   /volumes/{id}/checkpoints
+       Create a checkpoint.
+       Body: { "comment": "Before deploying v2.0" }
+       Returns: Checkpoint object
+
+GET    /volumes/{id}/checkpoints
+       List checkpoints.
+       Returns: Array of Checkpoint objects
+
+GET    /volumes/{id}/checkpoints/{checkpoint_id}
+       Get checkpoint details.
+
+DELETE /volumes/{id}/checkpoints/{checkpoint_id}
+       Delete a checkpoint.
+
+POST   /volumes/{id}/checkpoints/{checkpoint_id}/restore
+       Restore volume to this checkpoint (reboots VM).
+       Returns: Streaming NDJSON progress
+```
+
+#### 7.4 Backup Operations
+
+```
+POST   /volumes/{id}/backups
+       Trigger immediate backup.
+       Returns: Backup object (state: pending)
+
+GET    /volumes/{id}/backups
+       List backups.
+
+GET    /volumes/{id}/backups/{backup_id}
+       Get backup details.
+```
+
+#### 7.5 Fork Operations
+
+```
+POST   /volumes/{id}/fork
+       Create a new volume from this volume's current state or a checkpoint.
+       Body: { 
+         "new_volume_id": "vol-...",            // from control plane
+         "new_name": "my-db-fork",
+         "source_checkpoint_id": "cp-...",      // optional, defaults to current
+         "destination": "/data"                 // optional
+       }
+       Returns: New Volume object
+
+POST   /volumes/restore-from-backup
+       Create a new volume from a backup (for cross-host restore/migration).
+       Body: { 
+         "new_volume_id": "vol-...",            // from control plane
+         "name": "my-db-restored",
+         "bucket": "backups",
+         "manifest_key": "backups/vol-123/backup-456/manifest.json",
+         "destination": "/data"                 // optional
+       }
+       Returns: New Volume object (async - returns immediately, polls for completion)
+```
+
+#### 7.6 Pool Operations (Administrative)
+
+```
+GET    /pool
+       Get thin pool status.
+
+GET    /pool/health
+       Get RAID and thin pool health details.
+```
+
+---
+
+### 8. Firecracker Integration
+
+Volumes are attached to Firecracker VMs as virtio block devices.
+
+**Attach Flow:**
+
+1. Validate volume is `available` and machine exists.
+2. Update volume state → `attaching`.
+3. Call Firecracker API:
+   ```json
+   PUT /drives/data
+   {
+     "drive_id": "data",
+     "path_on_host": "/dev/vg_storage/vol-123-active",
+     "is_root_device": false,
+     "is_read_only": false
+   }
+   ```
+4. Firecracker hot-plugs the drive (if VM running) or makes it available at next boot.
+5. Update volume state → `attached`.
+6. Guest sees `/dev/vdb`.
+
+**Detach Flow:**
+
+1. Update volume state → `detaching`.
+2. Signal guest to unmount (optional, via vsock).
+3. Update Firecracker drive config.
+4. Update volume state → `available`.
+
+---
+
+### 9. Scheduler Integration
+
+Volumes are placed by the scheduler (RFC-001) using existing capacity signals.
+
+**Capacity Signal Additions:**
+
+```jsonc
+{
+  "available": {
+    "vcpu": 16,
+    "ram_mb": 61440,
+    "storage_gb": 1430,    // thin pool free space
+    "iops_r": 25000,
+    "iops_w": 25000
+  }
+}
+```
+
+**Volume Placement:**
+
+When creating a volume, the scheduler uses option **C (Stateless compute-hint)** from RFC-001 § 4.5:
+
+* Client sends `Hint-CPU`, `Hint-RAM` headers indicating expected companion VM size.
+* Scheduler places volume on a host with capacity for both.
+
+---
+
+### 10. Implementation Notes
+
+#### 10.1 Host Setup (one-time)
+
+```bash
+# Create RAID 10 array
+mdadm --create /dev/md0 --level=10 --raid-devices=4 \
+      /dev/nvme0n1 /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1
+
+# Persist RAID config
+mdadm --detail --scan >> /etc/mdadm/mdadm.conf
+
+# Create LVM
+pvcreate /dev/md0
+vgcreate vg_storage /dev/md0
+
+# Create thin pool
+lvcreate --type thin-pool --name thinpool \
+         --size 95%FREE \
+         --poolmetadatasize 16G \
+         vg_storage
+```
+
+#### 10.2 LVM Operations
+
+```bash
+# Create thin volume
+lvcreate --thin --name vol-123-active --virtualsize 100G vg_storage/thinpool
+
+# Create checkpoint (thin snapshot)
+lvcreate --snapshot --name vol-123-c1 vg_storage/vol-123-active
+
+# Restore: swap active to point at checkpoint's state
+lvremove -f vg_storage/vol-123-active
+lvcreate --snapshot --name vol-123-active vg_storage/vol-123-c1
+
+# Extend volume
+lvextend -L +50G vg_storage/vol-123-active
+
+# Remove checkpoint
+lvremove -f vg_storage/vol-123-c1
+```
+
+#### 10.3 Metrics Exporter
+
+```bash
+#!/bin/bash
+# /usr/local/bin/sparkd-metrics-writer
+
+OUTPUT="/var/lib/node_exporter/textfile_collector/sparkd.prom"
+TEMP=$(mktemp)
+
+# Thin pool metrics
+lvs --noheadings --units b --nosuffix \
+    -o data_percent,metadata_percent vg_storage/thinpool | \
+while read data_pct meta_pct; do
+  echo "sparkd_thinpool_data_percent{pool=\"thinpool\"} $data_pct" >> "$TEMP"
+  echo "sparkd_thinpool_metadata_percent{pool=\"thinpool\"} $meta_pct" >> "$TEMP"
+done
+
+# RAID health
+if mdadm --detail /dev/md0 | grep -q "State : clean"; then
+  echo "sparkd_raid_healthy{array=\"md0\"} 1" >> "$TEMP"
+else
+  echo "sparkd_raid_healthy{array=\"md0\"} 0" >> "$TEMP"
+fi
+
+mv "$TEMP" "$OUTPUT"
+```
+
+---
+
+### 11. Security Considerations
+
+* **Tenant Isolation** — Volumes are scoped to apps; enforced at sparkd API layer.
+* **Data at Rest** — LUKS encryption on RAID device (future RFC).
+* **Backup Encryption** — Client-side encryption before S3 upload (future RFC).
+* **Init Auth** — vsock is inherently scoped to the VM; cross-VM access is not possible.
+
+---
+
+### 12. Future Work
+
+* **Live Migration** — Block-level replication for hot migration.
+* **Shared Volumes** — Multi-attach for clustered workloads.
+* **Encryption at Rest** — LUKS or dm-crypt integration.
+* **Continuous Backup / CDP** — Sub-daily RPO.
+* **Hot-Swap Restore** — dm-linear indirection for no-reboot restore.
+* **Quotas & Billing** — Per-volume and per-checkpoint metering.
+* **XFS Support** — Alternative filesystem for large-file / high-throughput workloads.
+
+---
+
+### 13. References
+
+* [PlanetScale Metal Announcement](https://planetscale.com/blog/announcing-metal)
+* [PlanetScale Metal](https://planetscale.com/metal)
+* [Sprites Checkpoints API](https://sprites.dev/api/sprites/checkpoints)
+* [Linux Device Mapper Documentation](https://docs.kernel.org/admin-guide/device-mapper/index.html)
+* [LVM Thin Provisioning](https://man7.org/linux/man-pages/man7/lvmthin.7.html)
+* [Tigris Data](https://www.tigrisdata.com/)
+* RFC-001: Distributed Scheduler & Capacity Modeling
