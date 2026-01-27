@@ -37,6 +37,10 @@ source "${SCRIPT_DIR}/config.sh"
 [[ -f "${SCRIPT_DIR}/init.sh"         ]] && source "${SCRIPT_DIR}/init.sh"
 # shellcheck disable=SC1091
 [[ -f "${SCRIPT_DIR}/ssh.sh"          ]] && source "${SCRIPT_DIR}/ssh.sh"
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/kms.sh"          ]] && source "${SCRIPT_DIR}/kms.sh"
+# shellcheck disable=SC1091
+[[ -f "${SCRIPT_DIR}/bundle-libs.sh"  ]] && source "${SCRIPT_DIR}/bundle-libs.sh"
 
 if declare -F set_error_handlers >/dev/null 2>&1; then
   set_error_handlers
@@ -614,11 +618,21 @@ Usage:
   infernoctl destroy <name> [--yes] [--keep-logs]
 
   infernoctl logs {start|stop|restart|status|tail|clear}
+  infernoctl lvm
 
   infernoctl haproxy render
   infernoctl haproxy reload
   infernoctl images process <image> [entrypoint_json|string] [cmd_json|string]
   infernoctl images exposed <image>
+
+  infernoctl volume create --name <name> [--size GB]
+  infernoctl volume list [--all | --orphaned]
+  infernoctl volume delete --volume-id <vol>
+  infernoctl volume checkpoint --volume-id <vol> [--comment "description"]
+  infernoctl volume checkpoints list --volume-id <vol>
+  infernoctl volume checkpoints delete --checkpoint-id <id>
+  infernoctl volume checkpoints gc --volume-id <vol> [--keep N]
+  infernoctl volume restore --volume-id <vol> --checkpoint-id <id>
 
 Examples:
   # List all VMs
@@ -654,14 +668,124 @@ cmd_env_print() {
   echo "DB_PATH=${DB_PATH}"
   echo "HAPROXY_CFG=${HAPROXY_CFG}"
   echo "LOG_LEVEL=${LOG_LEVEL:-INFO}"
+  echo ""
+
+  # Show LVM configuration if available
+  local lvm_config="${INFERNO_ROOT}/.lvm_config"
+  if [[ -f "$lvm_config" ]]; then
+    echo "LVM Storage:"
+    # Source the config to get variables
+    source "$lvm_config"
+
+    echo "  Rootfs VG: ${ROOTFS_VG_NAME:-N/A}"
+    echo "    Device: ${ROOTFS_DEVICE:-N/A}"
+    if [[ -f "${ROOTFS_LOOP_FILE}" ]]; then
+      local rootfs_size=$(du -h "${ROOTFS_LOOP_FILE}" 2>/dev/null | cut -f1)
+      echo "    Loop file: ${ROOTFS_LOOP_FILE} (${rootfs_size} sparse)"
+    fi
+    echo ""
+    echo "  Data VG: ${DATA_VG_NAME:-N/A}"
+    echo "    Device: ${DATA_DEVICE:-N/A}"
+    if [[ -f "${DATA_LOOP_FILE}" ]]; then
+      local data_size=$(du -h "${DATA_LOOP_FILE}" 2>/dev/null | cut -f1)
+      echo "    Loop file: ${DATA_LOOP_FILE} (${data_size} sparse)"
+    fi
+  else
+    echo "LVM Storage: Not configured"
+    echo "  Run 'sudo infernoctl init' to set up LVM storage"
+  fi
+}
+
+cmd_lvm_status() {
+  echo "=== Inferno LVM Storage Status ==="
+  echo ""
+
+  # Load LVM config
+  local lvm_config="${INFERNO_ROOT}/.lvm_config"
+  if [[ ! -f "$lvm_config" ]]; then
+    warn "LVM not configured. Run 'infernoctl init' first."
+    return 1
+  fi
+
+  source "$lvm_config"
+
+  # Rootfs storage
+  echo "Rootfs Storage (${ROOTFS_VG_NAME}):"
+  if vgs "${ROOTFS_VG_NAME}" >/dev/null 2>&1; then
+    echo "  Status: Active"
+    echo "  Device: ${ROOTFS_DEVICE}"
+    [[ -f "${ROOTFS_LOOP_FILE}" ]] && echo "  Loop file: ${ROOTFS_LOOP_FILE}"
+
+    # Show VG info
+    local vg_size vg_free
+    vg_size=$(vgs --noheadings --units g --nosuffix "${ROOTFS_VG_NAME}" -o vg_size 2>/dev/null | tr -d '[:space:]')
+    vg_free=$(vgs --noheadings --units g --nosuffix "${ROOTFS_VG_NAME}" -o vg_free 2>/dev/null | tr -d '[:space:]')
+    echo "  VG Size: ${vg_size}G"
+    echo "  VG Free: ${vg_free}G"
+
+    # Show thin pool info
+    if lvs "${ROOTFS_VG_NAME}/${ROOTFS_POOL_NAME}" >/dev/null 2>&1; then
+      local pool_size pool_data pool_meta
+      pool_size=$(lvs --noheadings --units g --nosuffix "${ROOTFS_VG_NAME}/${ROOTFS_POOL_NAME}" -o lv_size 2>/dev/null | tr -d '[:space:]')
+      pool_data=$(lvs --noheadings "${ROOTFS_VG_NAME}/${ROOTFS_POOL_NAME}" -o data_percent 2>/dev/null | tr -d '[:space:]')
+      pool_meta=$(lvs --noheadings "${ROOTFS_VG_NAME}/${ROOTFS_POOL_NAME}" -o metadata_percent 2>/dev/null | tr -d '[:space:]')
+
+      echo "  Pool: ${ROOTFS_POOL_NAME}"
+      echo "    Size: ${pool_size}G"
+      echo "    Data usage: ${pool_data}%"
+      echo "    Metadata usage: ${pool_meta}%"
+    fi
+  else
+    echo "  Status: Not found"
+  fi
+
+  echo ""
+
+  # Data storage
+  echo "Data Volumes Storage (${DATA_VG_NAME}):"
+  if vgs "${DATA_VG_NAME}" >/dev/null 2>&1; then
+    echo "  Status: Active"
+    echo "  Device: ${DATA_DEVICE}"
+    [[ -f "${DATA_LOOP_FILE}" ]] && echo "  Loop file: ${DATA_LOOP_FILE}"
+
+    # Show VG info
+    local vg_size vg_free
+    vg_size=$(vgs --noheadings --units g --nosuffix "${DATA_VG_NAME}" -o vg_size 2>/dev/null | tr -d '[:space:]')
+    vg_free=$(vgs --noheadings --units g --nosuffix "${DATA_VG_NAME}" -o vg_free 2>/dev/null | tr -d '[:space:]')
+    echo "  VG Size: ${vg_size}G"
+    echo "  VG Free: ${vg_free}G"
+
+    # Show thin pool info
+    if lvs "${DATA_VG_NAME}/${DATA_POOL_NAME}" >/dev/null 2>&1; then
+      local pool_size pool_data pool_meta
+      pool_size=$(lvs --noheadings --units g --nosuffix "${DATA_VG_NAME}/${DATA_POOL_NAME}" -o lv_size 2>/dev/null | tr -d '[:space:]')
+      pool_data=$(lvs --noheadings "${DATA_VG_NAME}/${DATA_POOL_NAME}" -o data_percent 2>/dev/null | tr -d '[:space:]')
+      pool_meta=$(lvs --noheadings "${DATA_VG_NAME}/${DATA_POOL_NAME}" -o metadata_percent 2>/dev/null | tr -d '[:space:]')
+
+      echo "  Pool: ${DATA_POOL_NAME}"
+      echo "    Size: ${pool_size}G"
+      echo "    Data usage: ${pool_data}%"
+      echo "    Metadata usage: ${pool_meta}%"
+
+      # Count volumes
+      local vol_count
+      vol_count=$(lvs "${DATA_VG_NAME}" --noheadings -o lv_name 2>/dev/null | { grep -v "${DATA_POOL_NAME}" || true; } | wc -l)
+      echo "    Active volumes: ${vol_count}"
+    fi
+  else
+    echo "  Status: Not found"
+  fi
 }
 
 cmd_init() {
   local owner="${1:-${SUDO_USER:-$USER}}"
   info "Initializing Inferno data dir at ${INFERNO_ROOT} (owner=${owner})"
-  mkdir -p "${INFERNO_ROOT}"/{images,vms,volumes,logs,logs/vm,tmp}
+  mkdir -p "${INFERNO_ROOT}"/{images,vms,volumes,logs,logs/vm,tmp,storage}
   chgrp -R inferno "${INFERNO_ROOT}" 2>/dev/null || true
   chmod -R g+rwXs "${INFERNO_ROOT}" 2>/dev/null || true
+
+  # Setup LVM storage (loopback devices for rootfs and data volumes)
+  _setup_lvm_storage
 
   if type -t db_init >/dev/null 2>&1; then
     db_init "$owner"
@@ -670,6 +794,196 @@ cmd_init() {
   fi
 
   success "Init complete."
+}
+
+_setup_lvm_storage() {
+  # LVM setup requires root permissions
+  if [[ $EUID -ne 0 ]]; then
+    warn "LVM storage setup requires root permissions"
+    warn "  Run 'sudo infernoctl init' to set up LVM storage"
+    return 0
+  fi
+
+  info "Setting up LVM storage..."
+
+  # Read configuration from install.sh
+  local system_lvm_conf="/etc/inferno/lvm.conf"
+  local user_lvm_config="${INFERNO_ROOT}/.lvm_config"
+  local storage_dir="${INFERNO_ROOT}/storage"
+
+  # Load LVM configuration (defaults + system config)
+  local rootfs_vg_name="inferno_rootfs_vg"
+  local rootfs_pool_name="rootfs_pool"
+  local rootfs_pool_size="20G"
+  local rootfs_disk=""
+
+  local data_vg_name="inferno_vg"
+  local data_pool_name="vm_pool"
+  local data_pool_size="40G"
+  local data_disk=""
+
+  if [[ -f "$system_lvm_conf" ]]; then
+    info "Loading LVM configuration from $system_lvm_conf"
+    source "$system_lvm_conf"
+  fi
+
+  # Loopback configuration (used if no dedicated disks)
+  local rootfs_loop_file="${storage_dir}/inferno_rootfs.img"
+  local rootfs_loop_size="30G"
+  local data_loop_file="${storage_dir}/inferno_data.img"
+  local data_loop_size="50G"
+
+  # Setup rootfs VG
+  local rootfs_device=""
+  if vgs "$rootfs_vg_name" >/dev/null 2>&1; then
+    info "Rootfs VG already exists: $rootfs_vg_name"
+    # Try to find the device (loop or disk)
+    if [[ -n "$rootfs_disk" ]]; then
+      rootfs_device="$rootfs_disk"
+    elif [[ -f "$rootfs_loop_file" ]]; then
+      rootfs_device=$(losetup -j "$rootfs_loop_file" 2>/dev/null | cut -d: -f1 || echo "")
+    fi
+  else
+    info "Creating rootfs storage..."
+
+    # Use dedicated disk if specified, otherwise create loopback
+    if [[ -n "$rootfs_disk" ]]; then
+      info "  Using dedicated disk: $rootfs_disk"
+      rootfs_device="$rootfs_disk"
+
+      # Validate disk
+      if [[ ! -b "$rootfs_disk" ]]; then
+        warn "Rootfs disk not found: $rootfs_disk"
+        return 1
+      fi
+    else
+      info "  Using loopback device"
+
+      # Create sparse file
+      if [[ ! -f "$rootfs_loop_file" ]]; then
+        info "    Creating sparse file: $rootfs_loop_file ($rootfs_loop_size)"
+        truncate -s "$rootfs_loop_size" "$rootfs_loop_file" || {
+          warn "Failed to create rootfs sparse file"
+          return 1
+        }
+      fi
+
+      # Setup loopback device
+      rootfs_device=$(losetup -j "$rootfs_loop_file" 2>/dev/null | cut -d: -f1)
+      if [[ -z "$rootfs_device" ]]; then
+        info "    Creating loopback device..."
+        rootfs_device=$(losetup -f --show "$rootfs_loop_file") || {
+          warn "Failed to create rootfs loopback device"
+          return 1
+        }
+        info "    Loopback device: $rootfs_device"
+      fi
+    fi
+
+    # Create LVM on the device
+    if ! pvs "$rootfs_device" >/dev/null 2>&1; then
+      pvcreate "$rootfs_device" || {
+        warn "Failed to create physical volume on $rootfs_device"
+        return 1
+      }
+    fi
+
+    vgcreate "$rootfs_vg_name" "$rootfs_device" || {
+      warn "Failed to create rootfs VG"
+      return 1
+    }
+    lvcreate -L "$rootfs_pool_size" -T "$rootfs_vg_name/$rootfs_pool_name" || {
+      warn "Failed to create rootfs thin pool"
+      return 1
+    }
+    info "  Rootfs VG created: $rootfs_vg_name ($rootfs_device)"
+  fi
+
+  # Setup data VG
+  local data_device=""
+  if vgs "$data_vg_name" >/dev/null 2>&1; then
+    info "Data VG already exists: $data_vg_name"
+    # Try to find the device (loop or disk)
+    if [[ -n "$data_disk" ]]; then
+      data_device="$data_disk"
+    elif [[ -f "$data_loop_file" ]]; then
+      data_device=$(losetup -j "$data_loop_file" 2>/dev/null | cut -d: -f1 || echo "")
+    fi
+  else
+    info "Creating data volumes storage..."
+
+    # Use dedicated disk if specified, otherwise create loopback
+    if [[ -n "$data_disk" ]]; then
+      info "  Using dedicated disk: $data_disk"
+      data_device="$data_disk"
+
+      # Validate disk
+      if [[ ! -b "$data_disk" ]]; then
+        warn "Data disk not found: $data_disk"
+        return 1
+      fi
+    else
+      info "  Using loopback device"
+
+      # Create sparse file
+      if [[ ! -f "$data_loop_file" ]]; then
+        info "    Creating sparse file: $data_loop_file ($data_loop_size)"
+        truncate -s "$data_loop_size" "$data_loop_file" || {
+          warn "Failed to create data sparse file"
+          return 1
+        }
+      fi
+
+      # Setup loopback device
+      data_device=$(losetup -j "$data_loop_file" 2>/dev/null | cut -d: -f1)
+      if [[ -z "$data_device" ]]; then
+        info "    Creating loopback device..."
+        data_device=$(losetup -f --show "$data_loop_file") || {
+          warn "Failed to create data loopback device"
+          return 1
+        }
+        info "    Loopback device: $data_device"
+      fi
+    fi
+
+    # Create LVM on the device
+    if ! pvs "$data_device" >/dev/null 2>&1; then
+      pvcreate "$data_device" || {
+        warn "Failed to create physical volume on $data_device"
+        return 1
+      }
+    fi
+
+    vgcreate "$data_vg_name" "$data_device" || {
+      warn "Failed to create data VG"
+      return 1
+    }
+    lvcreate -L "$data_pool_size" -T "$data_vg_name/$data_pool_name" || {
+      warn "Failed to create data thin pool"
+      return 1
+    }
+    info "  Data VG created: $data_vg_name ($data_device)"
+  fi
+
+  # Save runtime configuration
+  cat > "$user_lvm_config" <<EOF
+# Auto-generated by infernoctl init
+# Do not edit manually - this tracks runtime LVM state
+
+ROOTFS_VG_NAME="$rootfs_vg_name"
+ROOTFS_POOL_NAME="$rootfs_pool_name"
+ROOTFS_DEVICE="$rootfs_device"
+ROOTFS_LOOP_FILE="$rootfs_loop_file"
+
+DATA_VG_NAME="$data_vg_name"
+DATA_POOL_NAME="$data_pool_name"
+DATA_DEVICE="$data_device"
+DATA_LOOP_FILE="$data_loop_file"
+EOF
+
+  info "LVM storage configured successfully"
+  info "  Rootfs: $rootfs_vg_name ($rootfs_device)"
+  info "  Data:   $data_vg_name ($data_device)"
 }
 
 cmd_logs() {
@@ -1258,10 +1572,49 @@ cmd_create() {
     fi
   fi
 
-  if [[ -n "$volume_id" ]] && type -t update_volume_vm >/dev/null 2>&1; then
+  if [[ -n "$volume_id" ]]; then
+    log "Verifying volume..."
+
+    # Check volume exists
+    if ! verify_volume "$volume_id"; then
+      rm -rf "$vm_root"
+      die 1 "Volume $volume_id not found"
+    fi
+
+    # Check volume is available (not already attached)
+    local vol_state
+    vol_state="$(sqlite3 "$DB_PATH" "SELECT state FROM volumes WHERE volume_id = '$volume_id';")"
+
+    if [[ "$vol_state" != "available" ]]; then
+      rm -rf "$vm_root"
+      die 1 "Volume $volume_id is not available (current state: $vol_state)"
+    fi
+
+    # Check volume device exists
+    local device_path
+    device_path="$(sqlite3 "$DB_PATH" "SELECT device_path FROM volumes WHERE volume_id = '$volume_id';")"
+
+    if [[ ! -b "$device_path" ]]; then
+      rm -rf "$vm_root"
+      die 1 "Volume device not found: $device_path"
+    fi
+
     log "Attaching volume..."
-    update_volume_vm "$volume_id" "$name" \
-      || { rm -rf "$vm_root"; die 1 "Failed to attach volume to VM"; }
+
+    # Update state to 'attaching'
+    sqlite3 "$DB_PATH" "UPDATE volumes SET state = 'attaching' WHERE volume_id = '$volume_id';" || {
+      rm -rf "$vm_root"
+      die 1 "Failed to update volume state"
+    }
+
+    # Link volume to VM
+    update_volume_vm "$volume_id" "$name" || {
+      sqlite3 "$DB_PATH" "UPDATE volumes SET state = 'available' WHERE volume_id = '$volume_id';"
+      rm -rf "$vm_root"
+      die 1 "Failed to attach volume to VM"
+    }
+
+    # State will transition to 'attached' after successful VM start in cmd_start
   fi
 
   log "Getting container metadata..."
@@ -1373,6 +1726,26 @@ cmd_create() {
   cp "/usr/share/inferno/init" "$inferno_dir/init" || { rm -rf "$base"; die 1 "Failed to copy init binary"; }
   chmod 755 "$inferno_dir/init"
 
+  # cryptsetup binary for LUKS volume unlock (optional, for encrypted volumes)
+  if [[ -f "/usr/share/inferno/cryptsetup" ]]; then
+    debug "Adding cryptsetup to initramfs for volume encryption support"
+    mkdir -p "$inferno_dir/sbin" || true
+    cp "/usr/share/inferno/cryptsetup" "$inferno_dir/sbin/cryptsetup" || warn "Failed to copy cryptsetup binary"
+    chmod 755 "$inferno_dir/sbin/cryptsetup" 2>/dev/null || true
+
+    # Bundle required libraries for cryptsetup (dynamically linked)
+    if type -t bundle_binary_libs >/dev/null 2>&1; then
+      debug "Bundling cryptsetup library dependencies..."
+      local lib_dir="$initramfs_dir/lib"
+      mkdir -p "$lib_dir" || true
+      bundle_binary_libs "/usr/share/inferno/cryptsetup" "$lib_dir" || warn "Failed to bundle libraries for cryptsetup"
+    else
+      warn "bundle-libs.sh not loaded; cryptsetup may not work in minimal containers"
+    fi
+  else
+    debug "cryptsetup not found at /usr/share/inferno/cryptsetup (encrypted volumes will not work)"
+  fi
+
   log "Creating initrd.cpio..."
   (cd "$initramfs_dir" && find . | cpio -H newc -o >"$chroot_dir/initrd.cpio") \
     || { rm -rf "$base"; die 1 "Failed to create initrd.cpio"; }
@@ -1463,6 +1836,18 @@ EOF
 EOF
   fi
   unset INFERNO_JAILER_ID
+
+  # Add volume mapping to kiln.json if volume is attached
+  if [[ -n "$volume_id" ]]; then
+    log "Adding volume mapping to kiln configuration..."
+    if jq --arg vol_id "$volume_id" \
+      '.kms_socket = "./kms.sock" | .volumes = {"/dev/vdb": $vol_id}' \
+      "$chroot_dir/kiln.json" > "$chroot_dir/kiln.json.tmp" 2>/dev/null; then
+      mv "$chroot_dir/kiln.json.tmp" "$chroot_dir/kiln.json"
+    else
+      warn "Failed to update kiln.json with volume mapping"
+    fi
+  fi
 
   # Sanity: enforce UID/GID in kiln.json to match 123/100 (or your env-provided overrides).
   _verify_kiln_ids "$chroot_dir" "${DEFAULT_JAIL_UID:-123}" "${DEFAULT_JAIL_GID:-100}"
@@ -1587,8 +1972,13 @@ cmd_start() {
     # Create device node inside chroot for snapshot
     log "Creating device node in chroot..."
     local snap_dev_major snap_dev_minor
-    snap_dev_major="$(stat -L -c '%t' "$snap_path" 2>/dev/null)"
-    snap_dev_minor="$(stat -L -c '%T' "$snap_path" 2>/dev/null)"
+    snap_dev_major="$(stat -L -c '%t' "$snap_path" 2>/dev/null || echo "")"
+    snap_dev_minor="$(stat -L -c '%T' "$snap_path" 2>/dev/null || echo "")"
+
+    if [[ -z "$snap_dev_major" ]] || [[ -z "$snap_dev_minor" ]]; then
+      die 1 "Failed to get device numbers for $snap_path"
+    fi
+
     snap_dev_major=$((16#$snap_dev_major))
     snap_dev_minor=$((16#$snap_dev_minor))
 
@@ -1605,6 +1995,45 @@ cmd_start() {
       chown "$JAIL_UID:$JAIL_GID" "$CHROOT_DIR/firecracker.json" 2>/dev/null || true
     else
       warn "Failed to update firecracker.json with snapshot path"
+    fi
+
+    # Create device node for volume if attached
+    local volume_id device_path
+    volume_id="$(sqlite3 "$DB_PATH" "SELECT volume_id FROM volumes WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');" 2>/dev/null || true)"
+
+    if [[ -n "$volume_id" ]]; then
+      log "Creating device node for volume $volume_id in chroot..."
+      device_path="$(sqlite3 "$DB_PATH" "SELECT device_path FROM volumes WHERE volume_id = '$volume_id';" 2>/dev/null)" || device_path=""
+
+      if [[ -n "$device_path" ]] && [[ -b "$device_path" ]]; then
+        local vol_dev_major vol_dev_minor
+        vol_dev_major="$(stat -L -c '%t' "$device_path" 2>/dev/null || echo "")"
+        vol_dev_minor="$(stat -L -c '%T' "$device_path" 2>/dev/null || echo "")"
+
+        if [[ -n "$vol_dev_major" ]] && [[ -n "$vol_dev_minor" ]]; then
+          vol_dev_major=$((16#$vol_dev_major))
+          vol_dev_minor=$((16#$vol_dev_minor))
+
+          local chroot_vol_path="$CHROOT_DIR/dev/volume"
+          rm -f "$chroot_vol_path" 2>/dev/null || true
+          mknod "$chroot_vol_path" b "$vol_dev_major" "$vol_dev_minor" || warn "Failed to create volume device node in chroot"
+          chown "$JAIL_UID:$JAIL_GID" "$chroot_vol_path" 2>/dev/null || true
+          chmod 0660 "$chroot_vol_path" 2>/dev/null || true
+
+          # Update firecracker.json to use relative path for volume
+          log "Updating firecracker config with volume device path..."
+          if jq --arg vol_id "$volume_id" '.drives |= map(if .drive_id == $vol_id then .path_on_host = "dev/volume" else . end)' "$CHROOT_DIR/firecracker.json" > "$CHROOT_DIR/firecracker.json.tmp" 2>/dev/null; then
+            mv "$CHROOT_DIR/firecracker.json.tmp" "$CHROOT_DIR/firecracker.json"
+            chown "$JAIL_UID:$JAIL_GID" "$CHROOT_DIR/firecracker.json" 2>/dev/null || true
+          else
+            warn "Failed to update firecracker.json with volume path"
+          fi
+        else
+          warn "Failed to get device numbers for volume $device_path"
+        fi
+      else
+        warn "Volume device not found or not a block device: $device_path"
+      fi
     fi
 
     # Check thin pool usage
@@ -1665,6 +2094,47 @@ cmd_start() {
     debug "Bind mounted ${INFERNO_ROOT}/logs to ${CHROOT_DIR}/logs"
   fi
 
+  # === KMS SOCKET LINKING (FOR ENCRYPTED VOLUMES) ==============================
+  # Check if VM has encrypted volumes attached
+  if type -t kms_is_running >/dev/null 2>&1; then
+    local has_encrypted_volume="0"
+    if [[ -n "$volume_id" ]]; then
+      # Check if volume is encrypted
+      local encrypted
+      encrypted="$(sqlite3 "$DB_PATH" "SELECT encrypted FROM volumes WHERE volume_id = '$volume_id';" 2>/dev/null || echo "0")"
+      if [[ "$encrypted" == "1" ]]; then
+        has_encrypted_volume="1"
+      fi
+    fi
+
+    if [[ "$has_encrypted_volume" == "1" ]]; then
+      debug "VM has encrypted volume, checking KMS availability..."
+
+      # Ensure KMS service is running
+      if ! kms_is_running; then
+        warn "Anubis KMS service is not running"
+        info "Starting Anubis service..."
+        if ! kms_start; then
+          die 1 "Failed to start Anubis service. Encrypted volumes require KMS."
+        fi
+      fi
+
+      # Verify KMS health
+      if ! kms_health_check; then
+        die 1 "Anubis KMS health check failed. Cannot start VM with encrypted volume."
+      fi
+
+      # Link KMS socket into chroot
+      debug "Linking KMS socket into chroot..."
+      if kms_link_socket "$CHROOT_DIR"; then
+        info "KMS socket linked successfully"
+      else
+        die 1 "Failed to link KMS socket into chroot"
+      fi
+    fi
+  fi
+  # === END KMS SOCKET LINKING ===================================================
+
   info "Starting ${name} with jailer (jail_id=${version}, uid=${JAIL_UID}, gid=${JAIL_GID})"
   info "Exec file (host): $KILN_EXEC"
   info "Jail root:        ${CHROOT_DIR}"
@@ -1689,6 +2159,12 @@ cmd_start() {
       if type -t set_vm_state >/dev/null 2>&1; then
         set_vm_state "$name" "running" || warn "Failed to update VM state to running"
       fi
+
+      # Update volume states to attached
+      sqlite3 "$DB_PATH" "UPDATE volumes SET state = 'attached' WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');" || {
+        warn "Failed to update volume state to attached"
+      }
+
       success "VM ${name} started (PID $(cat "$pid_file"))."
     else
       warn "VM ${name} started but PID file not yet present."
@@ -1699,6 +2175,11 @@ cmd_start() {
     if type -t set_vm_state >/dev/null 2>&1; then
       set_vm_state "$name" "running" || warn "Failed to update VM state to running"
     fi
+
+    # Update volume states to attached
+    sqlite3 "$DB_PATH" "UPDATE volumes SET state = 'attached' WHERE vm_id = (SELECT id FROM vms WHERE name = '$name');" || {
+      warn "Failed to update volume state to attached"
+    }
 
     # Setup cleanup trap for foreground mode
     _cleanup_foreground() {
@@ -1829,6 +2310,12 @@ cmd_stop() {
   fi
   # === END EPHEMERAL SNAPSHOT DELETION =========================================
 
+  # === KMS SOCKET CLEANUP ======================================================
+  if type -t kms_unlink_socket >/dev/null 2>&1; then
+    kms_unlink_socket "$CHROOT_DIR" || warn "Failed to unmount KMS socket (non-fatal)"
+  fi
+  # === END KMS SOCKET CLEANUP ==================================================
+
   # Clean transient artifacts in the versioned chroot
   rm -f "${CHROOT_DIR}/${EXEC_BASE}.pid" \
         "${CHROOT_DIR}/kiln.pid" \
@@ -1949,6 +2436,11 @@ cmd_destroy() {
     fi
   fi
 
+  # Unmount KMS socket before deleting chroot
+  if type -t kms_unlink_socket >/dev/null 2>&1; then
+    kms_unlink_socket "$CHROOT_DIR" 2>/dev/null || true
+  fi
+
   # unmount logs bind before deleting chroot
   umount -l "${CHROOT_DIR}/logs" 2>/dev/null || true
   umount -l "${CHROOT_DIR}/run/inferno" 2>/dev/null || true
@@ -1995,6 +2487,196 @@ cmd_images_exposed() {
   images_exposed_ports "$img" | jq .
 }
 
+# --- Volume Commands ---------------------------------------------------------
+
+cmd_volume_create() {
+  require_root
+  local name="" size_gb="1"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)     name="$2"; shift 2;;
+      --size)     size_gb="$2"; shift 2;;
+      -*)         die 2 "Unknown option: $1";;
+      *)          die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  [[ -n "$name" ]] || die 2 "Usage: infernoctl volume create --name <name> [--size GB]"
+
+  # create_volume() in database.sh handles volume_id generation, LV creation, formatting, and DB insert
+  # Signature: create_volume name size_gb
+  local result
+  result="$(create_volume "$name" "$size_gb")" || die 1 "Failed to create volume"
+
+  # Parse the returned JSON
+  local volume_id device_path
+  volume_id="$(jq -r '.volume_id' <<<"$result")"
+  device_path="$(jq -r '.device_path' <<<"$result")"
+
+  info "Volume created successfully:"
+  info "  Volume ID: $volume_id"
+  info "  Name: $name"
+  info "  Size: ${size_gb}GB"
+  info "  Device: $device_path"
+  info "  State: available"
+}
+
+cmd_volume_list() {
+  local all=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)      all=true; shift;;
+      --orphaned) all=false; shift;;
+      -*)         die 2 "Unknown option: $1";;
+      *)          die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  if $all; then
+    # Show all volumes
+    sqlite3 -header -column "$DB_PATH" "
+      SELECT
+        volume_id,
+        name,
+        size_gb || 'GB' as size,
+        state,
+        COALESCE((SELECT vms.name FROM vms WHERE vms.id = volumes.vm_id), '-') as attached_to,
+        destination,
+        CASE encrypted WHEN 1 THEN 'yes' ELSE 'no' END as encrypted
+      FROM volumes
+      ORDER BY created_at DESC;
+    "
+  else
+    # Show only unattached (orphaned) volumes
+    sqlite3 -header -column "$DB_PATH" "
+      SELECT
+        volume_id,
+        name,
+        size_gb || 'GB' as size,
+        state,
+        destination,
+        CASE encrypted WHEN 1 THEN 'yes' ELSE 'no' END as encrypted
+      FROM volumes
+      WHERE vm_id IS NULL
+      ORDER BY created_at DESC;
+    "
+  fi
+}
+
+cmd_volume_delete() {
+  require_root
+  local volume_id=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --volume-id) volume_id="$2"; shift 2;;
+      -*)          die 2 "Unknown option: $1";;
+      *)           die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  [[ -n "$volume_id" ]] || die 2 "Usage: infernoctl volume delete --volume-id <vol>"
+
+  # Use existing delete_volume function from database.sh (checks attachment)
+  delete_volume "$volume_id" || die 1 "Failed to delete volume"
+
+  # Delete LVM volume
+  delete_lv "$volume_id" || warn "Failed to remove LVM volume (may need manual cleanup)"
+
+  info "Volume $volume_id deleted successfully"
+}
+
+cmd_volume_checkpoint() {
+  require_root
+  local volume_id="" comment=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --volume-id) volume_id="$2"; shift 2;;
+      --comment)   comment="$2"; shift 2;;
+      -*)          die 2 "Unknown option: $1";;
+      *)           die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  [[ -n "$volume_id" ]] || die 2 "Usage: infernoctl volume checkpoint --volume-id <vol> [--comment 'description']"
+
+  create_checkpoint "$volume_id" "$comment" "user"
+}
+
+cmd_volume_checkpoints_list() {
+  require_root
+  local volume_id=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --volume-id) volume_id="$2"; shift 2;;
+      -*)          die 2 "Unknown option: $1";;
+      *)           die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  [[ -n "$volume_id" ]] || die 2 "Usage: infernoctl volume checkpoints list --volume-id <vol>"
+
+  list_checkpoints "$volume_id"
+}
+
+cmd_volume_checkpoints_delete() {
+  require_root
+  local checkpoint_id=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --checkpoint-id) checkpoint_id="$2"; shift 2;;
+      -*)              die 2 "Unknown option: $1";;
+      *)               die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  [[ -n "$checkpoint_id" ]] || die 2 "Usage: infernoctl volume checkpoints delete --checkpoint-id <id>"
+
+  delete_checkpoint "$checkpoint_id"
+}
+
+cmd_volume_checkpoints_gc() {
+  require_root
+  local volume_id="" keep_count="5"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --volume-id) volume_id="$2"; shift 2;;
+      --keep)      keep_count="$2"; shift 2;;
+      -*)          die 2 "Unknown option: $1";;
+      *)           die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  [[ -n "$volume_id" ]] || die 2 "Usage: infernoctl volume checkpoints gc --volume-id <vol> [--keep N]"
+
+  gc_checkpoints "$volume_id" "$keep_count"
+}
+
+cmd_volume_restore() {
+  require_root
+  local volume_id="" checkpoint_id=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --volume-id)     volume_id="$2"; shift 2;;
+      --checkpoint-id) checkpoint_id="$2"; shift 2;;
+      -*)              die 2 "Unknown option: $1";;
+      *)               die 2 "Unexpected argument: $1";;
+    esac
+  done
+
+  [[ -n "$volume_id" ]] || die 2 "Usage: infernoctl volume restore --volume-id <vol> --checkpoint-id <id>"
+  [[ -n "$checkpoint_id" ]] || die 2 "Usage: infernoctl volume restore --volume-id <vol> --checkpoint-id <id>"
+
+  restore_checkpoint "$volume_id" "$checkpoint_id"
+}
+
 # --- Dispatch ----------------------------------------------------------------
 main() {
   local sub="${1:-}"; shift || true
@@ -2017,12 +2699,31 @@ main() {
     destroy)              cmd_destroy "$@";;
 
     logs)                 cmd_logs "$@";;
+    lvm)                  cmd_lvm_status;;
 
     haproxy) case "${1:-}" in
                render) shift; cmd_haproxy_render;;
                reload) shift; cmd_haproxy_reload;;
                *) usage; exit 2;;
              esac ;;
+
+    volume) case "${1:-}" in
+              create)     shift; cmd_volume_create "$@";;
+              list)       shift; cmd_volume_list "$@";;
+              delete)     shift; cmd_volume_delete "$@";;
+              checkpoint) shift; cmd_volume_checkpoint "$@";;
+              checkpoints)
+                shift
+                case "${1:-}" in
+                  list)   shift; cmd_volume_checkpoints_list "$@";;
+                  delete) shift; cmd_volume_checkpoints_delete "$@";;
+                  gc)     shift; cmd_volume_checkpoints_gc "$@";;
+                  *) usage; exit 2;;
+                esac
+                ;;
+              restore) shift; cmd_volume_restore "$@";;
+              *) usage; exit 2;;
+            esac ;;
 
     images) case "${1:-}" in
               process) shift; cmd_images_process "$@";;
