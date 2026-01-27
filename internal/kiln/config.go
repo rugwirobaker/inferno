@@ -40,6 +40,10 @@ type Config struct {
 	LogRotation LogRotation `json:"log_rotation"` // log rotation settings
 
 	Resources Resources `json:"resources"`
+
+	// Encryption support
+	KMSSocket string            `json:"kms_socket,omitempty"` // path to KMS unix socket (relative to chroot)
+	Volumes   map[string]string `json:"volumes,omitempty"`    // device path -> volume_id mapping
 }
 
 // LogRotation defines settings for log file rotation

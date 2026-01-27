@@ -21,6 +21,8 @@ const (
 	VsockExitPort
 	// VsockAPIPort is port used by the host to send a kill signal to the guest
 	VsockAPIPort
+	// VsockKeyPort is port used by the guest to request encryption keys from the host
+	VsockKeyPort
 )
 
 // NewVsockConn creates a new vsock connection to the host via the specified port

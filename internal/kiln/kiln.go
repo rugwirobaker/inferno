@@ -284,6 +284,42 @@ func run(ctx context.Context) error {
 		}
 	}()
 
+	// Start the server that handles encryption key requests (port 10003)
+	// Only start if volumes are configured (indicating encrypted volumes may be present)
+	if len(config.Volumes) > 0 {
+		vsockKeyPath := fmt.Sprintf("%s_%d", config.FirecrackerVsockUDSPath, vsock.VsockKeyPort)
+		keyListener, err := vsock.NewVsockUnixListener(vsockKeyPath)
+		if err != nil {
+			slog.Error("Failed to start key vsock listener", "error", err)
+			return err
+		}
+		defer keyListener.Close()
+
+		go func() {
+			slog.Info("Serving encryption keys on vsock", "port", vsock.VsockKeyPort)
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/volume/key", KeyRequestHandler(config))
+			server := &http.Server{
+				Handler:      mux,
+				ReadTimeout:  5 * time.Second,
+				WriteTimeout: 10 * time.Second,
+				IdleTimeout:  120 * time.Second,
+			}
+
+			finalizers = append(finalizers, func() error {
+				slog.Info("Stopping key vsock server")
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				return server.Shutdown(ctx)
+			})
+
+			if err := server.Serve(keyListener); err != nil && err != http.ErrServerClosed {
+				slog.Error("Error serving encryption keys", "error", err)
+			}
+		}()
+	}
+
 	// Run the Firecracker process
 	if err := cmd.Start(); err != nil {
 		slog.Error("Failed to run Firecracker", "error", err)
