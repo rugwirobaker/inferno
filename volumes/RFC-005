@@ -1,0 +1,1144 @@
+## RFC 005: Guest-Side Volume Encryption with Vsock Key Delivery
+
+**Authors:** Rugwiro Valentin · Inferno Project
+
+**Date:** 2026-01-23
+
+**Status:** Draft
+
+**Supersedes:** RFC-004 (for Inferno experimental implementation)
+
+**Depends On:** RFC-002 (Volumes), RFC-003 (Volume Identity & Location)
+
+**Related:** RFC-006 (Key Management Service Design) — *to be written*
+
+---
+
+### 1. Abstract
+
+RFC-004 specified **host-side LUKS encryption** where the host unlocks volumes before attaching them to VMs. This RFC proposes an alternative architecture for Inferno: **guest-side encryption** where volumes remain locked on the host and encryption keys are delivered to the guest via vsock for in-VM decryption.
+
+This design provides **true cryptographic isolation from the hypervisor**: the host cannot read volume data even while the VM is running. The key insight is that Firecracker's vsock provides a secure channel for key delivery, and the guest's isolation boundary is the natural place to perform decryption.
+
+**Key difference from RFC-004:** Host manages encrypted blocks; guest manages plaintext data.
+
+**Key Management:** This RFC introduces a lightweight Key Management Service (KMS) that runs on the host and provides Vault-compatible APIs. The KMS design and implementation details are covered in RFC-006. For this RFC, we treat KMS as a black box that stores and retrieves encryption keys.
+
+---
+
+### 2. Motivation
+
+#### 2.1 Threat Model (Improved from RFC-004)
+
+| Threat | RFC-004 Mitigation | RFC-005 Mitigation |
+|--------|-------------------|-------------------|
+| Physical disk theft | LUKS encryption | LUKS encryption (same) |
+| Decommissioned drive recovery | Encrypted blocks | Encrypted blocks (same) |
+| Host compromise (volume detached) | Key not on host | Key not on host (same) |
+| **Host compromise (volume attached)** | ❌ Key in kernel, host can read | ✅ Key in guest only, host sees ciphertext |
+| **Malicious hypervisor** | ❌ Can read guest memory | ✅ Host never has plaintext access |
+| Cross-VM data access | Per-volume keys | Per-volume keys (same) |
+
+**Critical improvement:** RFC-004 § 2.2 lists "compromised host reading attached volumes" as a non-goal. RFC-005 **solves this** by moving decryption into the guest.
+
+#### 2.2 Why Guest-Side for Inferno
+
+1. **Security**: Aligns with Firecracker's security model—the VM is the isolation boundary
+2. **Simplicity**: No host-side LUKS management in bash scripts
+3. **Validation**: Proves cryptographic isolation is achievable in microVM architecture
+4. **Clean architecture**: Separation of concerns (host = encrypted blocks, guest = plaintext)
+5. **Educational**: Demonstrates key delivery over vsock, custom KMS design
+
+#### 2.3 Design Principles
+
+1. **Keys delivered just-in-time** — Via vsock during VM boot, never written to disk
+2. **Host is untrusted** — Cannot read volume plaintext under any circumstance
+3. **Guest owns decryption** — Init process unlocks LUKS, mounts filesystem
+4. **KMS as separate service** — Vault-compatible API, swappable backend (see RFC-006)
+5. **Utility VM pattern** — Offline operations (backup, resize) use isolated utility VMs
+
+---
+
+### 3. Scope
+
+| In Scope | Out of Scope |
+|----------|--------------|
+| LUKS2 encryption per thin volume | Full-disk encryption |
+| Guest-side LUKS unlock in init | Host-side LUKS unlock |
+| Vsock key delivery protocol | Network-based key delivery |
+| KMS integration (API contract) | KMS implementation (see RFC-006) |
+| Utility VM pattern for offline ops | Multi-host orchestration |
+| cryptsetup in initramfs | Hardware Security Modules (HSM) |
+| Per-volume encryption keys | Backup keys (future work) |
+| Application-consistent snapshots | Live migration |
+
+---
+
+### 4. Background Concepts
+
+#### 4.1 Guest-Side vs Host-Side Encryption
+
+**Host-Side (RFC-004):**
+```
+┌─────────────────────────────────────────────┐
+│ Host                                        │
+│                                             │
+│  /dev/inferno_vg/vol_xxx (LUKS encrypted)   │
+│              ↓                              │
+│  Host fetches key, unlocks                  │
+│              ↓                              │
+│  /dev/mapper/vol-xxx-crypt (plaintext)      │
+│              ↓                              │
+│  ═══════════╪═══════════════════════════    │
+│             ↓ virtio-block (plaintext)      │
+│  ┌────────────────────┐                     │
+│  │ Guest VM           │                     │
+│  │ sees /dev/vdb      │                     │
+│  │ (plaintext)        │                     │
+│  └────────────────────┘                     │
+│                                             │
+│  ⚠️  Host kernel can read plaintext         │
+└─────────────────────────────────────────────┘
+```
+
+**Guest-Side (This RFC):**
+```
+┌─────────────────────────────────────────────┐
+│ Host                                        │
+│                                             │
+│  /dev/inferno_vg/vol_xxx (LUKS encrypted)   │
+│              ↓                              │
+│  Stays locked (no key on host)              │
+│              ↓                              │
+│  ═══════════╪═══════════════════════════    │
+│             ↓ virtio-block (encrypted)      │
+│  ┌────────────────────┐                     │
+│  │ Guest VM           │                     │
+│  │ ┌────────────────┐ │                     │
+│  │ │ init receives  │ │                     │
+│  │ │ key via vsock  │ │                     │
+│  │ └────────┬───────┘ │                     │
+│  │          ↓         │                     │
+│  │ cryptsetup open    │                     │
+│  │          ↓         │                     │
+│  │ /dev/mapper/data   │                     │
+│  │ (plaintext in VM)  │                     │
+│  └────────────────────┘                     │
+│                                             │
+│  ✅ Host only sees encrypted blocks         │
+└─────────────────────────────────────────────┘
+```
+
+#### 4.2 LUKS and Device Mapper Architecture
+
+**Understanding the two devices:**
+
+When a volume is encrypted with LUKS, there are two devices involved:
+
+1. **`/dev/vdb`** - The raw **encrypted** block device
+   - Contains LUKS header + encrypted data
+   - **Cannot** be mounted directly (it's just encrypted bytes)
+   - This is what the host sees and what Firecracker attaches to the guest
+
+2. **`/dev/mapper/vdb_crypt`** - A virtual **decrypted** device
+   - Created by `cryptsetup open`
+   - Transparently decrypts reads and encrypts writes
+   - **This is what we mount** with a filesystem
+
+**The decryption flow:**
+
+```
+┌─────────────────────────────────────────────────┐
+│  Application: read file from /data              │
+└────────────────────┬────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  Filesystem (ext4) mounted on /dev/mapper/...   │
+└────────────────────┬────────────────────────────┘
+                     │ read block 1234
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  Device Mapper (dm-crypt kernel driver)         │
+│  1. Read encrypted block from /dev/vdb          │
+│  2. Decrypt using key (in kernel memory)        │
+│  3. Return decrypted data                       │
+└────────────────────┬────────────────────────────┘
+                     │ read encrypted bytes
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  /dev/vdb (raw encrypted Firecracker device)    │
+└─────────────────────────────────────────────────┘
+```
+
+**What `cryptsetup open` does:**
+
+```bash
+cryptsetup open --key-file=- /dev/vdb vdb_crypt
+```
+
+This command:
+1. Reads LUKS header from `/dev/vdb`
+2. Validates the encryption key
+3. Instructs the kernel to create a device mapper target
+4. Kernel automatically creates `/dev/mapper/vdb_crypt` device node
+5. dm-crypt driver handles all decryption/encryption transparently
+
+**Key insight for guest-side encryption:** The mapper device (`/dev/mapper/vdb_crypt`) is backed by the raw device (`/dev/vdb`). When you read from the mapper device, dm-crypt automatically reads encrypted data from `/dev/vdb`, decrypts it, and returns plaintext. When you write, it encrypts and writes to `/dev/vdb`.
+
+**This is why host-side encryption (RFC-004) exposes plaintext:** In RFC-004, the host runs `cryptsetup open`, so `/dev/mapper/*_crypt` exists on the **host** kernel with plaintext access. In RFC-005 (this design), `cryptsetup open` runs in the **guest**, so the mapper device only exists in the guest kernel—the host only ever sees the raw encrypted `/dev/vdb`.
+
+**Mount operations:** We always mount the mapper device, not the raw device:
+```bash
+mount /dev/mapper/vdb_crypt /data  # ✅ Correct - mounts decrypted device
+# NOT: mount /dev/vdb /data        # ❌ Would fail - can't mount encrypted data
+```
+
+**Device persistence:** When `/dev` is moved from initramfs to the new root (during `switchRoot()`), both devices are preserved:
+- `/dev/vdb` - Still present, still contains encrypted blocks
+- `/dev/mapper/vdb_crypt` - Still present, dm-crypt keeps decrypting using the key stored in kernel memory
+
+The encryption key remains in the guest kernel's memory until `cryptsetup close` is called during VM shutdown.
+
+#### 4.3 Chroot Jail Constraint
+
+**Critical implementation detail:** Both kiln and Firecracker run inside a chroot jail:
+
+```
+$INFERNO_ROOT/vms/kiln/<VERSION>/root/
+├── firecracker          # Firecracker binary
+├── kiln                 # Kiln executable (jailer exec's into this)
+├── vmlinux              # Kernel
+├── rootfs.img or rootfs_snapshot  # Container filesystem
+├── initrd.cpio          # Init ramdisk
+├── firecracker.json     # VM config
+├── kiln.json            # Kiln config
+├── run/
+│   └── firecracker.sock # Firecracker API socket
+├── dev/                 # Device nodes
+└── kms.sock            # Linked from $INFERNO_ROOT/kms.sock
+
+# Outside chroot (not accessible to kiln/firecracker):
+$INFERNO_ROOT/inferno.db           # SQLite database
+$INFERNO_ROOT/kms.sock             # KMS service socket (original)
+```
+
+**Problem:** Kiln cannot directly access `inferno.db` or other host resources.
+
+**Solution:** Run a dedicated Key Management Service on the host that:
+- Runs outside the chroot jail
+- Exposes unix socket at `$INFERNO_ROOT/kms.sock`
+- Socket is linked into each VM's chroot
+- Provides Vault-compatible HTTP API over unix socket
+- Handles all key storage/retrieval operations
+
+This design allows kiln to remain simple—it just proxies vsock requests to the KMS socket without needing database access, SQL knowledge, or complex key management logic.
+
+#### 4.4 Vsock as Secure Channel
+
+Firecracker's **vsock** (virtual socket) provides a point-to-point channel between host and guest:
+
+| Property | Implication |
+|----------|-------------|
+| **Isolated** | Guest A cannot intercept Guest B's vsock traffic |
+| **Not network-routed** | Cannot be sniffed or MitM'd by network attackers |
+| **Firecracker-managed** | Multiplexed over a single host socket |
+| **Low latency** | Shared memory, no TCP overhead |
+
+**Security model:** Vsock is as secure as the host-guest isolation boundary. If an attacker can compromise vsock, they've already compromised Firecracker's core isolation.
+
+**Key delivery flow:**
+```
+┌─────────────────────────────────────────────────────────┐
+│ VM Boot Sequence                                        │
+│                                                          │
+│  1. Firecracker starts, boots kernel                    │
+│  2. Kernel loads initramfs, runs /inferno/init          │
+│  3. init reads /inferno/run.json:                       │
+│     {                                                    │
+│       "volumes": [{                                      │
+│         "device": "/dev/vdb",                            │
+│         "mount_point": "/data",                          │
+│         "encrypted": true                                │
+│       }]                                                 │
+│     }                                                    │
+│  4. init connects to host vsock port 10003              │
+│  5. init → kiln: GET /v1/volume/key?device=/dev/vdb     │
+│  6. kiln → KMS: GET /v1/secret/data/.../encryption-key  │
+│  7. KMS → kiln: {encryption_key: "base64..."}           │
+│  8. kiln → init: forward key via vsock                  │
+│  9. init receives key (never writes to disk)            │
+│ 10. init: echo $key | cryptsetup open /dev/vdb data     │
+│ 11. init: mount /dev/mapper/data /data                  │
+│ 12. Key cleared from init memory                        │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Why not include key in run.json?** Security concerns:
+- Would be written to initramfs CPIO archive on host
+- Persists in `$CHROOT_DIR/initramfs/` directory
+- Survives VM shutdown
+- Accessible if host is compromised
+
+With vsock delivery:
+- Key exists only during boot handshake
+- Never written to host disk
+- Ephemeral, request/response only
+
+#### 4.5 Utility VM Pattern
+
+For operations that require decrypted volume access when the primary VM isn't running:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Utility VM Pattern                                      │
+│                                                          │
+│  Problem: Need to backup/resize/repair vol_xxx offline  │
+│                                                          │
+│  Solution:                                               │
+│  1. Create ephemeral utility VM                         │
+│  2. Attach vol_xxx to utility VM as /dev/vdb            │
+│  3. Deliver encryption key via vsock (same mechanism)   │
+│  4. Utility VM unlocks, performs operation, locks       │
+│  5. Destroy utility VM                                   │
+│                                                          │
+│  Benefits:                                               │
+│  • Host never sees plaintext                            │
+│  • Tooling (restic, resize2fs, fsck) runs in VM         │
+│  • Same security model as primary VM                    │
+│  • No new attack surface                                │
+│  • Isolated operation (can't affect running VMs)        │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+Example utility VM images:
+- `inferno-backup:latest` — restic, rclone, S3 tools
+- `inferno-repair:latest` — e2fsck, debugfs, resize2fs
+- `inferno-migrate:latest` — dd, rsync, compression tools
+
+---
+
+### 5. Architecture
+
+#### 5.1 Component Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           Host System                                │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ KMS Service (infernokms)                                     │   │
+│  │                                                               │   │
+│  │  • Vault-compatible HTTP API                                 │   │
+│  │  • Listens on $INFERNO_ROOT/kms.sock                         │   │
+│  │  • Manages encryption key storage/retrieval                  │   │
+│  │                                                               │   │
+│  │  Details: See RFC-006                                        │   │
+│  └────────────────────────────▲─────────────────────────────────┘   │
+│                               │ unix socket                          │
+│                               │ (linked into chroot)                 │
+│  ┌────────────────────────────┴─────────────────────────────────┐   │
+│  │ Chroot Jail: $CHROOT_DIR/root/                               │   │
+│  │                                                               │   │
+│  │  ┌──────────────────────────────────────────────────────┐    │   │
+│  │  │ kiln (Firecracker supervisor)                        │    │   │
+│  │  │                                                       │    │   │
+│  │  │  Vsock key proxy (port 10003):                       │    │   │
+│  │  │  1. Guest requests key via vsock                     │    │   │
+│  │  │  2. kiln → KMS: forward request                      │    │   │
+│  │  │  3. KMS → kiln: encryption key                       │    │   │
+│  │  │  4. kiln → Guest: forward key via vsock              │    │   │
+│  │  │                                                       │    │   │
+│  │  │  Socket: ./kms.sock → $INFERNO_ROOT/kms.sock         │    │   │
+│  │  └──────────────────────────────────────────────────────┘    │   │
+│  │                               ▲                               │   │
+│  │                               │ vsock (port 10003)            │   │
+│  │  ┌────────────────────────────┴───────────────────────────┐  │   │
+│  │  │ Firecracker VM                                         │  │   │
+│  │  │  ┌────────────────────────────────────────────────┐    │  │   │
+│  │  │  │ init (guest init process)                      │    │  │   │
+│  │  │  │                                                 │    │  │   │
+│  │  │  │ 1. Read run.json → volume encrypted             │    │  │   │
+│  │  │  │ 2. Request key via vsock:10003                  │    │  │   │
+│  │  │  │ 3. Receive key (ephemeral)                      │    │  │   │
+│  │  │  │ 4. cryptsetup open /dev/vdb data                │    │  │   │
+│  │  │  │ 5. mount /dev/mapper/data /data                 │    │  │   │
+│  │  │  │ 6. Clear key from memory                        │    │  │   │
+│  │  │  └────────────────────────────────────────────────┘    │  │   │
+│  │  │                                                         │  │   │
+│  │  │  /dev/vdb → /dev/inferno_vg/vol_xxx (encrypted)        │  │   │
+│  │  └─────────────────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Key insight:** The KMS service acts as a **clean interface boundary**. Kiln doesn't know how keys are stored (could be SQLite, Vault, AWS KMS). It just talks HTTP over a unix socket.
+
+#### 5.2 Vsock Key Delivery Protocol
+
+**New vsock port:**
+```go
+// internal/vsock/vsock.go
+const (
+    StdoutPort = 10000  // Guest stdout → host
+    ExitPort   = 10001  // Guest exit status → host
+    APIPort    = 10002  // Host → guest API (signals, etc.)
+    KeyPort    = 10003  // NEW: Guest → host key requests
+)
+```
+
+**Guest-side request (init):**
+```
+Guest initiates connection to vsock CID 2 (host), port 10003
+Sends HTTP request:
+
+GET /v1/volume/key?device=/dev/vdb HTTP/1.1
+Host: host
+
+(No mux protocol needed - dedicated port for keys)
+```
+
+**Host-side proxy (kiln):**
+```
+1. Accept vsock connection on port 10003
+2. Parse HTTP request
+3. Extract device parameter (/dev/vdb)
+4. Look up volume_id from kiln.json: volumes["/dev/vdb"] → "vol_xxx"
+5. Forward to KMS via unix socket:
+   GET /v1/secret/data/inferno/volumes/vol_xxx/encryption-key
+6. Receive KMS response (Vault-compatible JSON)
+7. Forward response back to guest via vsock
+```
+
+**KMS response format (from RFC-006):**
+```json
+{
+  "data": {
+    "data": {
+      "key": "dGhpc2lzYTMyYnl0ZWtleWZvcmRlbW9vbmx5ISEh",
+      "algorithm": "aes-xts-plain64",
+      "key_size": 512
+    }
+  }
+}
+```
+
+**Guest-side handler (init):**
+```
+1. Receive HTTP response
+2. Parse JSON, extract data.data.key
+3. Base64 decode key
+4. Pass to cryptsetup via stdin
+5. Zero memory containing key
+```
+
+#### 5.3 Configuration Changes
+
+**run.json (guest init config):**
+```json
+{
+  "process": {
+    "cmd": ["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"],
+    "cwd": "/",
+    "env": {...}
+  },
+  "network": {...},
+  "volumes": [
+    {
+      "device": "/dev/vdb",
+      "mount_point": "/data",
+      "encrypted": true,
+      "filesystem": "ext4",
+      "mount_options": "defaults"
+    }
+  ]
+}
+```
+
+**kiln.json (supervisor config):**
+```json
+{
+  "uid": 123,
+  "gid": 100,
+  "socket_path": "./run/firecracker.sock",
+  "kms_socket": "./kms.sock",
+  "volumes": {
+    "/dev/vdb": "vol_kf454eyxrwtf884k"
+  }
+}
+```
+
+The `volumes` mapping tells kiln which volume_id corresponds to which device, enabling the proxy to forward key requests to the correct KMS path.
+
+---
+
+### 6. Volume Lifecycle Operations
+
+#### 6.1 Volume Creation
+
+```bash
+# scripts/libvol.sh: volume_create()
+
+volume_id="vol_$(ulid_generate)"
+size="$1"  # GB
+
+# 1. Create thin LV
+lvcreate --thin --name "$volume_id" \
+         --virtualsize "${size}G" inferno_vg/thinpool
+
+# 2. Generate encryption key
+encryption_key=$(head -c 32 /dev/urandom | base64 -w0)
+
+# 3. Format with LUKS (on host, stays locked)
+echo -n "$encryption_key" | base64 -d | \
+  cryptsetup luksFormat --type luks2 \
+    --cipher aes-xts-plain64 \
+    --key-size 512 \
+    --key-file=- \
+    "/dev/inferno_vg/$volume_id"
+
+# 4. Temporarily unlock to format filesystem
+echo -n "$encryption_key" | base64 -d | \
+  cryptsetup open --key-file=- \
+    "/dev/inferno_vg/$volume_id" "${volume_id}_tmp"
+
+mkfs.ext4 -L "inferno_volume" "/dev/mapper/${volume_id}_tmp"
+
+cryptsetup close "${volume_id}_tmp"
+
+# 5. Store key in KMS via HTTP API
+curl -X POST --unix-socket "$INFERNO_ROOT/kms.sock" \
+  "http://unix/v1/secret/data/inferno/volumes/$volume_id/encryption-key" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"data\": {
+      \"key\": \"$encryption_key\",
+      \"algorithm\": \"aes-xts-plain64\",
+      \"key_size\": 512
+    }
+  }"
+
+# 6. Clear key from bash memory (best effort)
+unset encryption_key
+
+# Volume is now encrypted at rest, locked, key stored in KMS
+```
+
+#### 6.2 VM Start with Encrypted Volume
+
+```bash
+# scripts/infernoctl.sh: cmd_start()
+
+# 1. Ensure KMS service is running
+if ! _kms_is_running; then
+  info "Starting KMS service..."
+  _start_kms_service
+fi
+
+# 2. Resolve VM context
+_resolve_vm_ctx "$name"
+
+# 3. Check if VM has attached volume
+volume_id=$(sqlite3 "$DB_PATH" \
+  "SELECT volume_id FROM vm_volumes WHERE vm_id='$name' LIMIT 1")
+
+if [[ -n "$volume_id" ]]; then
+  # 4. Update kiln.json with volume mapping
+  jq --arg vol "$volume_id" \
+    '.volumes["/dev/vdb"] = $vol' \
+    "$CHROOT_DIR/kiln.json" > tmp.json && mv tmp.json "$CHROOT_DIR/kiln.json"
+
+  # 5. Update run.json to mark volume as encrypted
+  jq '.volumes[0].encrypted = true' \
+    "$INITRAMFS_DIR/inferno/run.json" > tmp.json && \
+    mv tmp.json "$INITRAMFS_DIR/inferno/run.json"
+
+  # 6. Link KMS socket into chroot
+  ln -sf "$INFERNO_ROOT/kms.sock" "$CHROOT_DIR/kms.sock"
+
+  # 7. Create device node in chroot (for encrypted device)
+  local major minor
+  read -r major minor < <(stat -c "%t %T" "/dev/inferno_vg/$volume_id")
+  mknod "$CHROOT_DIR/dev_vdb" b $((0x$major)) $((0x$minor))
+fi
+
+# 8. Start kiln (includes key proxy on vsock port 10003)
+sudo -u "$jail_user" "$KILN_EXEC" &
+
+# 9. Guest init will request key during boot via vsock
+```
+
+**Guest boot sequence (init):**
+
+When init sees `volumes[0].encrypted = true` in run.json:
+
+1. Connect to vsock CID 2 (host), port 10003
+2. Send: `GET /v1/volume/key?device=/dev/vdb`
+3. kiln receives request, extracts device `/dev/vdb`
+4. kiln looks up volume_id from kiln.json: `volumes["/dev/vdb"]` → `"vol_kf454eyxrwtf884k"`
+5. kiln forwards to KMS: `GET /v1/secret/data/inferno/volumes/vol_kf454eyxrwtf884k/encryption-key`
+6. KMS returns key (Vault JSON format)
+7. kiln forwards response to guest via vsock
+8. init parses response, extracts `data.data.key`
+9. init decodes base64 key
+10. init runs: `echo $key | cryptsetup open --key-file=- /dev/vdb data`
+11. init runs: `mount /dev/mapper/data /data`
+12. init zeros memory containing key
+13. Continue with normal boot (execute primary process)
+
+#### 6.3 VM Stop (Key Eviction)
+
+```bash
+# scripts/infernoctl.sh: cmd_stop()
+
+# 1. Send graceful shutdown signal to guest
+send_vm_signal "$name" "$signal" "$timeout"
+
+# Guest init receives signal:
+# - Unmounts /data (sync)
+# - cryptsetup close data (evicts key from guest kernel)
+# - Exits cleanly
+
+# 2. Wait for VM to stop
+wait_for_vm_stop "$name" "$timeout"
+
+# 3. Firecracker terminates
+# 4. Volume remains locked on host (never unlocked by host)
+
+# Note: KMS service keeps running (shared by all VMs)
+```
+
+**Key eviction guarantee:** When `cryptsetup close data` runs in the guest, the kernel's dm-crypt layer destroys the key from memory. The volume becomes inaccessible to the guest.
+
+#### 6.4 Snapshot Operations
+
+**Creating snapshots (crash-consistent):**
+```bash
+# LVM snapshots work on encrypted blocks - no key needed
+
+snapshot_id="${volume_id}_snap_$(date +%s)"
+lvcreate -s -n "$snapshot_id" "/dev/inferno_vg/$volume_id"
+
+# Snapshot inherits encryption, uses same key as origin
+```
+
+**Creating snapshots (application-consistent):**
+```bash
+# 1. Ask guest to freeze filesystem
+curl -X POST http://guest:10002/v1/volume/freeze \
+  -d '{"device": "/dev/vdb", "timeout": 30}'
+
+# Guest runs: sync && fsfreeze -f /data
+
+# 2. Create LVM snapshot
+snapshot_id="${volume_id}_snap_$(date +%s)"
+lvcreate -s -n "$snapshot_id" "/dev/inferno_vg/$volume_id"
+
+# 3. Unfreeze
+curl -X POST http://guest:10002/v1/volume/unfreeze \
+  -d '{"device": "/dev/vdb"}'
+
+# Guest runs: fsfreeze -u /data
+```
+
+**Using snapshots:**
+
+Snapshots are encrypted with the same key. To access snapshot data:
+
+1. Create utility VM
+2. Attach snapshot as `/dev/vdb`
+3. Utility VM requests key for **original volume_id** (snapshots share key)
+4. Unlock, mount, perform operation
+5. Destroy utility VM
+
+#### 6.5 Resize Operations
+
+**Live resize (VM running):**
+```bash
+# 1. Grow LVM volume on host
+lvextend -L +10G "/dev/inferno_vg/$volume_id"
+
+# 2. Notify guest to resize LUKS container + filesystem
+curl -X POST http://guest:10002/v1/volume/resize \
+  -d '{"device": "/dev/vdb", "action": "grow"}'
+
+# Guest handler:
+# - cryptsetup resize data  (detects new size automatically)
+# - resize2fs /dev/mapper/data
+```
+
+**Offline resize (VM stopped):**
+```bash
+# Use utility VM pattern
+
+# 1. Grow LVM volume
+lvextend -L +10G "/dev/inferno_vg/$volume_id"
+
+# 2. Create utility VM
+util_vm="resize_util_$(uuidgen)"
+infernoctl create "$util_vm" \
+  --image inferno-repair:latest \
+  --volume "$volume_id"
+
+# 3. Utility VM boots:
+#    - Requests key via vsock
+#    - Unlocks volume
+#    - Runs: cryptsetup resize data && resize2fs /dev/mapper/data
+#    - Locks and exits
+
+infernoctl start "$util_vm"  # Blocks until complete
+
+# 4. Cleanup
+infernoctl destroy "$util_vm" --yes
+```
+
+#### 6.6 Backup Operations
+
+**Full backup with utility VM:**
+```bash
+#!/bin/bash
+# infernoctl volume backup <volume_id> <s3_bucket>
+
+volume_id="$1"
+s3_bucket="$2"
+
+# 1. Create read-only snapshot
+snapshot_id="${volume_id}_backup_$(date +%s)"
+lvcreate -s -n "$snapshot_id" "/dev/inferno_vg/$volume_id"
+
+# 2. Create utility VM with snapshot attached
+util_vm="backup_util_$(uuidgen)"
+infernoctl create "$util_vm" \
+  --image inferno-backup:latest \
+  --volume "$snapshot_id" \
+  --env "S3_BUCKET=$s3_bucket" \
+  --env "OPERATION=backup" \
+  --env "RESTIC_PASSWORD=$RESTIC_PASSWORD"
+
+# 3. Start utility VM (blocks until backup completes)
+infernoctl start "$util_vm"
+
+# Utility VM:
+# - Requests key for original volume_id (snapshot shares key)
+# - Unlocks snapshot as /dev/vdb → /dev/mapper/data
+# - Mounts read-only
+# - Runs: restic backup /data --repo "s3:$s3_bucket"
+# - Unmounts, locks, exits
+
+# 4. Cleanup
+infernoctl destroy "$util_vm" --yes
+lvremove -f "/dev/inferno_vg/$snapshot_id"
+
+info "Backup complete!"
+```
+
+**Utility VM entrypoint (inferno-backup image):**
+```bash
+#!/bin/sh
+# /usr/local/bin/backup-entrypoint.sh
+
+set -e
+
+# Volume already unlocked and mounted by init at /data
+
+case "$OPERATION" in
+  backup)
+    restic backup /data \
+      --repo "s3:$S3_BUCKET" \
+      --tag "$(hostname)" \
+      --tag "$(date -Iseconds)"
+    ;;
+  restore)
+    restic restore latest \
+      --repo "s3:$S3_BUCKET" \
+      --target /data
+    ;;
+esac
+
+# Clean shutdown (init handles unmount + lock)
+exit 0
+```
+
+---
+
+### 7. Failure Handling
+
+#### 7.1 KMS Service Failures
+
+| Scenario | Impact | Recovery |
+|----------|--------|----------|
+| KMS not running | VM boot fails immediately | Start KMS: `infernoctl kms start` |
+| KMS socket missing | kiln cannot forward requests | Check KMS service status |
+| KMS returns 404 | Volume key not found | Verify volume exists, check KMS logs |
+| KMS returns 500 | Internal KMS error | Check KMS logs, database integrity |
+
+#### 7.2 Key Request Failures
+
+| Scenario | Guest Behavior | Recovery |
+|----------|---------------|----------|
+| Vsock connection timeout | Retry 3x with backoff (1s, 2s, 4s) | Check kiln running, check vsock listener |
+| HTTP 404 from kiln | Fatal error, boot fails | Volume not mapped in kiln.json |
+| Malformed key response | Fatal error, boot fails | KMS bug or protocol mismatch |
+| LUKS unlock fails | Fatal error, boot fails | Wrong key, corrupted LUKS header, or wrong device |
+
+#### 7.3 Volume Detached Mid-Operation
+
+If host forcibly detaches volume while VM is running:
+
+1. Guest I/O operations fail with EIO errors
+2. Kernel marks filesystem read-only (emergency remount)
+3. Application errors cascade
+4. Init should handle graceful degradation (if possible)
+
+**Mitigation:** Don't detach volumes from running VMs. Use proper shutdown sequence.
+
+#### 7.4 Host Crash During VM Operation
+
+1. Firecracker process killed (VM terminates)
+2. Guest kernel evicted (key in memory destroyed)
+3. Volume remains locked on host (never unlocked by host)
+4. KMS service may still be running (or restart via systemd)
+
+**Recovery:**
+- Volumes are untouched, encrypted, locked
+- No data loss (assuming filesystem journaling worked)
+- Restart VM normally—key will be delivered again via vsock
+
+---
+
+### 8. Security Considerations
+
+#### 8.1 Key Exposure Timeline
+
+| State | Host | KMS | Guest |
+|-------|------|-----|-------|
+| Volume created | ✅ During format only | ✅ Stored | ❌ |
+| Volume at rest | ❌ Never | ✅ Stored | ❌ |
+| VM booting | ❌ Proxies only | ✅ Reads from storage | ✅ Ephemeral (seconds) |
+| VM running | ❌ Never | ✅ Stored | ✅ In kernel dm-crypt |
+| VM stopped | ❌ Never | ✅ Stored | ❌ Evicted |
+
+**Critical property:** Host kernel **never unlocks** the volume. The encryption key travels: KMS → kiln (proxy) → vsock → guest, never to host's dm-crypt.
+
+#### 8.2 Attack Scenarios
+
+**Scenario 1: Root compromise on host**
+
+Attacker gains root access on host machine:
+
+- ✅ Can access KMS socket, request arbitrary keys (if no auth)
+- ✅ Can read KMS backend storage (SQLite, etc.) directly
+- ✅ Can read encrypted blocks from `/dev/inferno_vg/vol_xxx`
+- ❌ Cannot read plaintext without starting a VM (observable, auditable)
+
+**Mitigation (future):** Add authentication to KMS API, encrypt KMS backend storage.
+
+**Verdict:** Equivalent to physical disk theft + key database theft. Same as RFC-004.
+
+**Scenario 2: Guest compromise**
+
+Attacker gains root inside guest VM:
+
+- ✅ Can read `/dev/mapper/data` (plaintext)
+- ✅ Can read decrypted files in `/data`
+- ❌ Cannot access other VMs' volumes
+
+**Verdict:** Guest compromise = data loss for that VM only. No cross-VM impact. Same as RFC-004.
+
+**Scenario 3: Vsock interception**
+
+Attacker attempts to intercept vsock traffic:
+
+- Requires compromising Firecracker's vsock implementation (kernel-level attack)
+- Equivalent to breaking VM isolation entirely
+- Out of scope (if this is broken, all bets are off)
+
+**Scenario 4: KMS compromise**
+
+Attacker compromises KMS service process:
+
+- ✅ Can return arbitrary keys to VMs (MITM attack)
+- ✅ Can exfiltrate all stored keys
+
+**Mitigation:** Run KMS as unprivileged user, systemd hardening, audit logging, secure backend storage.
+
+**Verdict:** KMS is critical infrastructure. Secure it like you'd secure a database server.
+
+#### 8.3 Improvements Over RFC-004
+
+| Attack | RFC-004 | RFC-005 |
+|--------|---------|---------|
+| Compromised host reads running VM's volume | ✅ Possible | ❌ Impossible |
+| Malicious hypervisor reads VM data | ✅ Possible | ❌ Impossible (plaintext only in guest) |
+| Physical memory dump of host | ✅ Reveals keys in dm-crypt | ❌ Keys only in guest memory |
+
+---
+
+### 9. Implementation Roadmap
+
+#### Phase 1: KMS Service (RFC-006)
+
+See RFC-006 for detailed design. Summary:
+- Vault-compatible HTTP API over unix socket
+- Pluggable backend (SQLite, Vault, AWS KMS)
+- Systemd service unit
+- Health checks and metrics
+
+#### Phase 2: Volume Encryption
+
+**Week 1: Basic encryption**
+1. Update `scripts/libvol.sh` to generate keys, format LUKS
+2. Store keys in KMS via HTTP API
+3. Test: Create encrypted volume, verify locked on host
+
+**Week 2: KMS integration**
+1. Ensure KMS service starts with infernoctl init
+2. Link KMS socket into chroot during VM start
+3. Test: KMS socket accessible from chroot
+
+#### Phase 3: Guest-Side Unlock
+
+**Week 3: initramfs + init changes**
+1. Add cryptsetup binary to initramfs (measure size)
+2. Implement key request in `cmd/init/volumes.go`
+3. Implement LUKS unlock logic
+4. Test: Boot VM, verify volume unlocked and mounted
+
+**Week 4: kiln proxy**
+1. Add vsock listener on port 10003 in `cmd/kiln/`
+2. Implement KMS proxy (vsock → unix socket)
+3. Map device to volume_id using kiln.json
+4. Test: End-to-end key delivery
+
+#### Phase 4: Integration & Testing
+
+**Week 5: End-to-end testing**
+1. Create encrypted volume
+2. Attach to VM, start VM
+3. SSH into VM, verify `/data` mounted
+4. Write file, stop VM, restart, verify persistence
+
+**Week 6: Failure testing**
+1. Test KMS down (expect boot failure)
+2. Test wrong key (expect unlock failure)
+3. Test volume not in KMS (expect 404)
+4. Test LUKS header corruption
+
+#### Phase 5: Advanced Operations
+
+**Week 7: Snapshots**
+1. Test LVM snapshot of encrypted volume
+2. Attach snapshot to new VM
+3. Verify same key unlocks snapshot
+
+**Week 8: Utility VMs**
+1. Build `inferno-backup` Docker image
+2. Implement `infernoctl volume backup` command
+3. Test backup/restore workflow with S3
+
+**Week 9: Resize**
+1. Implement guest API `/v1/volume/resize`
+2. Test live resize (VM running)
+3. Test offline resize with utility VM
+
+---
+
+### 10. Monitoring & Observability
+
+#### 10.1 Key Metrics
+
+**KMS Service:**
+- `infernokms_key_requests_total{volume_id,status}` - Counter
+- `infernokms_key_request_duration_seconds{volume_id}` - Histogram
+- `infernokms_active_connections` - Gauge
+
+**kiln (proxy):**
+- `kiln_volume_key_proxy_total{volume_id,status}` - Counter
+- `kiln_volume_key_proxy_duration_seconds{volume_id}` - Histogram
+
+**init (guest):**
+- `init_volume_unlock_duration_seconds{device}` - Histogram
+- `init_volume_unlock_total{device,status}` - Counter
+
+#### 10.2 Logging
+
+**KMS logs:**
+```
+[INFO] Key request: volume_id=vol_xxx status=200 duration=1.2ms
+[WARN] Key not found: volume_id=vol_yyy
+[ERROR] Database error: msg="disk I/O error"
+```
+
+**kiln logs:**
+```
+[INFO] Vsock key request: device=/dev/vdb volume_id=vol_xxx
+[INFO] KMS response: status=200 duration=2.3ms
+[ERROR] KMS unavailable: error="connection refused"
+```
+
+**init logs:**
+```
+[INFO] Volume /dev/vdb marked as encrypted
+[INFO] Requesting encryption key via vsock
+[INFO] LUKS unlock successful: device=/dev/vdb mapper=data duration=87ms
+[INFO] Mounted: /dev/mapper/data -> /data
+[ERROR] LUKS unlock failed: device=/dev/vdb error="invalid key"
+```
+
+#### 10.3 Audit Trail
+
+All key accesses should be auditable:
+
+```
+timestamp=2026-01-23T18:05:00Z volume_id=vol_xxx vm_id=nginx action=key_request status=success
+timestamp=2026-01-23T18:10:00Z volume_id=vol_xxx vm_id=nginx action=volume_unlock status=success
+timestamp=2026-01-23T18:15:00Z volume_id=vol_xxx vm_id=nginx action=volume_detach status=success
+```
+
+---
+
+### 11. Comparison with RFC-004
+
+| Aspect | RFC-004 (Host-Side) | RFC-005 (Guest-Side) |
+|--------|---------------------|----------------------|
+| **Decryption location** | Host kernel (dm-crypt) | Guest kernel (dm-crypt) |
+| **Key management** | HashiCorp Vault (production) | Custom KMS (Vault-compatible) |
+| **Key delivery** | Host fetches from Vault | KMS → vsock → guest |
+| **Host sees plaintext** | ✅ Yes | ❌ No |
+| **Compromised host impact** | Can read attached volumes | Cannot read plaintext |
+| **Implementation complexity** | Moderate (Vault Agent, policies) | Moderate (KMS service, vsock proxy) |
+| **Operational complexity** | Host-side LUKS operations | Guest-side or utility VM operations |
+| **Suitable for** | Multi-tenant production, existing Vault infra | Experiments, custom KMS, maximum isolation |
+
+---
+
+### 12. Future Work
+
+- **KMS authentication:** VM-specific tokens, mTLS between kiln and KMS
+- **Key rotation:** LUKS supports multiple key slots; rotate without re-encryption
+- **Backup keys:** Separate keys for backups, independent of volume encryption keys
+- **KMS high availability:** Multiple KMS instances, leader election
+- **Sealed keys:** Use TPM to seal KMS backend storage encryption key
+- **Attestation:** Guest proves identity/integrity before receiving key (measured boot)
+- **Multi-host support:** Replicate KMS state for VM migration
+- **Hardware security:** Integrate KMS with HSM for master key storage
+
+---
+
+### 13. References
+
+- [LUKS2 On-Disk Format](https://gitlab.com/cryptsetup/cryptsetup/-/wikis/LUKS2-On-Disk-Format)
+- [dm-crypt Documentation](https://gitlab.com/cryptsetup/cryptsetup/-/wikis/DMCrypt)
+- [Firecracker vsock](https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md)
+- RFC-002: Volumes — Persistent Block Storage for Firecracker MicroVMs
+- RFC-003: Volume Identity & Location Management
+- RFC-004: Volume Encryption & Key Management (Host-Side)
+- RFC-006: Key Management Service Design & Implementation *(to be written)*
+
+---
+
+**Appendix A: cryptsetup in initramfs**
+
+Adding cryptsetup to the initramfs increases its size:
+
+**Current initramfs:** ~8 MB (Go init binary + minimal busybox)
+
+**cryptsetup binary:**
+- Alpine static build: ~1.5 MB
+- Ubuntu dynamic build: ~2 MB + ~3 MB libs
+
+**Recommendation:** Use Alpine's static `cryptsetup` package.
+
+**Expected initramfs size:** ~10 MB (8 MB + 1.5 MB cryptsetup + 0.5 MB overhead)
+
+**Boot time impact:**
+- LUKS unlock (AES-XTS-256): ~50-100ms on NVMe
+- vsock key request: ~1-5ms (local unix socket)
+- Total overhead: ~60-110ms
+
+**Verification:**
+```bash
+# Check cryptsetup size in initramfs
+cpio -tv < initrd.cpio | grep cryptsetup
+# -rwxr-xr-x   1 root root  1548288 Jan 23 18:05 inferno/cryptsetup
+
+# Test unlock performance
+time cryptsetup open --key-file=- /dev/vdb data
+# real    0m0.087s
+```
+
+---
+
+**Appendix B: Example Utility VM Workflow**
+
+Complete example of using a utility VM for offline operations:
+
+```bash
+#!/bin/bash
+# Script: infernoctl volume backup vol_xxx s3://bucket
+
+set -euo pipefail
+
+volume_id="$1"
+s3_bucket="$2"
+
+# 1. Create snapshot
+info "Creating snapshot..."
+snapshot_id="${volume_id}_backup_$(date +%s)"
+lvcreate -s -n "$snapshot_id" "/dev/inferno_vg/$volume_id"
+
+# 2. Create utility VM
+info "Creating utility VM..."
+util_vm="backup_$(uuidgen)"
+infernoctl create "$util_vm" \
+  --image inferno-backup:latest \
+  --volume "$snapshot_id" \
+  --env "S3_BUCKET=$s3_bucket" \
+  --env "OPERATION=backup" \
+  --env "RESTIC_PASSWORD=$RESTIC_PASSWORD"
+
+# 3. Start and wait for completion
+info "Running backup..."
+infernoctl start "$util_vm"  # Blocks until VM exits
+
+# 4. Cleanup
+info "Cleaning up..."
+infernoctl destroy "$util_vm" --yes
+lvremove -f "/dev/inferno_vg/$snapshot_id"
+
+info "Backup complete: s3:$s3_bucket"
+```
+
+**Utility VM logs:**
+```
+[init] Starting Inferno init...
+[init] Volume /dev/vdb marked as encrypted
+[init] Requesting encryption key via vsock...
+[init] LUKS unlock successful: /dev/vdb -> /dev/mapper/data (82ms)
+[init] Mounted: /dev/mapper/data -> /data (read-only)
+[init] Executing: /usr/local/bin/backup-entrypoint.sh
+[restic] repository s3:my-bucket opened successfully
+[restic] scanning /data
+[restic] processed 1.2 GB in 0:45
+[restic] snapshot a1b2c3d4 saved
+[init] Process exited: status=0
+[init] Unmounting /data...
+[init] Locking volume: cryptsetup close data
+[init] Shutdown complete
+```
+
+---
+
+**Document Version:** 1.0
+
+**Last Updated:** 2026-01-23
+
+**Status:** Draft - Ready for implementation
+
+**Next Steps:**
+1. Write RFC-006 (KMS Service Design)
+2. Begin Phase 1 implementation (KMS service)
+3. Prototype vsock key delivery in init
