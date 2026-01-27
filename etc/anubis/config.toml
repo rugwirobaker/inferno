@@ -1,0 +1,12 @@
+# Anubis - Key Management Service Configuration
+# Named after the Egyptian god who guards the keys
+
+[db]
+path = "/var/lib/anubis/anubis.db"
+
+[socket]
+path = "/var/lib/anubis/anubis.sock"
+mode = "0666"  # Allow jailed processes (kiln) to access the socket
+
+[log]
+level = "info"  # debug, info, warn, error
