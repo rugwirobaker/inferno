@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +59,37 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Mount /run as tmpfs for runtime data (needed by cryptsetup for lock files)
+	// This must happen early, before volume unlock
+	if err := os.MkdirAll("/run", 0755); err != nil {
+		slog.Error("Failed to create /run", "error", err)
+		os.Exit(1)
+	}
+	if err := syscall.Mount("tmpfs", "/run", "tmpfs", 0, "mode=0755"); err != nil {
+		slog.Error("Failed to mount /run", "error", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll("/run/cryptsetup", 0755); err != nil {
+		slog.Error("Failed to create /run/cryptsetup", "error", err)
+		os.Exit(1)
+	}
+
+	// Unlock encrypted volumes BEFORE moving /dev
+	// This must happen while /dev is still in initramfs where devices are accessible
+	if err := unlockEncryptedVolumes(ctx, config); err != nil {
+		slog.Error("FATAL: encrypted volume unlock failed", "error", err)
+		// Fail fast - exit init with non-zero status
+		// VM will terminate, operator must fix key/volume issues
+		os.Exit(1)
+	}
+
+	// Move /dev to new root AFTER volume unlock
+	// This preserves both /dev/vdb and /dev/mapper/*_crypt devices
+	if err := MoveDevToNewRoot(); err != nil {
+		slog.Error("Failed to move /dev to new root", "error", err)
+		os.Exit(1)
+	}
+
 	// Switch to new root
 	if err := switchRoot(); err != nil {
 		slog.Error("Failed to switch root", "error", err)
@@ -88,9 +120,21 @@ func main() {
 			}
 		}
 
-		if err := Mount(vol.Device, vol.MountPoint, vol.FSType, flags, ""); err != nil {
+		// Use mapper device for encrypted volumes
+		device := vol.Device
+		if vol.Encrypted {
+			mapperName := strings.TrimPrefix(vol.Device, "/dev/")
+			mapperName = strings.ReplaceAll(mapperName, "/", "_") + "_crypt"
+			device = "/dev/mapper/" + mapperName
+			slog.Debug("using mapper device for encrypted volume",
+				"original", vol.Device,
+				"mapper", device,
+			)
+		}
+
+		if err := Mount(device, vol.MountPoint, vol.FSType, flags, ""); err != nil {
 			slog.Error("Failed to mount volume",
-				"device", vol.Device,
+				"device", device,
 				"mountPoint", vol.MountPoint,
 				"error", err,
 			)
