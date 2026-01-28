@@ -118,9 +118,17 @@ func MoveDevToNewRoot() error {
 	return nil
 }
 
+// MountEarlyPseudoFS mounts /proc and /sys early for device-mapper
+// This must be called BEFORE unlockEncryptedVolumes so cryptsetup can initialize device-mapper
+func MountEarlyPseudoFS() error {
+	return mountPseudoFS()
+}
+
 // MountFS mounts all required filesystems
 func MountFS() error {
-	// Mount pseudo filesystems first
+	// Pseudo filesystems (/proc, /sys) are already mounted by MountEarlyPseudoFS
+	// We call mountPseudoFS again here to handle the case where we're in the new root
+	// The mounts will be re-created in the new mount namespace
 	if err := mountPseudoFS(); err != nil {
 		return err
 	}

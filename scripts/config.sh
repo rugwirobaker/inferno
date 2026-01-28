@@ -76,7 +76,7 @@ generate_firecracker_config() {
       "boot-source": {
         "kernel_image_path": $kernel,
         "initrd_path": "initrd.cpio",
-        "boot_args": "console=ttyS0 reboot=k panic=1 pci=off rdinit=/inferno/init"
+        "boot_args": "console=ttyS0 reboot=k panic=1 rdinit=/inferno/init"
       },
       "drives": [
         {

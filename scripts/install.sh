@@ -332,19 +332,31 @@ if [[ ! -x "$SHAREDIR/firecracker" || ! -x "$SHAREDIR/jailer" ]]; then
 fi
 
 # ===== Kernel (fallback) =====
+# NOTE: In dev mode, you should build the custom kernel first:
+#   cd kernel && ./build.sh
+# This ensures dm-crypt and other Inferno-specific features are enabled.
+# The fallback below only runs if no kernel exists (e.g., fresh prod install).
 if [[ ! -f "$SHAREDIR/vmlinux" ]]; then
-  info "Installing Firecracker-optimized kernel"
+  warn "No custom kernel found at $SHAREDIR/vmlinux"
+  if [[ "$MODE" == "dev" ]]; then
+    warn "For dev mode, build the custom kernel first:"
+    warn "  cd kernel && ./build.sh"
+    warn "Falling back to Firecracker's official kernel (missing dm-crypt support)"
+  fi
+
+  info "Downloading Firecracker official kernel as fallback..."
   # Allow override via KERNEL_LIST_URL; otherwise pick by arch
   if [[ -z "${KERNEL_LIST_URL:-}" ]]; then
-    KERNEL_LIST_URL="http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/v1.10/${FC_ARCH}/vmlinux-5.10&list-type=2"
+    KERNEL_LIST_URL="http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/v1.14/${FC_ARCH}/vmlinux-5.10&list-type=2"
   fi
   # Grab the latest vmlinux-5.10.x object key for this arch
   latest_kernel_rel="$(curl -fsSL "$KERNEL_LIST_URL" \
-    | grep -oE "firecracker-ci/v1\.10/${FC_ARCH}/vmlinux-5\.10\.[0-9]+" \
+    | grep -oE "firecracker-ci/v1\.14/${FC_ARCH}/vmlinux-5\.10\.[0-9]+" \
     | sort -Vr | head -n1)"
   [[ -n "$latest_kernel_rel" ]] || err "Could not resolve latest vmlinux for ${FC_ARCH}"
   curl -fL "https://s3.amazonaws.com/spec.ccfc.min/${latest_kernel_rel}" -o "$SHAREDIR/vmlinux"
   chmod 0644 "$SHAREDIR/vmlinux"
+  warn "Installed fallback kernel - encrypted volumes will NOT work"
 fi
 
 # ===== cryptsetup for volume encryption =====

@@ -59,6 +59,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Mount /proc and /sys early - required for device-mapper initialization
+	// This must happen BEFORE unlockEncryptedVolumes so cryptsetup can initialize device-mapper
+	if err := MountEarlyPseudoFS(); err != nil {
+		slog.Error("Failed to mount early pseudo filesystems", "error", err)
+		os.Exit(1)
+	}
+
 	// Mount /run as tmpfs for runtime data (needed by cryptsetup for lock files)
 	// This must happen early, before volume unlock
 	if err := os.MkdirAll("/run", 0755); err != nil {

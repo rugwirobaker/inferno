@@ -89,11 +89,16 @@ setup_encrypted_volume() {
     fi
 
     # Format device with LUKS2
-    log "Formatting volume with LUKS2 encryption..."
+    # Use PBKDF2 instead of Argon2 for low memory footprint (suitable for 128MB VMs)
+    # Argon2's default 1GB memory requirement is incompatible with lightweight VMs.
+    # PBKDF2 is secure here because we use 256-bit random keys from KMS, not weak passwords.
+    log "Formatting volume with LUKS2 encryption (PBKDF2)..."
     if ! echo -n "$encryption_key" | base64 -d | \
       cryptsetup luksFormat --type luks2 \
         --cipher aes-xts-plain64 \
         --key-size 512 \
+        --pbkdf pbkdf2 \
+        --iter-time 50 \
         --key-file=- \
         --batch-mode \
         "$device_path" 2>&1; then
@@ -152,6 +157,12 @@ setup_encrypted_volume() {
 create_lv() {
     local volume_id="$1"
     local size_gb="$2"
+
+    # Normalize size: strip "GB"/"G" suffix if present (support both "1" and "1GB")
+    size_gb="${size_gb%GB}"
+    size_gb="${size_gb%gb}"
+    size_gb="${size_gb%G}"
+    size_gb="${size_gb%g}"
 
     # Validate VG and pool existence
     verify_volume_group || return 1

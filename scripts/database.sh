@@ -294,6 +294,10 @@ create_volume() {
     local size_gb="$2"
     local encrypted="${3:-1}"  # Default to encrypted (1=true, 0=false)
 
+    # Normalize size: strip "GB" suffix if present (support both "1" and "1GB")
+    size_gb="${size_gb%GB}"
+    size_gb="${size_gb%gb}"
+
     local volume_id=$(generate_volume_id)
     local device_path="/dev/$VG_NAME/$volume_id"
 

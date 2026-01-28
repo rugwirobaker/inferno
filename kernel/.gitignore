@@ -1,0 +1,16 @@
+# Kernel source directory
+linux-*/
+
+# Kernel tarball
+linux-*.tar.xz
+
+# Built kernel
+vmlinux
+
+# Backup configs
+*.backup
+
+# Temporary config files
+config-*.txt
+config-*-firecracker-base
+/tmp/

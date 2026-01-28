@@ -107,6 +107,43 @@ rootfs_create_base() {
     lv_name="$(rootfs_base_lv_name "$digest")"
     local lv_path="/dev/${ROOTFS_VG_NAME}/${lv_name}"
 
+    # Check if LV already exists in LVM (orphaned from database wipe)
+    if lvs "$ROOTFS_VG_NAME/$lv_name" >/dev/null 2>&1; then
+        warn "Base LV $lv_name exists in LVM but not in database; re-importing"
+
+        # Get manifest JSON for storage
+        local manifest_json="{}"
+        if type -t images_inspect_json >/dev/null 2>&1; then
+            manifest_json="$(images_inspect_json "$image" 2>/dev/null | jq -c . 2>/dev/null || echo '{}')"
+        fi
+
+        # Re-import into database
+        local escaped_ref escaped_manifest
+        escaped_ref="$(echo "$image" | sed "s/'/''/g")"
+        escaped_manifest="$(echo "$manifest_json" | sed "s/'/''/g")"
+
+        sqlite3 "$DB_PATH" <<EOF
+INSERT INTO base_images (docker_ref, docker_digest, lv_name, lv_path, size_mb, manifest_json)
+VALUES (
+    '$escaped_ref',
+    '$digest',
+    '$lv_name',
+    '$lv_path',
+    $size_mb,
+    '$escaped_manifest'
+);
+EOF
+
+        if [ $? -ne 0 ]; then
+            error "Failed to re-import base image into database"
+            return 1
+        fi
+
+        success "Base image re-imported: $lv_name"
+        echo "$lv_path"
+        return 0
+    fi
+
     log "Creating base image LV: $lv_name (${size_mb}MB)"
 
     # Create thin volume
